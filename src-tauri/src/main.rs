@@ -5,8 +5,10 @@
 
 mod core;
 mod history;
+mod pairing;
 mod platform;
 mod state;
+mod transport;
 
 #[tauri::command]
 fn greet(name: &str) -> String {

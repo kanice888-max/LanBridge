@@ -4,6 +4,8 @@
 )]
 
 mod core;
+mod history;
+mod platform;
 mod state;
 
 #[tauri::command]

@@ -3,6 +3,9 @@
     windows_subsystem = "windows"
 )]
 
+mod core;
+mod state;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! Welcome to LAN Folder Sync.", name)

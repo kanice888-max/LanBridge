@@ -1,4 +1,4 @@
-# LAN Folder Sync Windows Implementation Plan
+# LanBridge Windows Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -15,7 +15,7 @@
 All Windows work happens in:
 
 - Path: `.worktrees/windows`
-- Branch: `codex/lan-sync-windows`
+- Branch: `codex/lanbridge-windows`
 
 Do not start this plan until the macOS branch has a passing baseline and stable shared interfaces.
 
@@ -24,10 +24,10 @@ All Windows commands in this plan assume PowerShell unless stated otherwise.
 ## 2. Windows-Specific Requirements
 
 - Use app data directory for identity, SQLite state, logs, and peer pins.
-- Use `.lan-sync-history/` inside each sync root for trash and overwritten files.
+- Use `.lanbridge-history/` inside each sync root for trash and overwritten files.
 - Use `notify` on Windows, backed by ReadDirectoryChangesW.
 - Use scanner fallback because watcher events may be incomplete during sleep, heavy writes, or network interruptions.
-- Ignore `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, exact directory `.git/`, exact directory `node_modules/`, temporary Office lock files, Windows shortcut files, and `.lan-sync-history/` by default.
+- Ignore `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, exact directory `.git/`, exact directory `node_modules/`, temporary Office lock files, Windows shortcut files, and `.lanbridge-history/` by default.
 - Handle Windows path restrictions, including reserved names, invalid characters, drive roots, long paths, trailing spaces, and trailing dots.
 - Treat path comparison carefully because default Windows filesystems are case-insensitive.
 - Do not follow or synchronize symlinks, junctions, or reparse points in P0. Record skipped entries as warnings.
@@ -67,7 +67,7 @@ Run:
 git branch --show-current
 ```
 
-Expected: `codex/lan-sync-windows`.
+Expected: `codex/lanbridge-windows`.
 
 - [ ] **Step 2: Bring in macOS baseline**
 
@@ -129,7 +129,7 @@ $RECYCLE.BIN
 System Volume Information
 .git/
 node_modules/
-.lan-sync-history/
+.lanbridge-history/
 ```
 
 Default glob patterns:
@@ -245,7 +245,7 @@ Verify scanner handles normal drive paths, nested folders, ignored system files,
 Verify primary delete moves secondary file into:
 
 ```text
-.lan-sync-history/trash/<unix-ms>/<relative-path>
+.lanbridge-history/trash/<unix-ms>/<relative-path>
 ```
 
 - [ ] **Step 3: Test overwrite backup**
@@ -253,7 +253,7 @@ Verify primary delete moves secondary file into:
 Verify confirmed return-sync overwrite moves old primary file into:
 
 ```text
-.lan-sync-history/overwritten/<unix-ms>/<relative-path>
+.lanbridge-history/overwritten/<unix-ms>/<relative-path>
 ```
 
 - [ ] **Step 4: Test locked file behavior**

@@ -2,7 +2,7 @@
 
 ## Project Mission
 
-Build a local LAN folder sync desktop app for macOS and Windows. The product uses a fixed primary-secondary sync model:
+Build a local LanBridge desktop app for macOS and Windows. The product uses a fixed primary-secondary sync model:
 
 - Primary changes automatically sync to secondary.
 - Primary deletes move secondary files into sync history/trash.
@@ -14,10 +14,10 @@ Build a local LAN folder sync desktop app for macOS and Windows. The product use
 
 Read these documents before implementation:
 
-- `docs/superpowers/specs/2026-05-11-lan-folder-sync-prd.md`
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-technical-development.md`
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-macos-development.md`
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-windows-development.md`
+- `docs/superpowers/specs/2026-05-11-lanbridge-prd.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-technical-development.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-macos-development.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-windows-development.md`
 
 ## Required Development Order
 
@@ -92,7 +92,7 @@ If verification fails, report the failing command and exact failure before chang
 
 - macOS establishes the shared engine and UI baseline.
 - Use `notify`/FSEvents as a trigger for scans, not as the source of truth.
-- Ignore `.DS_Store`, `.AppleDouble`, `.DocumentRevisions-V100`, `.Spotlight-V100`, `.TemporaryItems`, `.Trashes`, and `.lan-sync-history`.
+- Ignore `.DS_Store`, `.AppleDouble`, `.DocumentRevisions-V100`, `.Spotlight-V100`, `.TemporaryItems`, `.Trashes`, and `.lanbridge-history`.
 - Do not attempt full macOS resource fork or metadata sync in P0.
 
 ### Windows Second

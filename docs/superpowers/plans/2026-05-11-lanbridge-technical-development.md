@@ -1,8 +1,8 @@
-# LAN Folder Sync Technical Development Index
+# LanBridge Technical Development Index
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement the platform plans task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Coordinate development of the LAN folder sync app across macOS and Windows while keeping platform-specific work isolated.
+**Goal:** Coordinate development of the LanBridge app across macOS and Windows while keeping platform-specific work isolated.
 
 **Architecture:** Build the macOS client first to establish the shared Rust/Tauri sync engine, product behavior, UI flow, encrypted pairing, and safety model. Then implement the Windows client by reusing shared engine interfaces and adding Windows-specific filesystem, watcher, tray, firewall, startup, and packaging behavior.
 
@@ -12,9 +12,10 @@
 
 ## Required Reading Order
 
-1. Product requirements: `docs/superpowers/specs/2026-05-11-lan-folder-sync-prd.md`
-2. macOS implementation plan: `docs/superpowers/plans/2026-05-11-lan-folder-sync-macos-development.md`
-3. Windows implementation plan: `docs/superpowers/plans/2026-05-11-lan-folder-sync-windows-development.md`
+1. Product requirements: `docs/superpowers/specs/2026-05-11-lanbridge-prd.md`
+2. macOS implementation plan: `docs/superpowers/plans/2026-05-11-lanbridge-macos-development.md`
+3. Windows implementation plan: `docs/superpowers/plans/2026-05-11-lanbridge-windows-development.md`
+4. Next-stage optimization plan: `docs/superpowers/plans/2026-05-13-lanbridge-next-stage-optimization.md`
 
 ## Required UI Skill
 
@@ -39,7 +40,7 @@ Keep the worktree count small. Use one platform worktree per OS plus one integra
 ### macOS Worktree
 
 - Path: `.worktrees/macos`
-- Branch: `codex/lan-sync-macos`
+- Branch: `codex/lanbridge-macos`
 - Purpose: design and implement the first working client, including shared engine modules where needed.
 - Owned files:
   - `src-tauri/src/core/**`
@@ -55,7 +56,7 @@ Keep the worktree count small. Use one platform worktree per OS plus one integra
 ### Windows Worktree
 
 - Path: `.worktrees/windows`
-- Branch: `codex/lan-sync-windows`
+- Branch: `codex/lanbridge-windows`
 - Purpose: adapt the working macOS baseline to Windows and implement Windows-only filesystem, watcher, tray, firewall, startup, and packaging behavior.
 - Owned files:
   - `src-tauri/src/platform/windows/**`
@@ -66,7 +67,7 @@ Keep the worktree count small. Use one platform worktree per OS plus one integra
 ### Integration Worktree
 
 - Path: `.worktrees/integration`
-- Branch: `codex/lan-sync-integration`
+- Branch: `codex/lanbridge-integration`
 - Purpose: merge macOS and Windows work, resolve interface mismatches, and run two-device integration verification.
 - Owned files:
   - any file required to resolve merge conflicts
@@ -97,7 +98,7 @@ Then commit the documentation baseline:
 
 ```powershell
 git add .gitignore AGENTS.md CLAUDE.md docs
-git commit -m "docs: add LAN folder sync product and development plans"
+git commit -m "docs: add LanBridge product and development plans"
 ```
 
 Expected: the repository has its first commit containing the PRD, platform plans, AI rules, and generated documentation bundle.
@@ -109,9 +110,9 @@ Run these from repository root after the bootstrap docs commit exists:
 The following `git worktree` commands are shell-neutral and can be run from Bash, Git Bash, or PowerShell. Platform-specific plans use Bash for macOS commands and PowerShell for Windows commands.
 
 ```bash
-git worktree add .worktrees/macos -b codex/lan-sync-macos
-git worktree add .worktrees/windows -b codex/lan-sync-windows
-git worktree add .worktrees/integration -b codex/lan-sync-integration
+git worktree add .worktrees/macos -b codex/lanbridge-macos
+git worktree add .worktrees/windows -b codex/lanbridge-windows
+git worktree add .worktrees/integration -b codex/lanbridge-integration
 ```
 
 Before creating project-local worktrees, ensure `.worktrees/` is ignored:
@@ -127,6 +128,7 @@ Before creating project-local worktrees, ensure `.worktrees/` is ignored:
 3. Start the Windows plan from the macOS baseline.
 4. Merge both platform branches in the integration worktree.
 5. Verify Mac-to-Windows and Windows-to-Mac task roles over LAN.
+6. Implement the next-stage optimization plan after the basic transport and sync loop are passing.
 
 ## Shared Sync Semantics
 
@@ -151,7 +153,7 @@ Both clients must implement exactly the same product semantics:
 - Large files above the eager hash limit use size and modified time as a hash-unverified fallback.
 - P0 does not follow or synchronize symlinks.
 - P0 treats directory rename/move as delete plus create.
-- P0 cleans stale `.lan-sync-partial` files on startup. During graceful shutdown, the app stops accepting new work and waits up to 30 seconds for the current single-file transfer; if it does not finish, interrupt it and let startup cleanup/retry handle the partial file.
+- P0 cleans stale `.lanbridge-partial` files on startup. During graceful shutdown, the app stops accepting new work and waits up to 30 seconds for the current single-file transfer; if it does not finish, interrupt it and let startup cleanup/retry handle the partial file.
 
 ## Shared Defaults
 
@@ -160,14 +162,14 @@ Both clients must implement exactly the same product semantics:
 - History retention: 30 days or 1 GB per sync task.
 - Log retention: latest 10,000 entries or 7 days, whichever keeps fewer entries.
 - Transfer resumability: not supported in P0; failed transfers restart from byte 0.
-- High-risk default ignores: exact directory `.git/`, exact directory `node_modules/`, `.lan-sync-history/`, platform system trash/history folders, Windows shortcuts `*.lnk`, and platform-specific junk files.
+- High-risk default ignores: exact directory `.git/`, exact directory `node_modules/`, `.lanbridge-history/`, platform system trash/history folders, Windows shortcuts `*.lnk`, and platform-specific junk files.
 
 ## Ignore Rule Matching
 
 Platform ignore rules must distinguish exact name matches, exact directory matches, and glob patterns:
 
 - Exact file/name match examples: `.DS_Store`, `Thumbs.db`, `desktop.ini`.
-- Exact directory match examples: `.git/`, `node_modules/`, `.lan-sync-history/`.
+- Exact directory match examples: `.git/`, `node_modules/`, `.lanbridge-history/`.
 - Glob pattern examples: `~$*`, `*.tmp`, `*.lnk`.
 
 The `.git/` rule applies only to a directory named `.git`. Do not treat `.gitignore`, `.gitmodules`, or `.github/` as ignored by this rule.
@@ -236,11 +238,11 @@ Do not overwrite an existing conflict file. If the generated name already exists
 
 Use the macOS plan for initial architecture and working behavior:
 
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-macos-development.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-macos-development.md`
 
 Use the Windows plan only after the macOS baseline exists:
 
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-windows-development.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-windows-development.md`
 
 ## AI Worker Rules
 

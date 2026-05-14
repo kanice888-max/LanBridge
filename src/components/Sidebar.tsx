@@ -1,3 +1,5 @@
+import { useTranslation } from "../lib/i18n/context";
+
 interface SidebarProps {
   currentScreen: string;
   onNavigate: (screen: any) => void;
@@ -5,17 +7,19 @@ interface SidebarProps {
 }
 
 export function Sidebar({ currentScreen, onNavigate, deviceName }: SidebarProps) {
+  const { t } = useTranslation();
+
   const navItems = [
-    { id: "dashboard", label: "Dashboard", icon: " " },
-    { id: "pairing", label: "Pair Device", icon: " " },
-    { id: "logs", label: "Logs", icon: " " },
-    { id: "settings", label: "Settings", icon: "⚙️" },
+    { id: "dashboard", label: t.sidebar.dashboard, icon: " " },
+    { id: "pairing", label: t.sidebar.pairing, icon: " " },
+    { id: "logs", label: t.sidebar.logs, icon: " " },
+    { id: "settings", label: t.sidebar.settings, icon: "⚙️" },
   ];
 
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
-        <h2>LAN Sync</h2>
+        <h2>{t.sidebar.appName}</h2>
         {deviceName && <span className="device-name">{deviceName}</span>}
       </div>
       <nav className="sidebar-nav">

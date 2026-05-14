@@ -16,9 +16,9 @@ pub fn derive_pairing_code(public_key_a: &[u8], public_key_b: &[u8], nonce: &[u8
         (public_key_b, public_key_a)
     };
 
-    // SHA256("lan-sync-pairing-v1" || nonce || min_public_key || max_public_key)
+    // SHA256("lanbridge-pairing-v1" || nonce || min_public_key || max_public_key)
     let mut hasher = Sha256::new();
-    hasher.update(b"lan-sync-pairing-v1");
+    hasher.update(b"lanbridge-pairing-v1");
     hasher.update(nonce);
     hasher.update(min_key);
     hasher.update(max_key);

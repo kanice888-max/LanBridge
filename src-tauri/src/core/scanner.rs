@@ -6,17 +6,14 @@ use crate::core::model::{EntryKind, FileSnapshot, HashStatus};
 use crate::platform::traits::{IgnoreDecision, Platform};
 
 /// Files larger than this use size+mtime fallback instead of hashing.
-const EAGER_HASH_LIMIT: i64 = 100 * 1024 * 1024; // 100 MB
+pub const EAGER_HASH_LIMIT: i64 = 100 * 1024 * 1024; // 100 MB
 
 /// Scan a sync root directory and produce file snapshots.
 ///
 /// Walks the directory tree, applies platform ignore rules,
 /// records metadata, and hashes files up to the eager hash limit.
 /// Symlinks are skipped and recorded as warnings.
-pub fn scan_root<P: Platform>(
-    sync_root: &Path,
-    platform: &P,
-) -> Result<Vec<ScanResult>> {
+pub fn scan_root(sync_root: &Path, platform: &dyn Platform) -> Result<Vec<ScanResult>> {
     let mut results = Vec::new();
     walk_dir(sync_root, sync_root, platform, &mut results)?;
     Ok(results)
@@ -29,10 +26,10 @@ pub struct ScanResult {
     pub skipped_symlink: bool,
 }
 
-fn walk_dir<P: Platform>(
+fn walk_dir(
     dir: &Path,
     sync_root: &Path,
-    platform: &P,
+    platform: &dyn Platform,
     results: &mut Vec<ScanResult>,
 ) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
@@ -70,7 +67,11 @@ fn walk_dir<P: Platform>(
                 snapshot: FileSnapshot {
                     task_id: uuid::Uuid::nil(),
                     relative_path: relative_path(sync_root, &path),
-                    kind: if file_type.is_dir() { EntryKind::Directory } else { EntryKind::File },
+                    kind: if file_type.is_dir() {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    },
                     size: 0,
                     modified_unix_ms: 0,
                     blake3_hash: None,
@@ -161,7 +162,7 @@ fn walk_dir<P: Platform>(
 }
 
 /// Compute blake3 hash of a file.
-fn hash_file(path: &Path) -> Result<String> {
+pub fn hash_file(path: &Path) -> Result<String> {
     let data = std::fs::read(path)?;
     let hash = blake3::hash(&data);
     Ok(hash.to_hex().to_string())

@@ -84,6 +84,7 @@ pub struct SyncBaseline {
     pub relative_path: String,
     pub primary_hash: Option<String>,
     pub primary_hash_status: HashStatus,
+    pub primary_size: i64,
     pub primary_modified_unix_ms: i64,
     pub secondary_hash: Option<String>,
     pub secondary_hash_status: HashStatus,

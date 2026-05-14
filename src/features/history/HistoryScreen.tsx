@@ -5,6 +5,7 @@ import {
   cleanupHistory,
   type HistoryEntry,
 } from "../../lib/tauriApi";
+import { useTranslation } from "../../lib/i18n/context";
 
 interface HistoryScreenProps {
   taskId: string;
@@ -12,6 +13,7 @@ interface HistoryScreenProps {
 }
 
 export function HistoryScreen({ taskId, onBack }: HistoryScreenProps) {
+  const { t } = useTranslation();
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -66,25 +68,22 @@ export function HistoryScreen({ taskId, onBack }: HistoryScreenProps) {
     <div className="screen-container">
       <div className="screen-header">
         <button className="btn btn-secondary" onClick={onBack}>
-          ← Back
+          ← {t.history.back}
         </button>
-        <h1>Sync History / Trash</h1>
+        <h1>{t.history.title}</h1>
         <button className="btn btn-secondary" onClick={handleCleanup}>
-          Cleanup Old Entries
+          {t.history.cleanup}
         </button>
       </div>
 
       {error && <div className="error-message">{error}</div>}
 
       {loading ? (
-        <p>Loading history...</p>
+        <p>{t.history.loading}</p>
       ) : entries.length === 0 ? (
         <div className="empty-state">
-          <h3>No history entries</h3>
-          <p>
-            Files deleted from primary or overwritten during conflict resolution
-            will appear here.
-          </p>
+          <h3>{t.history.noEntries}</h3>
+          <p>{t.history.noEntriesDesc}</p>
         </div>
       ) : (
         <div className="history-list">
@@ -98,7 +97,7 @@ export function HistoryScreen({ taskId, onBack }: HistoryScreenProps) {
                   <span
                     className={`reason-badge ${entry.reason.toLowerCase()}`}
                   >
-                    {entry.reason}
+                    {entry.reason === "Trash" ? t.history.trash : entry.reason === "Overwritten" ? t.history.overwritten : entry.reason}
                   </span>
                   {" · "}
                   {formatSize(entry.size)} · {formatTime(entry.created_unix_ms)}
@@ -109,7 +108,7 @@ export function HistoryScreen({ taskId, onBack }: HistoryScreenProps) {
                 onClick={() => handleRestore(entry.id)}
                 disabled={restoring === entry.id}
               >
-                {restoring === entry.id ? "Restoring..." : "Restore"}
+                {restoring === entry.id ? t.history.restoring : t.history.restore}
               </button>
             </div>
           ))}

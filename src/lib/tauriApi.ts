@@ -98,9 +98,76 @@ export interface AppSettings {
 export interface CreateTaskRequest {
   name: string;
   local_path: string;
-  remote_path: string;
+  remote_path?: string;
   peer_device_id: string;
   local_role: string;
+}
+
+export interface SendTaskInviteRequest {
+  name: string;
+  local_path: string;
+  peer_device_id: string;
+  local_role: string;
+}
+
+export interface TaskInviteProgress {
+  invite_id: string;
+  task_id: string;
+  status: "Pending" | "Accepted" | "Rejected" | "Missing" | string;
+  task: SyncTask | null;
+  error: string | null;
+}
+
+export interface IncomingTaskInviteInfo {
+  invite_id: string;
+  task_id: string;
+  task_name: string;
+  requester_device_id: string;
+  requester_address: string | null;
+  requester_path: string | null;
+  proposed_role: "Primary" | "Secondary" | string;
+  status: "Pending" | "Accepted" | "Rejected" | string;
+  local_path: string | null;
+  error: string | null;
+  created_unix_ms: number;
+}
+
+export interface OnlineDevice {
+  device_id: string;
+  display_name: string;
+  ip: string;
+  port: number;
+  public_key: number[];
+  addresses: OnlineDeviceAddress[];
+  last_seen_unix_ms: number;
+}
+
+export interface OnlineDeviceAddress {
+  ip: string;
+  port: number;
+  interface_name: string | null;
+  last_seen_unix_ms: number;
+}
+
+export interface DiscoveryStatus {
+  running: boolean;
+  error: string | null;
+  interfaces: string[];
+  multicast_addr: string;
+  multicast_port: number;
+}
+
+export interface NetworkCheckItem {
+  label: string;
+  status: "ok" | "warn" | "error" | string;
+  detail: string;
+}
+
+export interface NetworkDiagnosticReport {
+  ok: boolean;
+  tcp_port: number;
+  checks: NetworkCheckItem[];
+  suggestions: string[];
 }
 
 // ─── API Functions ───
@@ -119,9 +186,9 @@ export async function confirmPairingCode(
   nonceHex: string
 ): Promise<string> {
   return invoke("confirm_pairing_code", {
-    peer_device_id: peerDeviceId,
-    peer_public_key: peerPublicKey,
-    nonce_hex: nonceHex,
+    peerDeviceId,
+    peerPublicKey,
+    nonceHex,
   });
 }
 
@@ -130,8 +197,8 @@ export async function approvePairing(
   displayName: string
 ): Promise<void> {
   return invoke("approve_pairing", {
-    peer_device_id: peerDeviceId,
-    display_name: displayName,
+    peerDeviceId,
+    displayName,
   });
 }
 
@@ -142,8 +209,31 @@ export async function getPairedDevices(): Promise<PairedDevice[]> {
 export async function connectPeer(
   address: string,
   port: number
-): Promise<void> {
+): Promise<string> {
   return invoke("connect_peer", { address, port });
+}
+
+export async function connectDiscoveredPeer(
+  device: OnlineDevice
+): Promise<string> {
+  return invoke("connect_discovered_peer", {
+    address: device.ip,
+    port: device.port,
+    peerDeviceId: device.device_id,
+    peerPublicKey: device.public_key,
+  });
+}
+
+export async function listOnlineDevices(): Promise<OnlineDevice[]> {
+  return invoke("list_online_devices");
+}
+
+export async function getDiscoveryStatus(): Promise<DiscoveryStatus> {
+  return invoke("get_discovery_status");
+}
+
+export async function checkNetworkEnvironment(): Promise<NetworkDiagnosticReport> {
+  return invoke("check_network_environment");
 }
 
 export async function createSyncTask(
@@ -152,37 +242,73 @@ export async function createSyncTask(
   return invoke("create_sync_task", { request });
 }
 
+export async function sendTaskInvite(
+  request: SendTaskInviteRequest
+): Promise<TaskInviteProgress> {
+  return invoke("send_task_invite", { request });
+}
+
+export async function pollTaskInvite(
+  inviteId: string
+): Promise<TaskInviteProgress> {
+  return invoke("poll_task_invite", { inviteId });
+}
+
+export async function listTaskInvites(): Promise<IncomingTaskInviteInfo[]> {
+  return invoke("list_task_invites");
+}
+
+export async function acceptTaskInvite(
+  inviteId: string,
+  localPath: string
+): Promise<SyncTask> {
+  return invoke("accept_task_invite", {
+    inviteId,
+    localPath,
+  });
+}
+
+export async function rejectTaskInvite(
+  inviteId: string,
+  reason?: string
+): Promise<void> {
+  return invoke("reject_task_invite", {
+    inviteId,
+    reason,
+  });
+}
+
 export async function listSyncTasks(): Promise<SyncTask[]> {
   return invoke("list_sync_tasks");
 }
 
 export async function getSyncTask(taskId: string): Promise<SyncTask | null> {
-  return invoke("get_sync_task", { task_id: taskId });
+  return invoke("get_sync_task", { taskId });
 }
 
 export async function toggleTaskEnabled(
   taskId: string,
   enabled: boolean
 ): Promise<void> {
-  return invoke("toggle_task_enabled", { task_id: taskId, enabled });
+  return invoke("toggle_task_enabled", { taskId, enabled });
 }
 
 export async function scanTask(taskId: string): Promise<FileSnapshot[]> {
-  return invoke("scan_task", { task_id: taskId });
+  return invoke("scan_task", { taskId });
 }
 
 export async function syncNow(taskId: string): Promise<SyncActionResult[]> {
-  return invoke("sync_now", { task_id: taskId });
+  return invoke("sync_now", { taskId });
 }
 
 export async function listPendingReturns(
   taskId: string
 ): Promise<PendingReturnChange[]> {
-  return invoke("list_pending_returns", { task_id: taskId });
+  return invoke("list_pending_returns", { taskId });
 }
 
 export async function getPendingCount(taskId: string): Promise<number> {
-  return invoke("get_pending_count", { task_id: taskId });
+  return invoke("get_pending_count", { taskId });
 }
 
 export async function executeReturnSync(
@@ -190,15 +316,15 @@ export async function executeReturnSync(
   selectedPaths: string[]
 ): Promise<ReturnSyncResult[]> {
   return invoke("execute_return_sync", {
-    task_id: taskId,
-    selected_paths: selectedPaths,
+    taskId,
+    selectedPaths,
   });
 }
 
 export async function detectConflicts(
   taskId: string
 ): Promise<ConflictInfo[]> {
-  return invoke("detect_conflicts", { task_id: taskId });
+  return invoke("detect_conflicts", { taskId });
 }
 
 export async function resolveConflictOverwrite(
@@ -206,15 +332,25 @@ export async function resolveConflictOverwrite(
   relativePath: string
 ): Promise<SyncActionResult> {
   return invoke("resolve_conflict_overwrite", {
-    task_id: taskId,
-    relative_path: relativePath,
+    taskId,
+    relativePath,
+  });
+}
+
+export async function resolveConflictKeepBoth(
+  taskId: string,
+  relativePath: string
+): Promise<SyncActionResult> {
+  return invoke("resolve_conflict_keep_both", {
+    taskId,
+    relativePath,
   });
 }
 
 export async function listHistory(
   taskId: string
 ): Promise<HistoryEntry[]> {
-  return invoke("list_history", { task_id: taskId });
+  return invoke("list_history", { taskId });
 }
 
 export async function restoreHistoryEntry(
@@ -222,13 +358,13 @@ export async function restoreHistoryEntry(
   entryId: string
 ): Promise<string> {
   return invoke("restore_history_entry", {
-    task_id: taskId,
-    entry_id: entryId,
+    taskId,
+    entryId,
   });
 }
 
 export async function cleanupHistory(taskId: string): Promise<number> {
-  return invoke("cleanup_history", { task_id: taskId });
+  return invoke("cleanup_history", { taskId });
 }
 
 export async function listLogs(limit?: number): Promise<LogEntry[]> {
@@ -244,8 +380,8 @@ export async function writeLog(
   return invoke("write_log", {
     level,
     message,
-    task_id: taskId,
-    relative_path: relativePath,
+    taskId,
+    relativePath,
   });
 }
 

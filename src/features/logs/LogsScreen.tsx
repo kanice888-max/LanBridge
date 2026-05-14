@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { listLogs, type LogEntry } from "../../lib/tauriApi";
+import { useTranslation } from "../../lib/i18n/context";
 
 interface LogsScreenProps {
   onBack: () => void;
 }
 
 export function LogsScreen({ onBack }: LogsScreenProps) {
+  const { t } = useTranslation();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -43,22 +45,22 @@ export function LogsScreen({ onBack }: LogsScreenProps) {
     <div className="screen-container">
       <div className="screen-header">
         <button className="btn btn-secondary" onClick={onBack}>
-          ← Back
+          ← {t.logs.back}
         </button>
-        <h1>Sync Logs</h1>
+        <h1>{t.logs.title}</h1>
         <button className="btn btn-secondary" onClick={loadLogs}>
-          Refresh
+          {t.logs.refresh}
         </button>
       </div>
 
       {error && <div className="error-message">{error}</div>}
 
       {loading ? (
-        <p>Loading logs...</p>
+        <p>{t.logs.loading}</p>
       ) : logs.length === 0 ? (
         <div className="empty-state">
-          <h3>No log entries</h3>
-          <p>Sync events will be recorded here.</p>
+          <h3>{t.logs.noLogs}</h3>
+          <p>{t.logs.noLogsDesc}</p>
         </div>
       ) : (
         <div className="logs-list">

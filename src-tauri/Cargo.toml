@@ -1,5 +1,5 @@
 [package]
-name = "lan-folder-sync"
+name = "lanbridge"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
-tauri = { version = "1", features = ["shell-open"] }
+tauri = { version = "1", features = ["dialog-open", "shell-open"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -23,6 +23,8 @@ walkdir = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 sha2 = "0.10"
+socket2 = "0.5"
+local-ip-address = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

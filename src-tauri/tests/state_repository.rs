@@ -1,6 +1,6 @@
-use lan_folder_sync::core::model::*;
-use lan_folder_sync::state::db;
-use lan_folder_sync::state::repository::*;
+use lanbridge::core::model::*;
+use lanbridge::state::db;
+use lanbridge::state::repository::*;
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -105,6 +105,96 @@ fn test_file_snapshot_upsert() {
 }
 
 #[test]
+fn test_file_snapshot_replace_for_task_removes_stale_paths() {
+    let conn = setup_db();
+    let task_repo = SyncTaskRepository::new(&conn);
+    let snap_repo = FileSnapshotRepository::new(&conn);
+
+    let task = SyncTask {
+        id: Uuid::new_v4(),
+        name: "Replace Snapshot Test".to_string(),
+        primary_device_id: "a".to_string(),
+        secondary_device_id: "b".to_string(),
+        local_path: "/tmp/a".to_string(),
+        remote_path: "/tmp/b".to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: now_ms(),
+        updated_unix_ms: now_ms(),
+    };
+    task_repo.insert(&task).unwrap();
+
+    let stale = FileSnapshot {
+        task_id: task.id,
+        relative_path: "deleted.txt".to_string(),
+        kind: EntryKind::File,
+        size: 1,
+        modified_unix_ms: 1,
+        blake3_hash: Some("old".to_string()),
+        hash_status: HashStatus::Verified,
+        deleted: false,
+        is_symlink: false,
+    };
+    snap_repo.upsert(&stale).unwrap();
+
+    let current = FileSnapshot {
+        task_id: task.id,
+        relative_path: "current.txt".to_string(),
+        kind: EntryKind::File,
+        size: 2,
+        modified_unix_ms: 2,
+        blake3_hash: Some("new".to_string()),
+        hash_status: HashStatus::Verified,
+        deleted: false,
+        is_symlink: false,
+    };
+    snap_repo.replace_for_task(&task.id, &[current]).unwrap();
+
+    assert!(snap_repo.get(&task.id, "deleted.txt").unwrap().is_none());
+    assert!(snap_repo.get(&task.id, "current.txt").unwrap().is_some());
+}
+
+#[test]
+fn test_sync_baseline_list_by_task_includes_paths_without_snapshots() {
+    let conn = setup_db();
+    let task_repo = SyncTaskRepository::new(&conn);
+    let baseline_repo = SyncBaselineRepository::new(&conn);
+
+    let task = SyncTask {
+        id: Uuid::new_v4(),
+        name: "Baseline List Test".to_string(),
+        primary_device_id: "a".to_string(),
+        secondary_device_id: "b".to_string(),
+        local_path: "/tmp/a".to_string(),
+        remote_path: "/tmp/b".to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: now_ms(),
+        updated_unix_ms: now_ms(),
+    };
+    task_repo.insert(&task).unwrap();
+
+    baseline_repo
+        .upsert(&SyncBaseline {
+            task_id: task.id,
+            relative_path: "deleted.txt".to_string(),
+            primary_hash: Some("hash".to_string()),
+            primary_hash_status: HashStatus::Verified,
+            primary_size: 10,
+            primary_modified_unix_ms: 100,
+            secondary_hash: Some("hash".to_string()),
+            secondary_hash_status: HashStatus::Verified,
+            secondary_modified_unix_ms: 100,
+            last_synced_unix_ms: 100,
+        })
+        .unwrap();
+
+    let baselines = baseline_repo.list_by_task(&task.id).unwrap();
+    assert_eq!(baselines.len(), 1);
+    assert_eq!(baselines[0].relative_path, "deleted.txt");
+}
+
+#[test]
 fn test_pending_return_operations() {
     let conn = setup_db();
     let task_repo = SyncTaskRepository::new(&conn);
@@ -171,7 +261,7 @@ fn test_history_operations() {
         id: Uuid::new_v4(),
         task_id: task.id,
         original_relative_path: "deleted.txt".to_string(),
-        stored_path: ".lan-sync-history/trash/123456/deleted.txt".to_string(),
+        stored_path: ".lanbridge-history/trash/123456/deleted.txt".to_string(),
         reason: HistoryReason::Trash,
         created_unix_ms: now_ms(),
         size: 512,

@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding new migrations.
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 /// Run all pending migrations.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -13,6 +13,10 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     if version < 1 {
         migrate_v1(conn)?;
+    }
+
+    if version < 2 {
+        migrate_v2(conn)?;
     }
 
     conn.pragma_update(None, "user_version", CURRENT_VERSION)?;
@@ -109,6 +113,16 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_pending_task ON pending_return_changes(task_id);
         CREATE INDEX IF NOT EXISTS idx_history_task ON history_entries(task_id);
         CREATE INDEX IF NOT EXISTS idx_logs_time ON event_logs(created_unix_ms);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Add primary_size to sync_baselines.
+fn migrate_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE sync_baselines ADD COLUMN primary_size INTEGER NOT NULL DEFAULT 0;
         "#,
     )?;
     Ok(())

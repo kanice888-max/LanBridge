@@ -3,9 +3,13 @@ import {
   listPendingReturns,
   executeReturnSync,
   detectConflicts,
+  resolveConflictOverwrite,
+  resolveConflictKeepBoth,
   type PendingReturnChange,
   type ConflictInfo,
 } from "../../lib/tauriApi";
+import { ConflictModal } from "../conflicts/ConflictModal";
+import { useTranslation } from "../../lib/i18n/context";
 
 interface ReturnSyncScreenProps {
   taskId: string;
@@ -13,12 +17,14 @@ interface ReturnSyncScreenProps {
 }
 
 export function ReturnSyncScreen({ taskId, onBack }: ReturnSyncScreenProps) {
+  const { t } = useTranslation();
   const [pending, setPending] = useState<PendingReturnChange[]>([]);
   const [conflicts, setConflicts] = useState<ConflictInfo[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [results, setResults] = useState<any[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeConflict, setActiveConflict] = useState<ConflictInfo | null>(null);
 
   const loadData = async () => {
     try {
@@ -71,6 +77,28 @@ export function ReturnSyncScreen({ taskId, onBack }: ReturnSyncScreenProps) {
     }
   };
 
+  const handleConflictOverwrite = async () => {
+    if (!activeConflict) return;
+    try {
+      await resolveConflictOverwrite(taskId, activeConflict.relative_path);
+      setActiveConflict(null);
+      await loadData();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const handleConflictKeepBoth = async () => {
+    if (!activeConflict) return;
+    try {
+      await resolveConflictKeepBoth(taskId, activeConflict.relative_path);
+      setActiveConflict(null);
+      await loadData();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const conflictPaths = new Set(conflicts.map((c) => c.relative_path));
 
   const formatTime = (unixMs: number) => new Date(unixMs).toLocaleString();
@@ -79,43 +107,40 @@ export function ReturnSyncScreen({ taskId, onBack }: ReturnSyncScreenProps) {
     <div className="screen-container">
       <div className="screen-header">
         <button className="btn btn-secondary" onClick={onBack}>
-          ← Back
+          ← {t.returnSync.back}
         </button>
-        <h1>Pending Return-Sync</h1>
+        <h1>{t.returnSync.title}</h1>
       </div>
 
       {error && <div className="error-message">{error}</div>}
 
       {conflicts.length > 0 && (
         <div className="conflict-banner">
-          <strong>{conflicts.length} conflict(s) detected</strong>
-          <p>
-            Files marked with ⚠️ have been changed on the primary since the
-            last sync. Return-syncing them will require conflict resolution.
-          </p>
+          <strong>{conflicts.length} {t.returnSync.conflictsBanner}</strong>
+          <p>{t.returnSync.conflictsDesc}</p>
         </div>
       )}
 
       {pending.length === 0 ? (
         <div className="empty-state">
-          <h3>No pending changes</h3>
-          <p>Secondary-side files will appear here when created or modified.</p>
+          <h3>{t.returnSync.noPending}</h3>
+          <p>{t.returnSync.noPendingDesc}</p>
         </div>
       ) : (
         <>
           <div className="pending-toolbar">
             <button className="btn btn-secondary" onClick={selectAll}>
-              Select Safe Items
+              {t.returnSync.selectSafe}
             </button>
-            <span>{selected.size} selected</span>
+            <span>{selected.size} {t.returnSync.selected}</span>
             <button
               className="btn btn-primary"
               onClick={handleReturnSync}
               disabled={syncing || selected.size === 0}
             >
               {syncing
-                ? "Syncing..."
-                : `Return-Sync ${selected.size} File(s)`}
+                ? t.returnSync.syncing
+                : `${t.returnSync.returnSyncN} ${selected.size} ${t.returnSync.file}`}
             </button>
           </div>
 
@@ -145,9 +170,17 @@ export function ReturnSyncScreen({ taskId, onBack }: ReturnSyncScreenProps) {
                     </span>
                   </div>
                   {isConflict && (
-                    <span className="conflict-badge" title="Conflict detected">
-                      ⚠️ Conflict
-                    </span>
+                    <button
+                      className="btn btn-small btn-danger"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setActiveConflict(
+                          conflicts.find((c) => c.relative_path === item.relative_path) ?? null
+                        );
+                      }}
+                    >
+                      ⚠️ {t.returnSync.resolve}
+                    </button>
                   )}
                 </div>
               );
@@ -158,10 +191,10 @@ export function ReturnSyncScreen({ taskId, onBack }: ReturnSyncScreenProps) {
 
       {results.length > 0 && (
         <div className="results-section">
-          <h3>Return-Sync Results</h3>
+          <h3>{t.returnSync.results}</h3>
           {results.map((r, i) => (
             <div
-              key={i}
+              key={r.relative_path || i}
               className={`result-item ${r.success ? "success" : "failure"}`}
             >
               <span>{r.relative_path}</span>
@@ -169,6 +202,15 @@ export function ReturnSyncScreen({ taskId, onBack }: ReturnSyncScreenProps) {
             </div>
           ))}
         </div>
+      )}
+
+      {activeConflict && (
+        <ConflictModal
+          conflict={activeConflict}
+          onOverwrite={handleConflictOverwrite}
+          onKeepBoth={handleConflictKeepBoth}
+          onCancel={() => setActiveConflict(null)}
+        />
       )}
     </div>
   );

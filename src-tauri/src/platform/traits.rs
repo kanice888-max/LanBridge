@@ -25,7 +25,7 @@ pub enum IgnoreDecision {
 ///
 /// Both macOS and Windows must implement this interface.
 /// Shared core modules depend on this trait, not on platform-specific code.
-pub trait Platform {
+pub trait Platform: Send + Sync {
     /// Return the application data directory for storing state, keys, logs.
     fn app_data_dir(&self) -> Result<PathBuf>;
 

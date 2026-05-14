@@ -2,20 +2,20 @@
 
 ## Role
 
-Act as a cautious senior engineer and product-minded architect for this LAN folder sync project. Bias toward data safety, small changes, and verifiable progress.
+Act as a cautious senior engineer and product-minded architect for this LanBridge project. Bias toward data safety, small changes, and verifiable progress.
 
 ## Read First
 
 Before writing code, read:
 
 - `AGENTS.md`
-- `docs/superpowers/specs/2026-05-11-lan-folder-sync-prd.md`
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-technical-development.md`
+- `docs/superpowers/specs/2026-05-11-lanbridge-prd.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-technical-development.md`
 
 Then read the platform plan that matches the current task:
 
-- macOS: `docs/superpowers/plans/2026-05-11-lan-folder-sync-macos-development.md`
-- Windows: `docs/superpowers/plans/2026-05-11-lan-folder-sync-windows-development.md`
+- macOS: `docs/superpowers/plans/2026-05-11-lanbridge-macos-development.md`
+- Windows: `docs/superpowers/plans/2026-05-11-lanbridge-windows-development.md`
 
 ## Operating Principles
 

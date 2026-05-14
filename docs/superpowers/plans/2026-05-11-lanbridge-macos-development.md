@@ -1,8 +1,8 @@
-# LAN Folder Sync macOS Implementation Plan
+# LanBridge macOS Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the first working macOS client and shared sync foundation for the LAN folder sync app.
+**Goal:** Build the first working macOS client and shared sync foundation for the LanBridge app.
 
 **Architecture:** Implement the shared Rust/Tauri engine while targeting macOS first. macOS establishes domain models, SQLite state, scanner, history/trash behavior, encrypted pairing, manual IP transport, React UI, and macOS-specific filesystem/watcher/menu-bar behavior.
 
@@ -15,17 +15,17 @@
 All macOS work happens in:
 
 - Path: `.worktrees/macos`
-- Branch: `codex/lan-sync-macos`
+- Branch: `codex/lanbridge-macos`
 
 The macOS worker owns the first implementation of shared modules because macOS is built first.
 
 ## 2. macOS-Specific Requirements
 
 - Use app data directory for identity, SQLite state, logs, and peer pins.
-- Use a per-sync-root `.lan-sync-history/` directory for user-restorable trash and overwritten files.
+- Use a per-sync-root `.lanbridge-history/` directory for user-restorable trash and overwritten files.
 - Use `notify` with macOS FSEvents support for live watching.
 - Use scanner fallback because FSEvents may coalesce or miss details after sleep.
-- Ignore `.DS_Store`, `.AppleDouble`, `.DocumentRevisions-V100`, `.Spotlight-V100`, `.TemporaryItems`, `.Trashes`, exact directory `.git/`, exact directory `node_modules/`, and `.lan-sync-history/` by default. `.gitignore`, `.gitmodules`, and `.github/` are not ignored by the `.git/` rule.
+- Ignore `.DS_Store`, `.AppleDouble`, `.DocumentRevisions-V100`, `.Spotlight-V100`, `.TemporaryItems`, `.Trashes`, exact directory `.git/`, exact directory `node_modules/`, and `.lanbridge-history/` by default. `.gitignore`, `.gitmodules`, and `.github/` are not ignored by the `.git/` rule.
 - Do not follow or synchronize symlinks in P0. Record skipped symlinks as warnings.
 - Preserve file contents and basic modified time; do not attempt full macOS metadata/resource fork sync in P0.
 - Show a menu bar/tray entry with open, pause all, sync now, and quit.
@@ -70,7 +70,7 @@ Run:
 git branch --show-current
 ```
 
-Expected: `codex/lan-sync-macos`.
+Expected: `codex/lanbridge-macos`.
 
 - [ ] **Step 2: Verify root ignores**
 
@@ -230,7 +230,7 @@ Default ignored names:
 .Trashes
 .git/
 node_modules/
-.lan-sync-history/
+.lanbridge-history/
 ```
 
 These are exact directory matches where a trailing slash is shown. The `.git/` rule does not ignore `.gitignore`, `.gitmodules`, or `.github/`.
@@ -280,8 +280,8 @@ Planner emits `ApplyToSecondary`, `MoveSecondaryToHistory`, `MarkPendingReturn`,
 Use:
 
 ```text
-.lan-sync-history/trash/<unix-ms>/<relative-path>
-.lan-sync-history/overwritten/<unix-ms>/<relative-path>
+.lanbridge-history/trash/<unix-ms>/<relative-path>
+.lanbridge-history/overwritten/<unix-ms>/<relative-path>
 ```
 
 History retention defaults to 30 days or 1 GB per sync task. Restore to the original relative path when free; if occupied, restore to a timestamped path such as `name (restored 2026-05-11 143000).ext`.
@@ -333,7 +333,7 @@ Create an Ed25519 identity on first launch and store it in the app data director
 
 - [ ] **Step 3: Implement pairing code**
 
-Derive a six-digit code from both public keys and a session nonce. Sort the two public keys lexicographically, then compute `SHA256("lan-sync-pairing-v1" || nonce || min_public_key || max_public_key)`, convert the first bytes to an integer, and take modulo `1_000_000`. Both devices must show the same zero-padded six-digit code.
+Derive a six-digit code from both public keys and a session nonce. Sort the two public keys lexicographically, then compute `SHA256("lanbridge-pairing-v1" || nonce || min_public_key || max_public_key)`, convert the first bytes to an integer, and take modulo `1_000_000`. Both devices must show the same zero-padded six-digit code.
 
 - [ ] **Step 4: Implement pinned encrypted connection**
 
@@ -345,7 +345,7 @@ Manual IP and port connection is P0. `src-tauri/src/transport/discovery.rs` may 
 
 - [ ] **Step 6: Implement safe file transfer**
 
-Write incoming data to `<target>.lan-sync-partial`, verify blake3 hash, then atomically rename. P0 does not support resumable transfer; failed transfers restart from byte 0. On startup, clean stale `.lan-sync-partial` files that are not owned by an active transfer.
+Write incoming data to `<target>.lanbridge-partial`, verify blake3 hash, then atomically rename. P0 does not support resumable transfer; failed transfers restart from byte 0. On startup, clean stale `.lanbridge-partial` files that are not owned by an active transfer.
 
 - [ ] **Step 7: Test local loopback transfer**
 
@@ -370,7 +370,7 @@ Send file to secondary and update baseline only after secondary confirms write c
 
 - [ ] **Step 2: Apply primary delete**
 
-Send delete notice to secondary. Secondary moves target file into `.lan-sync-history/trash`.
+Send delete notice to secondary. Secondary moves target file into `.lanbridge-history/trash`.
 
 - [ ] **Step 3: Record secondary pending returns**
 
@@ -382,7 +382,7 @@ Selected secondary files copy to primary only when no conflict exists.
 
 - [ ] **Step 5: Execute confirmed overwrite**
 
-Before overwriting primary, move old primary file into `.lan-sync-history/overwritten`.
+Before overwriting primary, move old primary file into `.lanbridge-history/overwritten`.
 
 - [ ] **Step 6: Test executor**
 

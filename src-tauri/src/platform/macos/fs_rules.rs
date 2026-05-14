@@ -1,10 +1,7 @@
 use crate::platform::traits::{IgnoreDecision, IgnoreReason};
 
 /// Exact file names to ignore on macOS.
-const EXACT_FILE_NAMES: &[&str] = &[
-    ".DS_Store",
-    ".AppleDouble",
-];
+const EXACT_FILE_NAMES: &[&str] = &[".DS_Store", ".AppleDouble"];
 
 /// Exact directory names to ignore (matched with trailing slash).
 const EXACT_DIR_NAMES: &[&str] = &[
@@ -14,13 +11,13 @@ const EXACT_DIR_NAMES: &[&str] = &[
     ".Trashes",
     ".git",
     "node_modules",
-    ".lan-sync-history",
+    ".lanbridge-history",
 ];
 
 /// Glob patterns to ignore.
 const GLOB_PATTERNS: &[&str] = &[
-    "~$*",    // Office temp files
-    "*.tmp",  // Temp files
+    "~$*",   // Office temp files
+    "*.tmp", // Temp files
 ];
 
 /// Check whether an entry should be ignored on macOS.
@@ -130,7 +127,10 @@ mod tests {
         // `.git` dir is ignored, but `.gitignore` and `.github` are NOT
         assert_eq!(classify_entry(".gitignore", false), IgnoreDecision::Allowed);
         assert_eq!(classify_entry(".github", true), IgnoreDecision::Allowed);
-        assert_eq!(classify_entry(".gitmodules", false), IgnoreDecision::Allowed);
+        assert_eq!(
+            classify_entry(".gitmodules", false),
+            IgnoreDecision::Allowed
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { type ConflictInfo } from "../../lib/tauriApi";
+import { useTranslation } from "../../lib/i18n/context";
 
 interface ConflictModalProps {
   conflict: ConflictInfo;
@@ -13,49 +14,47 @@ export function ConflictModal({
   onKeepBoth,
   onCancel,
 }: ConflictModalProps) {
+  const { t } = useTranslation();
   const formatTime = (unixMs: number) => new Date(unixMs).toLocaleString();
 
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>Sync Conflict</h2>
+        <h2>{t.conflict.title}</h2>
         <p className="conflict-description">
-          The file <strong>{conflict.relative_path}</strong> has been changed on
-          both sides since the last sync.
+          {t.conflict.description} <strong>{conflict.relative_path}</strong> {t.conflict.hasConflict}
         </p>
 
         {conflict.hash_unverified && (
           <div className="hash-warning">
-            Hash verification unavailable for this file.
-            Comparison uses size and modification time only.
+            {t.conflict.hashWarning}
           </div>
         )}
 
         <div className="conflict-details">
           <div className="conflict-side">
-            <h3>Primary (current)</h3>
-            <p>Modified: {formatTime(conflict.primary_modified_unix_ms)}</p>
+            <h3>{t.conflict.primarySide}</h3>
+            <p>{t.conflict.modified} {formatTime(conflict.primary_modified_unix_ms)}</p>
           </div>
           <div className="conflict-side">
-            <h3>Secondary (pending)</h3>
-            <p>Modified: {formatTime(conflict.secondary_modified_unix_ms)}</p>
+            <h3>{t.conflict.secondarySide}</h3>
+            <p>{t.conflict.modified} {formatTime(conflict.secondary_modified_unix_ms)}</p>
           </div>
         </div>
 
         <div className="safety-notice">
-          <strong>Note:</strong> Choosing "Overwrite Primary" will first back up
-          the current primary file to history before replacing it.
+          <strong>{t.conflict.note}</strong> {t.conflict.noteDesc}
         </div>
 
         <div className="modal-actions">
           <button className="btn btn-secondary" onClick={onCancel}>
-            Cancel
+            {t.conflict.cancel}
           </button>
           <button className="btn btn-secondary" onClick={onKeepBoth}>
-            Keep Both
+            {t.conflict.keepBoth}
           </button>
           <button className="btn btn-danger" onClick={onOverwrite}>
-            Overwrite Primary (with backup)
+            {t.conflict.overwrite}
           </button>
         </div>
       </div>

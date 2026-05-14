@@ -1,13 +1,12 @@
-use lan_folder_sync::core::conflict;
-use lan_folder_sync::core::executor;
-use lan_folder_sync::core::model::*;
-use lan_folder_sync::core::planner::{self, PlannedAction};
-use lan_folder_sync::core::scanner::scan_root;
-use lan_folder_sync::history::store::HistoryStore;
-use lan_folder_sync::platform::macos::MacPlatform;
-use lan_folder_sync::platform::traits::Platform;
-use lan_folder_sync::state::db;
-use lan_folder_sync::state::repository::*;
+use lanbridge::core::conflict;
+use lanbridge::core::executor;
+use lanbridge::core::model::*;
+use lanbridge::core::planner;
+use lanbridge::core::scanner::scan_root;
+use lanbridge::history::store::HistoryStore;
+use lanbridge::platform::macos::MacPlatform;
+use lanbridge::state::db;
+use lanbridge::state::repository::*;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
@@ -84,7 +83,10 @@ fn plan_and_execute_primary(
     // Also get baselines for files no longer in snapshots (detect deletes)
     let all_baselines_in_db = get_all_baselines_for_task(conn, &task.id);
     for b in &all_baselines_in_db {
-        if !baselines.iter().any(|existing| existing.relative_path == b.relative_path) {
+        if !baselines
+            .iter()
+            .any(|existing| existing.relative_path == b.relative_path)
+        {
             baselines.push(b.clone());
         }
     }
@@ -95,7 +97,7 @@ fn plan_and_execute_primary(
 
 fn get_all_baselines_for_task(conn: &Connection, task_id: &Uuid) -> Vec<SyncBaseline> {
     let mut stmt = conn
-        .prepare("SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms FROM sync_baselines WHERE task_id = ?1")
+        .prepare("SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms FROM sync_baselines WHERE task_id = ?1")
         .unwrap();
     let rows = stmt
         .query_map(rusqlite::params![task_id.to_string()], |row| {
@@ -109,11 +111,12 @@ fn get_all_baselines_for_task(conn: &Connection, task_id: &Uuid) -> Vec<SyncBase
                 relative_path: row.get(1)?,
                 primary_hash: row.get(2)?,
                 primary_hash_status: parse_hs(row.get(3)?),
-                primary_modified_unix_ms: row.get(4)?,
-                secondary_hash: row.get(5)?,
-                secondary_hash_status: parse_hs(row.get(6)?),
-                secondary_modified_unix_ms: row.get(7)?,
-                last_synced_unix_ms: row.get(8)?,
+                primary_size: row.get(4)?,
+                primary_modified_unix_ms: row.get(5)?,
+                secondary_hash: row.get(6)?,
+                secondary_hash_status: parse_hs(row.get(7)?),
+                secondary_modified_unix_ms: row.get(8)?,
+                last_synced_unix_ms: row.get(9)?,
             })
         })
         .unwrap();
@@ -139,15 +142,22 @@ fn test_primary_create_syncs_to_secondary() {
     let snaps = scan_and_store(&task, primary_dir.path(), &conn, &platform);
 
     // Step 3: Plan and execute — should ApplyToSecondary
-    let results = plan_and_execute_primary(&task, &snaps, &conn, secondary_dir.path());
+    let results = plan_and_execute_primary(&task, &snaps, &conn, primary_dir.path());
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "apply should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].success,
+        "apply should succeed: {:?}",
+        results[0].error
+    );
 
     // Step 4: Verify baseline was created
     let baseline_repo = SyncBaselineRepository::new(&conn);
     let baseline = baseline_repo.get(&task.id, "hello.txt").unwrap();
     assert!(baseline.is_some(), "baseline should exist after sync");
-    assert!(baseline.unwrap().primary_hash.is_some(), "baseline should have hash");
+    assert!(
+        baseline.unwrap().primary_hash.is_some(),
+        "baseline should have hash"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -165,7 +175,7 @@ fn test_primary_update_syncs_to_secondary() {
     // Initial sync: create file
     std::fs::write(primary_dir.path().join("doc.txt"), "version 1").unwrap();
     let snaps = scan_and_store(&task, primary_dir.path(), &conn, &platform);
-    let results = plan_and_execute_primary(&task, &snaps, &conn, secondary_dir.path());
+    let results = plan_and_execute_primary(&task, &snaps, &conn, primary_dir.path());
     assert!(results[0].success);
 
     // Simulate secondary receiving the file
@@ -176,7 +186,10 @@ fn test_primary_update_syncs_to_secondary() {
 
     // Re-scan primary — should detect change
     let snaps2 = scan_and_store(&task, primary_dir.path(), &conn, &platform);
-    let changed_snap = snaps2.iter().find(|s| s.relative_path == "doc.txt").unwrap();
+    let changed_snap = snaps2
+        .iter()
+        .find(|s| s.relative_path == "doc.txt")
+        .unwrap();
 
     // Hash should differ because content changed
     assert_ne!(
@@ -210,7 +223,7 @@ fn test_primary_delete_moves_secondary_to_history() {
     // Step 1: Create and sync
     std::fs::write(primary_dir.path().join("delete_me.txt"), "important data").unwrap();
     let snaps = scan_and_store(&task, primary_dir.path(), &conn, &platform);
-    let results = plan_and_execute_primary(&task, &snaps, &conn, secondary_dir.path());
+    let results = plan_and_execute_primary(&task, &snaps, &conn, primary_dir.path());
     assert!(results[0].success);
 
     // Simulate secondary has the file
@@ -262,7 +275,11 @@ fn test_secondary_create_becomes_pending_return() {
     task.local_role = DeviceRole::Secondary;
 
     // Step 1: Create file on secondary
-    std::fs::write(secondary_dir.path().join("new_on_secondary.txt"), "secondary content").unwrap();
+    std::fs::write(
+        secondary_dir.path().join("new_on_secondary.txt"),
+        "secondary content",
+    )
+    .unwrap();
 
     // Step 2: Scan secondary
     let snaps = scan_and_store(&task, secondary_dir.path(), &conn, &platform);
@@ -303,6 +320,7 @@ fn test_secondary_delete_does_not_affect_primary() {
         relative_path: "shared_file.txt".to_string(),
         primary_hash: Some("hash1".to_string()),
         primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -315,7 +333,10 @@ fn test_secondary_delete_does_not_affect_primary() {
 
     // Step 2: Plan as secondary — should be Noop
     let actions = planner::plan_sync(&snaps, &[baseline], DeviceRole::Secondary);
-    assert!(actions.is_empty(), "secondary delete should produce no actions");
+    assert!(
+        actions.is_empty(),
+        "secondary delete should produce no actions"
+    );
 
     // Primary file should be untouched
     assert!(primary_dir.path().exists());
@@ -356,6 +377,7 @@ fn test_return_sync_conflict_blocks_overwrite() {
             relative_path: "conflicted.txt".to_string(),
             primary_hash: Some("original_hash".to_string()),
             primary_hash_status: HashStatus::Verified,
+            primary_size: 100,
             primary_modified_unix_ms: 1000,
             secondary_hash: Some("original_hash".to_string()),
             secondary_hash_status: HashStatus::Verified,
@@ -401,32 +423,21 @@ fn test_return_sync_conflict_blocks_overwrite() {
 fn test_confirmed_overwrite_creates_backup() {
     let conn = setup_db();
     let primary_dir = TempDir::new().unwrap();
-    let task = create_task(&conn, primary_dir.path(), primary_dir.path());
+    let secondary_dir = TempDir::new().unwrap();
+    let task = create_task(&conn, primary_dir.path(), secondary_dir.path());
 
     // Create existing primary file
     let file_path = primary_dir.path().join("overwrite.txt");
     std::fs::write(&file_path, "original primary content").unwrap();
-
-    let current = FileSnapshot {
-        task_id: task.id,
-        relative_path: "overwrite.txt".to_string(),
-        kind: EntryKind::File,
-        size: 100,
-        modified_unix_ms: now_ms(),
-        blake3_hash: Some("incoming_hash".to_string()),
-        hash_status: HashStatus::Verified,
-        deleted: false,
-        is_symlink: false,
-    };
+    std::fs::write(
+        secondary_dir.path().join("overwrite.txt"),
+        "incoming content",
+    )
+    .unwrap();
 
     // Execute confirmed overwrite
-    let result = executor::execute_confirmed_overwrite(
-        &task,
-        "overwrite.txt",
-        &current,
-        primary_dir.path(),
-        &conn,
-    );
+    let result =
+        executor::execute_confirmed_overwrite(&task, "overwrite.txt", primary_dir.path(), &conn);
 
     assert!(result.success, "overwrite should succeed");
 
@@ -453,7 +464,9 @@ fn test_history_restore_to_original_path() {
     // Create and trash a file
     let source = dir.path().join("restore_me.txt");
     std::fs::write(&source, "important data").unwrap();
-    let entry = store.move_to_trash(&source, "restore_me.txt", now_ms()).unwrap();
+    let entry = store
+        .move_to_trash(&source, "restore_me.txt", now_ms())
+        .unwrap();
 
     // Source should be gone
     assert!(!source.exists());
@@ -461,7 +474,10 @@ fn test_history_restore_to_original_path() {
     // Restore to original path
     let restored = store.restore(&entry, dir.path(), now_ms()).unwrap();
     assert!(restored.exists());
-    assert_eq!(std::fs::read_to_string(&restored).unwrap(), "important data");
+    assert_eq!(
+        std::fs::read_to_string(&restored).unwrap(),
+        "important data"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -476,7 +492,9 @@ fn test_history_restore_creates_conflict_safe_name() {
     // Create and trash a file
     let source = dir.path().join("conflict.txt");
     std::fs::write(&source, "old version").unwrap();
-    let entry = store.move_to_trash(&source, "conflict.txt", now_ms()).unwrap();
+    let entry = store
+        .move_to_trash(&source, "conflict.txt", now_ms())
+        .unwrap();
 
     // Create a new file at the original path
     std::fs::write(dir.path().join("conflict.txt"), "new version").unwrap();
@@ -511,7 +529,7 @@ fn test_full_roundtrip_create_sync_delete_restore() {
 
     // 2. Scan and sync to secondary
     let snaps = scan_and_store(&task, primary_dir.path(), &conn, &platform);
-    let results = plan_and_execute_primary(&task, &snaps, &conn, secondary_dir.path());
+    let results = plan_and_execute_primary(&task, &snaps, &conn, primary_dir.path());
     assert!(results[0].success);
 
     // 3. Simulate secondary receiving the file
@@ -542,7 +560,9 @@ fn test_full_roundtrip_create_sync_delete_restore() {
     assert_eq!(entries.len(), 1);
 
     let store = HistoryStore::new(secondary_dir.path());
-    let restored = store.restore(&entries[0], secondary_dir.path(), now_ms()).unwrap();
+    let restored = store
+        .restore(&entries[0], secondary_dir.path(), now_ms())
+        .unwrap();
     assert!(restored.exists());
     assert_eq!(std::fs::read_to_string(&restored).unwrap(), "step 1");
 }
@@ -580,6 +600,7 @@ fn test_same_hash_not_a_conflict() {
         relative_path: "file.txt".to_string(),
         primary_hash: Some("same_hash".to_string()), // same hash as current
         primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("old_hash".to_string()),
         secondary_hash_status: HashStatus::Verified,

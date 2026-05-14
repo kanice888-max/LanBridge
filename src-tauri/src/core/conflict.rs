@@ -30,16 +30,29 @@ pub fn detect_conflict(
     current_primary: Option<&FileSnapshot>,
     baseline: Option<&SyncBaseline>,
 ) -> ConflictResult {
-    // If no baseline, this is a new file from secondary — no conflict
-    let baseline = match baseline {
-        Some(b) => b,
-        None => return ConflictResult::NoConflict,
-    };
-
     // If primary file doesn't currently exist, no conflict
     let primary = match current_primary {
         Some(p) if !p.deleted => p,
         _ => return ConflictResult::NoConflict,
+    };
+
+    // If there is no baseline but the primary path exists, return-sync would
+    // overwrite local data. Treat it as a conflict and require user choice.
+    let baseline = match baseline {
+        Some(b) => b,
+        None => {
+            return ConflictResult::Conflict {
+                relative_path: pending.relative_path.clone(),
+                primary_hash: primary.blake3_hash.clone(),
+                primary_hash_status: primary.hash_status,
+                primary_modified_unix_ms: primary.modified_unix_ms,
+                secondary_hash: pending.secondary_hash.clone(),
+                secondary_hash_status: pending.secondary_hash_status,
+                secondary_modified_unix_ms: pending.secondary_modified_unix_ms,
+                hash_unverified: primary.hash_status != HashStatus::Verified
+                    || pending.secondary_hash_status != HashStatus::Verified,
+            }
+        }
     };
 
     // Check if primary changed since baseline
@@ -78,7 +91,7 @@ fn has_primary_changed_since_baseline(primary: &FileSnapshot, baseline: &SyncBas
     }
 
     // Fallback: size or mtime differs
-    primary.size != baseline.primary_modified_unix_ms as i64
+    primary.size != baseline.primary_size
         || primary.modified_unix_ms != baseline.primary_modified_unix_ms
 }
 

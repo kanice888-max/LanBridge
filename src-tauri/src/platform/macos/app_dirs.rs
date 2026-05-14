@@ -19,7 +19,7 @@ impl MacPlatform {
         let app_data = PathBuf::from(home)
             .join("Library")
             .join("Application Support")
-            .join("LANFolderSync");
+            .join("LanBridge");
         Ok(Self { app_data })
     }
 
@@ -36,7 +36,7 @@ impl Platform for MacPlatform {
 
     fn database_path(&self) -> Result<PathBuf> {
         let dir = self.app_data_dir()?;
-        Ok(dir.join("lan-sync.db"))
+        Ok(dir.join("lanbridge.db"))
     }
 
     fn identity_key_path(&self) -> Result<PathBuf> {
@@ -51,7 +51,7 @@ impl Platform for MacPlatform {
 
     fn log_path(&self) -> Result<PathBuf> {
         let dir = self.app_data_dir()?;
-        Ok(dir.join("lan-sync.log"))
+        Ok(dir.join("lanbridge.log"))
     }
 
     fn normalize_relative_path(&self, path: &str) -> String {
@@ -77,7 +77,10 @@ impl Platform for MacPlatform {
         }
 
         if relative_path.starts_with('/') || relative_path.starts_with('\\') {
-            bail!("relative path cannot start with separator: {}", relative_path);
+            bail!(
+                "relative path cannot start with separator: {}",
+                relative_path
+            );
         }
 
         // Check for path traversal

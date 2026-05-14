@@ -34,7 +34,7 @@ pub fn plan_sync(
         let decision = match baseline_map.get(snap.relative_path.as_str()) {
             Some(baseline) => {
                 // File exists in baseline: check if changed
-                if has_changed(snap, baseline) {
+                if has_changed(snap, baseline, local_role) {
                     match local_role {
                         DeviceRole::Primary => SyncDecision::ApplyToSecondary,
                         DeviceRole::Secondary => SyncDecision::MarkPendingReturn,
@@ -57,7 +57,10 @@ pub fn plan_sync(
                 relative_path: snap.relative_path.clone(),
                 decision,
                 snapshot: Some(snap.clone()),
-                baseline: baseline_map.get(snap.relative_path.as_str()).cloned().cloned(),
+                baseline: baseline_map
+                    .get(snap.relative_path.as_str())
+                    .cloned()
+                    .cloned(),
             });
         }
     }
@@ -98,17 +101,28 @@ pub struct PlannedAction {
 /// Hash comparison is authoritative: if both hashes are available and match,
 /// the file has NOT changed even if mtime differs.
 /// If hashes are unavailable, fall back to size + mtime comparison.
-fn has_changed(snapshot: &FileSnapshot, baseline: &SyncBaseline) -> bool {
+fn has_changed(snapshot: &FileSnapshot, baseline: &SyncBaseline, local_role: DeviceRole) -> bool {
+    let (baseline_hash, baseline_hash_status, baseline_modified_unix_ms) = match local_role {
+        DeviceRole::Primary => (
+            &baseline.primary_hash,
+            baseline.primary_hash_status,
+            baseline.primary_modified_unix_ms,
+        ),
+        DeviceRole::Secondary => (
+            &baseline.secondary_hash,
+            baseline.secondary_hash_status,
+            baseline.secondary_modified_unix_ms,
+        ),
+    };
+
     // If both hashes are verified and available, compare hashes
-    if snapshot.hash_status == HashStatus::Verified
-        && baseline.primary_hash_status == HashStatus::Verified
+    if snapshot.hash_status == HashStatus::Verified && baseline_hash_status == HashStatus::Verified
     {
-        if let (Some(snap_hash), Some(base_hash)) = (&snapshot.blake3_hash, &baseline.primary_hash) {
+        if let (Some(snap_hash), Some(base_hash)) = (&snapshot.blake3_hash, baseline_hash) {
             return snap_hash != base_hash;
         }
     }
 
     // Fallback: compare size and modified time
-    snapshot.size != baseline.primary_modified_unix_ms as i64
-        || snapshot.modified_unix_ms != baseline.primary_modified_unix_ms
+    snapshot.size != baseline.primary_size || snapshot.modified_unix_ms != baseline_modified_unix_ms
 }

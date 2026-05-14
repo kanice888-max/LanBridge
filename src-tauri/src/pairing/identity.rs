@@ -30,7 +30,10 @@ impl DeviceIdentity {
             let bytes = std::fs::read(path)?;
             if bytes.len() == 32 {
                 let signing_key = SigningKey::from_bytes(
-                    bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("invalid key length"))?,
+                    bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid key length"))?,
                 );
                 return Ok(Self { signing_key });
             }

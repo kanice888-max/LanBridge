@@ -1,4 +1,4 @@
-# LAN Folder Sync Windows Implementation Plan
+# LanBridge Windows Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -15,7 +15,7 @@
 All Windows work happens in:
 
 - Path: `.worktrees/windows`
-- Branch: `codex/lan-sync-windows`
+- Branch: `codex/lanbridge-windows`
 
 Do not start this plan until the macOS branch has a passing baseline and stable shared interfaces.
 
@@ -24,10 +24,10 @@ All Windows commands in this plan assume PowerShell unless stated otherwise.
 ## 2. Windows-Specific Requirements
 
 - Use app data directory for identity, SQLite state, logs, and peer pins.
-- Use `.lan-sync-history/` inside each sync root for trash and overwritten files.
+- Use `.lanbridge-history/` inside each sync root for trash and overwritten files.
 - Use `notify` on Windows, backed by ReadDirectoryChangesW.
 - Use scanner fallback because watcher events may be incomplete during sleep, heavy writes, or network interruptions.
-- Ignore `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, exact directory `.git/`, exact directory `node_modules/`, temporary Office lock files, Windows shortcut files, and `.lan-sync-history/` by default.
+- Ignore `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, exact directory `.git/`, exact directory `node_modules/`, temporary Office lock files, Windows shortcut files, and `.lanbridge-history/` by default.
 - Handle Windows path restrictions, including reserved names, invalid characters, drive roots, long paths, trailing spaces, and trailing dots.
 - Treat path comparison carefully because default Windows filesystems are case-insensitive.
 - Do not follow or synchronize symlinks, junctions, or reparse points in P0. Record skipped entries as warnings.
@@ -36,7 +36,135 @@ All Windows commands in this plan assume PowerShell unless stated otherwise.
 - Support startup-at-login after explicit user opt-in.
 - Prepare MSI/NSIS packaging later; P0 can use development builds.
 
-## 3. Target File Structure
+## 3. Reusability Analysis From macOS Baseline
+
+### 3.1 Directly Reusable Files (Copy As-Is, Zero Changes)
+
+The following macOS files are fully platform-agnostic and can be copied directly to the Windows worktree without modification.
+
+**Rust Backend — Core Sync Engine (5 files):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src-tauri/src/core/model.rs` | Pure data types, enums, structs. No platform dependency. |
+| `src-tauri/src/core/planner.rs` | Pure decision logic comparing snapshots with baselines. |
+| `src-tauri/src/core/conflict.rs` | Conflict detection and filename generation. Pure logic. |
+| `src-tauri/src/core/executor.rs` | File operations use `std::fs` / `std::path`, cross-platform. |
+| `src-tauri/src/core/scanner.rs` | Directory walk + blake3 hashing via `std::fs`. Cross-platform. |
+
+**Rust Backend — Commands (1 file):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src-tauri/src/commands.rs` | Tauri command handlers depend only on `core`, `state`, `platform` trait. No platform-specific code. |
+
+**Rust Backend — State Persistence (4 files):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src-tauri/src/state/db.rs` | rusqlite with bundled SQLite. Cross-platform. |
+| `src-tauri/src/state/migrations.rs` | Pure SQL migrations. Platform-agnostic. |
+| `src-tauri/src/state/repository.rs` | All repository CRUD via rusqlite queries. No platform code. |
+| `src-tauri/src/state/mod.rs` | Module declarations only. |
+
+**Rust Backend — Pairing & Identity (3 files):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src-tauri/src/pairing/identity.rs` | Ed25519 via ed25519-dalek. Pure crypto, cross-platform. |
+| `src-tauri/src/pairing/handshake.rs` | SHA256 pairing code derivation. Pure logic. |
+| `src-tauri/src/pairing/mod.rs` | Module declarations only. |
+
+**Rust Backend — Transport (5 files):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src-tauri/src/transport/connection.rs` | TCP via tokio. Cross-platform. |
+| `src-tauri/src/transport/discovery.rs` | UDP stub. No platform code. |
+| `src-tauri/src/transport/protocol.rs` | Length-prefixed JSON wire format. Pure serialization. |
+| `src-tauri/src/transport/transfer.rs` | Streaming file I/O via tokio. Cross-platform. |
+| `src-tauri/src/transport/mod.rs` | Module declarations only. |
+
+**Rust Backend — History (2 files):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src-tauri/src/history/store.rs` | File move/copy via `std::fs`. Cross-platform. |
+| `src-tauri/src/history/mod.rs` | Module declaration only. |
+
+**Rust Backend — Other (2 files):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src-tauri/src/lib.rs` | Module declarations only. |
+| `src-tauri/src/platform/traits.rs` | `Platform` trait definition. Shared interface, copy as-is. |
+
+**Frontend — All Files (14 files, zero changes):**
+
+| File | Why Reusable |
+|------|-------------|
+| `src/lib/tauriApi.ts` | Tauri invoke wrappers. Platform-agnostic. |
+| `src/App.tsx` | Router and layout. No platform code. |
+| `src/main.tsx` | React entry point. |
+| `src/styles.css` | All styles. |
+| `src/vite-env.d.ts` | Vite type declarations. |
+| `src/components/Sidebar.tsx` | Navigation sidebar. |
+| `src/features/dashboard/Dashboard.tsx` | Task list dashboard. |
+| `src/features/pairing/PairingScreen.tsx` | Device pairing flow. |
+| `src/features/sync-task/TaskDetail.tsx` | Task detail and scan/sync. |
+| `src/features/return-sync/ReturnSyncScreen.tsx` | Pending return-sync UI. |
+| `src/features/conflicts/ConflictModal.tsx` | Conflict resolution modal. |
+| `src/features/history/HistoryScreen.tsx` | History/trash browser. |
+| `src/features/logs/LogsScreen.tsx` | Event log viewer. |
+| `src/features/settings/SettingsScreen.tsx` | App settings. |
+
+**Config & Dependencies:**
+
+| File | Notes |
+|------|-------|
+| `src-tauri/Cargo.toml` | All deps cross-platform (`rusqlite bundled`, `blake3`, `ed25519-dalek`, `tokio`, `notify`). `notify` auto-selects `ReadDirectoryChangesW` on Windows. Only change: if adding Windows-specific crate deps (e.g. `dirs`, `winreg`). |
+| `src-tauri/tauri.conf.json` | Reuse as-is. |
+| `package.json` | Reuse as-is. |
+| `tsconfig.json`, `vite.config.ts`, `index.html` | Reuse as-is. |
+
+### 3.2 Files Needing Minor Modification (2 files)
+
+| File | Change Required |
+|------|-----------------|
+| `src-tauri/src/app_state.rs` | Replace `use platform::macos::app_dirs::MacPlatform` → `use platform::windows::app_dirs::WinPlatform`; replace `Box::new(MacPlatform::new()?)` → `Box::new(WinPlatform::new()?)`. Two lines changed. |
+| `src-tauri/src/platform/mod.rs` | Add `pub mod windows;` alongside existing `pub mod macos;`. One line added. |
+
+### 3.3 Files To Create (Windows Platform Layer, 5-7 files)
+
+All new files go under `src-tauri/src/platform/windows/`. Each implements the existing `Platform` trait or provides Windows-specific behavior.
+
+| File | Complexity | Description |
+|------|-----------|-------------|
+| `platform/windows/mod.rs` | Trivial | Module declarations, re-export `WinPlatform`. |
+| `platform/windows/app_dirs.rs` | ~30 lines | Store app data under `%APPDATA%\LanBridge`. Implement `Platform` trait methods identical to macOS except for path base. |
+| `platform/windows/fs_rules.rs` | ~120 lines | Windows ignore rules (add `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, `*.lnk` to macOS rules). Plus Windows path validation (invalid chars, reserved names, trailing dots/spaces). |
+| `platform/windows/watcher.rs` | ~50 lines | Likely identical to macOS watcher — `notify` crate auto-selects backend. May need minor tweaks for Windows-specific debounce behavior. |
+| `platform/windows/tray.rs` | ~30 lines | MenuItems constants (identical to macOS version). |
+
+Optional P0 extras (from existing plan):
+
+| File | Description |
+|------|-------------|
+| `platform/windows/firewall.rs` | Detect firewall errors, return structured error with help text. |
+| `platform/windows/startup.rs` | Registry-based startup-at-login via `HKCU\...\Run`. |
+
+### 3.4 Summary
+
+| Category | File Count | Work Required |
+|----------|-----------|---------------|
+| Direct copy (zero changes) | ~36 files | Copy to worktree |
+| Minor modification | 2 files | 3 lines total |
+| New platform files | 5-7 files | ~250 lines, simple trait implementations |
+| **Total codebase** | ~43 files | **~95% reusable as-is** |
+
+The `Platform` trait abstraction isolates all platform differences. Windows development is primarily implementing this trait with Windows-specific paths, ignore rules, and path validation — the sync engine, transport, state, UI, and commands are shared.
+
+## 4. Target File Structure
 
 ```text
 src-tauri/src/
@@ -52,7 +180,7 @@ src-tauri/src/
 │       └── startup.rs
 ```
 
-## 4. P0 Windows Task Plan
+## 5. P0 Windows Task Plan
 
 ### Task 1: Rebase From macOS Baseline
 
@@ -67,7 +195,7 @@ Run:
 git branch --show-current
 ```
 
-Expected: `codex/lan-sync-windows`.
+Expected: `codex/lanbridge-windows`.
 
 - [ ] **Step 2: Bring in macOS baseline**
 
@@ -129,7 +257,7 @@ $RECYCLE.BIN
 System Volume Information
 .git/
 node_modules/
-.lan-sync-history/
+.lanbridge-history/
 ```
 
 Default glob patterns:
@@ -245,7 +373,7 @@ Verify scanner handles normal drive paths, nested folders, ignored system files,
 Verify primary delete moves secondary file into:
 
 ```text
-.lan-sync-history/trash/<unix-ms>/<relative-path>
+.lanbridge-history/trash/<unix-ms>/<relative-path>
 ```
 
 - [ ] **Step 3: Test overwrite backup**
@@ -253,7 +381,7 @@ Verify primary delete moves secondary file into:
 Verify confirmed return-sync overwrite moves old primary file into:
 
 ```text
-.lan-sync-history/overwritten/<unix-ms>/<relative-path>
+.lanbridge-history/overwritten/<unix-ms>/<relative-path>
 ```
 
 - [ ] **Step 4: Test locked file behavior**
@@ -373,7 +501,7 @@ git add -A
 git commit -m "feat: add Windows platform support"
 ```
 
-## 5. Integration Handoff
+## 6. Integration Handoff
 
 Windows branch is ready for integration when:
 
@@ -384,7 +512,7 @@ Windows branch is ready for integration when:
 - Windows app builds.
 - Windows runtime notes are documented.
 
-## 6. Integration Scenarios To Verify Later
+## 7. Integration Scenarios To Verify Later
 
 - Mac primary to Windows secondary.
 - Windows primary to Mac secondary.

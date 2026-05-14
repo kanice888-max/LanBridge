@@ -10,6 +10,7 @@ import {
   type FileSnapshot,
   type SyncActionResult,
 } from "../../lib/tauriApi";
+import { useTranslation } from "../../lib/i18n/context";
 
 interface TaskDetailProps {
   taskId: string;
@@ -24,6 +25,7 @@ export function TaskDetail({
   onOpenReturnSync,
   onOpenHistory,
 }: TaskDetailProps) {
+  const { t } = useTranslation();
   const [task, setTask] = useState<SyncTask | null>(null);
   const [snapshots, setSnapshots] = useState<FileSnapshot[]>([]);
   const [pendingCount, setPendingCount] = useState(0);
@@ -101,9 +103,9 @@ export function TaskDetail({
     return (
       <div className="screen-container">
         <button className="btn btn-secondary" onClick={onBack}>
-          Back
+          ← {t.task.back}
         </button>
-        <p>Loading...</p>
+        <p>{t.task.loading}</p>
       </div>
     );
   }
@@ -112,7 +114,7 @@ export function TaskDetail({
     <div className="screen-container">
       <div className="screen-header">
         <button className="btn btn-secondary" onClick={onBack}>
-          ← Back
+          ← {t.task.back}
         </button>
         <h1>{task.name}</h1>
         <span className={`role-badge ${task.local_role.toLowerCase()}`}>
@@ -124,34 +126,34 @@ export function TaskDetail({
 
       <div className="task-info-grid">
         <div className="info-card">
-          <span className="label">Local Path</span>
+          <span className="label">{t.task.localPath}</span>
           <span className="value monospace">{task.local_path}</span>
         </div>
         <div className="info-card">
-          <span className="label">Remote Path</span>
+          <span className="label">{t.task.remotePath}</span>
           <span className="value monospace">{task.remote_path}</span>
         </div>
         <div className="info-card">
-          <span className="label">Status</span>
+          <span className="label">{t.task.status}</span>
           <span className={`value ${task.enabled ? "status-active" : "status-paused"}`}>
-            {task.enabled ? "Active" : "Paused"}
+            {task.enabled ? t.task.active : t.task.paused}
           </span>
         </div>
         <div className="info-card">
-          <span className="label">Created</span>
+          <span className="label">{t.task.created}</span>
           <span className="value">{formatTime(task.created_unix_ms)}</span>
         </div>
       </div>
 
       <div className="action-bar">
         <button className="btn btn-primary" onClick={handleSync} disabled={syncing}>
-          {syncing ? "Syncing..." : "Scan & Sync"}
+          {syncing ? t.task.syncing : t.task.scanAndSync}
         </button>
         <button className="btn btn-secondary" onClick={handleScan}>
-          Scan Only
+          {t.task.scanOnly}
         </button>
         <button className="btn btn-secondary" onClick={handleToggle}>
-          {task.enabled ? "Pause" : "Resume"}
+          {task.enabled ? t.task.pause : t.task.resume}
         </button>
       </div>
 
@@ -161,20 +163,20 @@ export function TaskDetail({
           onClick={onOpenReturnSync}
         >
           <span className="status-count">{pendingCount}</span>
-          <span className="status-label">Pending Return</span>
+          <span className="status-label">{t.task.pendingReturn}</span>
         </div>
         <div className="status-item">
           <span className="status-count warning">{conflictCount}</span>
-          <span className="status-label">Conflicts</span>
+          <span className="status-label">{t.task.conflicts}</span>
         </div>
         <div className="status-item clickable" onClick={onOpenHistory}>
-          <span className="status-label">View History →</span>
+          <span className="status-label">{t.task.viewHistory}</span>
         </div>
       </div>
 
       {syncResults.length > 0 && (
         <div className="results-section">
-          <h3>Last Sync Results</h3>
+          <h3>{t.task.lastResults}</h3>
           <div className="results-list">
             {syncResults.map((r, i) => (
               <div
@@ -193,7 +195,7 @@ export function TaskDetail({
 
       {snapshots.length > 0 && (
         <div className="snapshots-section">
-          <h3>Files ({snapshots.filter((s) => s.kind === "File").length})</h3>
+          <h3>{t.task.files} ({snapshots.filter((s) => s.kind === "File").length})</h3>
           <div className="file-list">
             {snapshots
               .filter((s) => s.kind === "File")

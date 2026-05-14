@@ -6,7 +6,7 @@
     "distDir": "../dist"
   },
   "package": {
-    "productName": "LAN Folder Sync",
+    "productName": "LanBridge",
     "version": "0.1.0"
   },
   "tauri": {
@@ -15,12 +15,16 @@
       "shell": {
         "all": false,
         "open": true
+      },
+      "dialog": {
+        "all": false,
+        "open": true
       }
     },
     "bundle": {
       "active": true,
       "targets": "all",
-      "identifier": "com.lanfoldersync.app",
+      "identifier": "com.lanbridge.app",
       "icon": [
         "icons/32x32.png",
         "icons/128x128.png",
@@ -36,7 +40,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "LAN Folder Sync",
+        "title": "LanBridge",
         "width": 900,
         "height": 620
       }

@@ -1,6 +1,6 @@
-use lan_folder_sync::platform::macos::fs_rules;
-use lan_folder_sync::platform::macos::MacPlatform;
-use lan_folder_sync::platform::traits::{IgnoreDecision, IgnoreReason, Platform};
+use lanbridge::platform::macos::fs_rules;
+use lanbridge::platform::macos::MacPlatform;
+use lanbridge::platform::traits::{IgnoreDecision, IgnoreReason, Platform};
 use std::path::PathBuf;
 
 // ===== fs_rules tests =====
@@ -40,22 +40,33 @@ fn test_node_modules_ignored() {
 #[test]
 fn test_history_directory_ignored() {
     assert_eq!(
-        fs_rules::classify_entry(".lan-sync-history", true),
-        IgnoreDecision::Ignored(IgnoreReason::ExactDirectory(".lan-sync-history".to_string()))
+        fs_rules::classify_entry(".lanbridge-history", true),
+        IgnoreDecision::Ignored(IgnoreReason::ExactDirectory(
+            ".lanbridge-history".to_string()
+        ))
     );
 }
 
 #[test]
 fn test_git_file_not_ignored() {
     // .gitignore is NOT ignored by the .git/ rule
-    assert_eq!(fs_rules::classify_entry(".gitignore", false), IgnoreDecision::Allowed);
-    assert_eq!(fs_rules::classify_entry(".gitmodules", false), IgnoreDecision::Allowed);
+    assert_eq!(
+        fs_rules::classify_entry(".gitignore", false),
+        IgnoreDecision::Allowed
+    );
+    assert_eq!(
+        fs_rules::classify_entry(".gitmodules", false),
+        IgnoreDecision::Allowed
+    );
 }
 
 #[test]
 fn test_github_dir_not_ignored() {
     // .github is NOT ignored by the .git/ rule
-    assert_eq!(fs_rules::classify_entry(".github", true), IgnoreDecision::Allowed);
+    assert_eq!(
+        fs_rules::classify_entry(".github", true),
+        IgnoreDecision::Allowed
+    );
 }
 
 #[test]
@@ -76,16 +87,27 @@ fn test_tmp_file_ignored() {
 
 #[test]
 fn test_normal_files_allowed() {
-    assert_eq!(fs_rules::classify_entry("readme.md", false), IgnoreDecision::Allowed);
-    assert_eq!(fs_rules::classify_entry("src", true), IgnoreDecision::Allowed);
-    assert_eq!(fs_rules::classify_entry("main.rs", false), IgnoreDecision::Allowed);
+    assert_eq!(
+        fs_rules::classify_entry("readme.md", false),
+        IgnoreDecision::Allowed
+    );
+    assert_eq!(
+        fs_rules::classify_entry("src", true),
+        IgnoreDecision::Allowed
+    );
+    assert_eq!(
+        fs_rules::classify_entry("main.rs", false),
+        IgnoreDecision::Allowed
+    );
 }
 
 #[test]
 fn test_macos_specific_dirs_ignored() {
     assert_eq!(
         fs_rules::classify_entry(".DocumentRevisions-V100", true),
-        IgnoreDecision::Ignored(IgnoreReason::ExactDirectory(".DocumentRevisions-V100".to_string()))
+        IgnoreDecision::Ignored(IgnoreReason::ExactDirectory(
+            ".DocumentRevisions-V100".to_string()
+        ))
     );
     assert_eq!(
         fs_rules::classify_entry(".Spotlight-V100", true),
@@ -116,7 +138,9 @@ fn test_validate_target_relative_path() {
 
     // Valid paths
     assert!(platform.validate_target_relative_path("file.txt").is_ok());
-    assert!(platform.validate_target_relative_path("dir/file.txt").is_ok());
+    assert!(platform
+        .validate_target_relative_path("dir/file.txt")
+        .is_ok());
     assert!(platform.validate_target_relative_path("a/b/c.txt").is_ok());
 
     // Invalid paths
@@ -142,10 +166,7 @@ fn test_detect_case_collisions() {
     assert_eq!(collisions[0].len(), 2);
 
     // No collision when cases differ
-    let no_collision = vec![
-        "File.txt".to_string(),
-        "Other.txt".to_string(),
-    ];
+    let no_collision = vec!["File.txt".to_string(), "Other.txt".to_string()];
     assert!(platform.detect_case_collisions(&no_collision).is_empty());
 }
 

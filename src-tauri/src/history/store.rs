@@ -9,7 +9,7 @@ pub const DEFAULT_RETENTION_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// Default history size limit: 1 GB.
 pub const DEFAULT_SIZE_LIMIT_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// History store manages the `.lan-sync-history/` directory within a sync root.
+/// History store manages the `.lanbridge-history/` directory within a sync root.
 pub struct HistoryStore {
     history_dir: PathBuf,
 }
@@ -17,7 +17,7 @@ pub struct HistoryStore {
 impl HistoryStore {
     pub fn new(sync_root: &Path) -> Self {
         Self {
-            history_dir: sync_root.join(".lan-sync-history"),
+            history_dir: sync_root.join(".lanbridge-history"),
         }
     }
 
@@ -33,28 +33,46 @@ impl HistoryStore {
 
     /// Move a file from its current location into the history trash.
     ///
-    /// Stores at: `.lan-sync-history/trash/<unix-ms>/<relative_path>`
+    /// Stores at: `.lanbridge-history/trash/<unix-ms>/<relative_path>`
     pub fn move_to_trash(
         &self,
         source: &Path,
         relative_path: &str,
         now_unix_ms: i64,
     ) -> Result<HistoryEntry> {
-        let dest = self.trash_dir().join(now_unix_ms.to_string()).join(relative_path);
-        self.move_to_history(source, &dest, relative_path, HistoryReason::Trash, now_unix_ms)
+        let dest = self
+            .trash_dir()
+            .join(now_unix_ms.to_string())
+            .join(relative_path);
+        self.move_to_history(
+            source,
+            &dest,
+            relative_path,
+            HistoryReason::Trash,
+            now_unix_ms,
+        )
     }
 
     /// Move a file to history as an overwritten backup.
     ///
-    /// Stores at: `.lan-sync-history/overwritten/<unix-ms>/<relative_path>`
+    /// Stores at: `.lanbridge-history/overwritten/<unix-ms>/<relative_path>`
     pub fn move_to_overwritten(
         &self,
         source: &Path,
         relative_path: &str,
         now_unix_ms: i64,
     ) -> Result<HistoryEntry> {
-        let dest = self.overwritten_dir().join(now_unix_ms.to_string()).join(relative_path);
-        self.move_to_history(source, &dest, relative_path, HistoryReason::Overwritten, now_unix_ms)
+        let dest = self
+            .overwritten_dir()
+            .join(now_unix_ms.to_string())
+            .join(relative_path);
+        self.move_to_history(
+            source,
+            &dest,
+            relative_path,
+            HistoryReason::Overwritten,
+            now_unix_ms,
+        )
     }
 
     /// Restore a history entry to its original relative path.
@@ -88,10 +106,7 @@ impl HistoryStore {
                 .naive_utc();
             let ts = dt.format("%Y-%m-%d %H%M%S").to_string();
 
-            let restored_name = format!(
-                "{} (restored {}){}",
-                stem, ts, ext
-            );
+            let restored_name = format!("{} (restored {}){}", stem, ts, ext);
             sync_root.join(parent).join(restored_name)
         } else {
             original
@@ -162,10 +177,7 @@ impl HistoryStore {
     /// Clean up old history entries.
     ///
     /// Removes entries older than `retention_days` days and enforces size limit.
-    pub fn cleanup_old_entries(
-        &self,
-        cutoff_unix_ms: i64,
-    ) -> Result<usize> {
+    pub fn cleanup_old_entries(&self, cutoff_unix_ms: i64) -> Result<usize> {
         let mut deleted = 0;
 
         for subdir in &["trash", "overwritten"] {

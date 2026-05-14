@@ -1,9 +1,9 @@
-use lan_folder_sync::core::conflict::{conflict_filename, detect_conflict, ConflictResult};
-use lan_folder_sync::core::model::*;
-use lan_folder_sync::core::planner::{plan_sync, PlannedAction};
-use lan_folder_sync::core::scanner::scan_root;
-use lan_folder_sync::history::store::HistoryStore;
-use lan_folder_sync::platform::macos::MacPlatform;
+use lanbridge::core::conflict::{conflict_filename, detect_conflict, ConflictResult};
+use lanbridge::core::model::*;
+use lanbridge::core::planner::plan_sync;
+use lanbridge::core::scanner::scan_root;
+use lanbridge::history::store::HistoryStore;
+use lanbridge::platform::macos::MacPlatform;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -126,6 +126,7 @@ fn test_planner_primary_delete() {
         relative_path: "old.txt".to_string(),
         primary_hash: Some("hash1".to_string()),
         primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -146,6 +147,7 @@ fn test_planner_secondary_delete_ignored() {
         relative_path: "old.txt".to_string(),
         primary_hash: Some("hash1".to_string()),
         primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -177,6 +179,7 @@ fn test_planner_unchanged_file_noop() {
         relative_path: "file.txt".to_string(),
         primary_hash: Some("same_hash".to_string()),
         primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("same_hash".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -186,6 +189,38 @@ fn test_planner_unchanged_file_noop() {
 
     let actions = plan_sync(&[snap], &[baseline], DeviceRole::Primary);
     assert!(actions.is_empty());
+}
+
+#[test]
+fn test_planner_secondary_compares_secondary_baseline() {
+    let snap = FileSnapshot {
+        task_id: Uuid::nil(),
+        relative_path: "file.txt".to_string(),
+        kind: EntryKind::File,
+        size: 100,
+        modified_unix_ms: 2000,
+        blake3_hash: Some("secondary_new".to_string()),
+        hash_status: HashStatus::Verified,
+        deleted: false,
+        is_symlink: false,
+    };
+
+    let baseline = SyncBaseline {
+        task_id: Uuid::nil(),
+        relative_path: "file.txt".to_string(),
+        primary_hash: Some("secondary_new".to_string()),
+        primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
+        primary_modified_unix_ms: 2000,
+        secondary_hash: Some("secondary_old".to_string()),
+        secondary_hash_status: HashStatus::Verified,
+        secondary_modified_unix_ms: 1000,
+        last_synced_unix_ms: 1000,
+    };
+
+    let actions = plan_sync(&[snap], &[baseline], DeviceRole::Secondary);
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].decision, SyncDecision::MarkPendingReturn);
 }
 
 // ===== Conflict Tests =====
@@ -205,6 +240,34 @@ fn test_conflict_no_baseline() {
     // No baseline = no conflict (new file)
     let result = detect_conflict(&pending, None, None);
     assert!(matches!(result, ConflictResult::NoConflict));
+}
+
+#[test]
+fn test_conflict_no_baseline_but_primary_exists() {
+    let pending = PendingReturnChange {
+        task_id: Uuid::nil(),
+        relative_path: "file.txt".to_string(),
+        change_kind: ChangeKind::Created,
+        secondary_hash: Some("secondary_hash".to_string()),
+        secondary_hash_status: HashStatus::Verified,
+        secondary_modified_unix_ms: 2000,
+        created_unix_ms: now_ms(),
+    };
+
+    let primary = FileSnapshot {
+        task_id: Uuid::nil(),
+        relative_path: "file.txt".to_string(),
+        kind: EntryKind::File,
+        size: 100,
+        modified_unix_ms: 1000,
+        blake3_hash: Some("primary_hash".to_string()),
+        hash_status: HashStatus::Verified,
+        deleted: false,
+        is_symlink: false,
+    };
+
+    let result = detect_conflict(&pending, Some(&primary), None);
+    assert!(matches!(result, ConflictResult::Conflict { .. }));
 }
 
 #[test]
@@ -236,6 +299,7 @@ fn test_conflict_primary_changed() {
         relative_path: "file.txt".to_string(),
         primary_hash: Some("hash_original".to_string()),
         primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -264,7 +328,7 @@ fn test_conflict_mtime_changed_but_hash_same() {
         relative_path: "file.txt".to_string(),
         kind: EntryKind::File,
         size: 100,
-        modified_unix_ms: 5000, // mtime changed
+        modified_unix_ms: 5000,                     // mtime changed
         blake3_hash: Some("same_hash".to_string()), // but hash is same
         hash_status: HashStatus::Verified,
         deleted: false,
@@ -276,6 +340,7 @@ fn test_conflict_mtime_changed_but_hash_same() {
         relative_path: "file.txt".to_string(),
         primary_hash: Some("same_hash".to_string()),
         primary_hash_status: HashStatus::Verified,
+        primary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -297,7 +362,9 @@ fn test_history_move_to_trash() {
     std::fs::write(&source, "important data").unwrap();
 
     let store = HistoryStore::new(dir.path());
-    let entry = store.move_to_trash(&source, "delete_me.txt", now_ms()).unwrap();
+    let entry = store
+        .move_to_trash(&source, "delete_me.txt", now_ms())
+        .unwrap();
 
     assert!(!source.exists()); // Source moved
     assert_eq!(entry.reason, HistoryReason::Trash);
@@ -312,11 +379,15 @@ fn test_history_move_to_overwritten() {
     std::fs::write(&source, "old content").unwrap();
 
     let store = HistoryStore::new(dir.path());
-    let entry = store.move_to_overwritten(&source, "old_version.txt", now_ms()).unwrap();
+    let entry = store
+        .move_to_overwritten(&source, "old_version.txt", now_ms())
+        .unwrap();
 
     assert!(!source.exists());
     assert_eq!(entry.reason, HistoryReason::Overwritten);
-    assert!(entry.stored_path.contains("overwritten") || entry.stored_path.contains("overwritten\\"));
+    assert!(
+        entry.stored_path.contains("overwritten") || entry.stored_path.contains("overwritten\\")
+    );
 }
 
 #[test]
@@ -352,7 +423,10 @@ fn test_history_restore_conflict_name() {
     assert!(restored.to_string_lossy().contains("restored"));
     assert_eq!(std::fs::read_to_string(&restored).unwrap(), "old data");
     // Original file unchanged
-    assert_eq!(std::fs::read_to_string(dir.path().join("file.txt")).unwrap(), "new data");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "new data"
+    );
 }
 
 #[test]

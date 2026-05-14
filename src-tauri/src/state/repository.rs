@@ -204,6 +204,17 @@ impl<'a> FileSnapshotRepository<'a> {
         Ok(result)
     }
 
+    pub fn replace_for_task(&self, task_id: &Uuid, snapshots: &[FileSnapshot]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_snapshots WHERE task_id = ?1",
+            params![task_id.to_string()],
+        )?;
+        for snap in snapshots {
+            self.upsert(snap)?;
+        }
+        Ok(())
+    }
+
     pub fn mark_deleted(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE file_snapshots SET deleted = 1 WHERE task_id = ?1 AND relative_path = ?2",
@@ -225,11 +236,12 @@ impl<'a> SyncBaselineRepository<'a> {
 
     pub fn upsert(&self, baseline: &SyncBaseline) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sync_baselines (task_id, relative_path, primary_hash, primary_hash_status, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO sync_baselines (task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(task_id, relative_path) DO UPDATE SET
                 primary_hash = excluded.primary_hash,
                 primary_hash_status = excluded.primary_hash_status,
+                primary_size = excluded.primary_size,
                 primary_modified_unix_ms = excluded.primary_modified_unix_ms,
                 secondary_hash = excluded.secondary_hash,
                 secondary_hash_status = excluded.secondary_hash_status,
@@ -240,6 +252,7 @@ impl<'a> SyncBaselineRepository<'a> {
                 baseline.relative_path,
                 baseline.primary_hash,
                 format!("{:?}", baseline.primary_hash_status),
+                baseline.primary_size,
                 baseline.primary_modified_unix_ms,
                 baseline.secondary_hash,
                 format!("{:?}", baseline.secondary_hash_status),
@@ -252,7 +265,7 @@ impl<'a> SyncBaselineRepository<'a> {
 
     pub fn get(&self, task_id: &Uuid, relative_path: &str) -> Result<Option<SyncBaseline>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms
+            "SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms
              FROM sync_baselines WHERE task_id = ?1 AND relative_path = ?2",
         )?;
         let result = stmt.query_row(params![task_id.to_string(), relative_path], |row| {
@@ -266,11 +279,12 @@ impl<'a> SyncBaselineRepository<'a> {
                 relative_path: row.get(1)?,
                 primary_hash: row.get(2)?,
                 primary_hash_status: parse_hs(row.get(3)?),
-                primary_modified_unix_ms: row.get(4)?,
-                secondary_hash: row.get(5)?,
-                secondary_hash_status: parse_hs(row.get(6)?),
-                secondary_modified_unix_ms: row.get(7)?,
-                last_synced_unix_ms: row.get(8)?,
+                primary_size: row.get(4)?,
+                primary_modified_unix_ms: row.get(5)?,
+                secondary_hash: row.get(6)?,
+                secondary_hash_status: parse_hs(row.get(7)?),
+                secondary_modified_unix_ms: row.get(8)?,
+                last_synced_unix_ms: row.get(9)?,
             })
         });
         match result {
@@ -278,6 +292,37 @@ impl<'a> SyncBaselineRepository<'a> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub fn list_by_task(&self, task_id: &Uuid) -> Result<Vec<SyncBaseline>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms
+             FROM sync_baselines WHERE task_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![task_id.to_string()], |row| {
+            let parse_hs = |s: String| match s.as_str() {
+                "Verified" => HashStatus::Verified,
+                "UnverifiedLargeFile" => HashStatus::UnverifiedLargeFile,
+                _ => HashStatus::Unavailable,
+            };
+            Ok(SyncBaseline {
+                task_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                relative_path: row.get(1)?,
+                primary_hash: row.get(2)?,
+                primary_hash_status: parse_hs(row.get(3)?),
+                primary_size: row.get(4)?,
+                primary_modified_unix_ms: row.get(5)?,
+                secondary_hash: row.get(6)?,
+                secondary_hash_status: parse_hs(row.get(7)?),
+                secondary_modified_unix_ms: row.get(8)?,
+                last_synced_unix_ms: row.get(9)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 }
 
@@ -484,6 +529,27 @@ impl<'a> PairedDeviceRepository<'a> {
             Err(e) => Err(e.into()),
         }
     }
+
+    pub fn list_all(&self) -> Result<Vec<PairedDevice>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device_id, display_name, public_key, last_seen_unix_ms, trusted
+             FROM paired_devices ORDER BY last_seen_unix_ms DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PairedDevice {
+                device_id: row.get(0)?,
+                display_name: row.get(1)?,
+                public_key: row.get(2)?,
+                last_seen_unix_ms: row.get(3)?,
+                trusted: row.get::<_, i32>(4)? != 0,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
 }
 
 /// Repository for event logs.
@@ -524,7 +590,9 @@ impl<'a> LogRepository<'a> {
                     "Error" => LogLevel::Error,
                     _ => LogLevel::Info,
                 },
-                task_id: row.get::<_, Option<String>>(2)?.and_then(|s| Uuid::parse_str(&s).ok()),
+                task_id: row
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|s| Uuid::parse_str(&s).ok()),
                 relative_path: row.get(3)?,
                 message: row.get(4)?,
                 created_unix_ms: row.get(5)?,

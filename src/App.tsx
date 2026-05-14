@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { getIdentity, listSyncTasks, type IdentityInfo, type SyncTask } from "./lib/tauriApi";
+import { LanguageProvider, useTranslation } from "./lib/i18n/context";
 import { Sidebar } from "./components/Sidebar";
 import { PairingScreen } from "./features/pairing/PairingScreen";
 import { Dashboard } from "./features/dashboard/Dashboard";
@@ -19,12 +20,13 @@ type Screen =
   | "logs"
   | "settings";
 
-export default function App() {
+function AppContent() {
   const [screen, setScreen] = useState<Screen>("dashboard");
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
   const [tasks, setTasks] = useState<SyncTask[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { t } = useTranslation();
 
   const refreshTasks = useCallback(async () => {
     try {
@@ -50,7 +52,14 @@ export default function App() {
   const renderScreen = () => {
     switch (screen) {
       case "pairing":
-        return <PairingScreen onComplete={refreshTasks} />;
+        return (
+          <PairingScreen
+            onComplete={() => {
+              refreshTasks();
+              setScreen("dashboard");
+            }}
+          />
+        );
       case "dashboard":
         return (
           <Dashboard
@@ -104,11 +113,19 @@ export default function App() {
         {error && (
           <div className="error-banner">
             <span>{error}</span>
-            <button onClick={() => setError(null)}>Dismiss</button>
+            <button onClick={() => setError(null)}>{t.app.dismiss}</button>
           </div>
         )}
         {renderScreen()}
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <LanguageProvider>
+      <AppContent />
+    </LanguageProvider>
   );
 }

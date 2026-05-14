@@ -1,4 +1,4 @@
-# LAN Folder Sync PRD
+# LanBridge PRD
 
 ## 1. Product Summary
 
@@ -69,7 +69,7 @@ Each sync task has:
 - A fixed sync direction: primary to secondary.
 - A manual return direction: secondary to primary.
 
-The primary-secondary direction can be switched only while both configured folders are empty after applying platform ignore rules. "Empty" means both folders contain no non-ignored files and no non-ignored directory entries. Ignored entries such as `.DS_Store`, `Thumbs.db`, and `.lan-sync-history` do not block direction switching.
+The primary-secondary direction can be switched only while both configured folders are empty after applying platform ignore rules. "Empty" means both folders contain no non-ignored files and no non-ignored directory entries. Ignored entries such as `.DS_Store`, `Thumbs.db`, and `.lanbridge-history` do not block direction switching.
 
 ## 6. Sync Rules
 

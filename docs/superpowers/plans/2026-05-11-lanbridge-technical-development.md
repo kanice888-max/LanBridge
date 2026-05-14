@@ -1,20 +1,20 @@
-# LAN Folder Sync Technical Development Index
+# LanBridge Technical Development Index
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement the platform plans task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Coordinate development of the LAN folder sync app across macOS and Windows while keeping platform-specific work isolated.
+**Goal:** Coordinate development of the LanBridge app across macOS and Windows while keeping platform-specific work isolated.
 
 **Architecture:** Build the macOS client first to establish the shared Rust/Tauri sync engine, product behavior, UI flow, encrypted pairing, and safety model. Then implement the Windows client by reusing shared engine interfaces and adding Windows-specific filesystem, watcher, tray, firewall, startup, and packaging behavior.
 
-**Tech Stack:** Rust, Tauri, React, TypeScript, SQLite, Tokio, notify, blake3, tokio-rustls, macOS FSEvents via `notify`, Windows ReadDirectoryChangesW via `notify`, Vitest, Rust tests, Playwright.
+**Tech Stack:** Rust, Tauri, React, TypeScript, SQLite, Tokio, notify, blake3, tokio-rustls, socket2, local-ip-address, macOS FSEvents via `notify`, Windows ReadDirectoryChangesW via `notify`, Vitest, Rust tests, Playwright.
 
 ---
 
 ## Required Reading Order
 
-1. Product requirements: `docs/superpowers/specs/2026-05-11-lan-folder-sync-prd.md`
-2. macOS implementation plan: `docs/superpowers/plans/2026-05-11-lan-folder-sync-macos-development.md`
-3. Windows implementation plan: `docs/superpowers/plans/2026-05-11-lan-folder-sync-windows-development.md`
+1. Product requirements: `docs/superpowers/specs/2026-05-11-lanbridge-prd.md`
+2. macOS implementation plan: `docs/superpowers/plans/2026-05-11-lanbridge-macos-development.md`
+3. Windows implementation plan: `docs/superpowers/plans/2026-05-11-lanbridge-windows-development.md`
 
 ## Required UI Skill
 
@@ -39,14 +39,14 @@ Keep the worktree count small. Use one platform worktree per OS plus one integra
 ### macOS Worktree
 
 - Path: `.worktrees/macos`
-- Branch: `codex/lan-sync-macos`
+- Branch: `codex/lanbridge-macos`
 - Purpose: design and implement the first working client, including shared engine modules where needed.
 - Owned files:
   - `src-tauri/src/core/**`
   - `src-tauri/src/state/**`
   - `src-tauri/src/history/**`
   - `src-tauri/src/pairing/**`
-  - `src-tauri/src/transport/**`
+  - `src-tauri/src/transport/**` (including shared auto-discovery code)
   - `src-tauri/src/platform/macos/**`
   - `src/**`
   - `tests/**`
@@ -55,10 +55,10 @@ Keep the worktree count small. Use one platform worktree per OS plus one integra
 ### Windows Worktree
 
 - Path: `.worktrees/windows`
-- Branch: `codex/lan-sync-windows`
+- Branch: `codex/lanbridge-windows`
 - Purpose: adapt the working macOS baseline to Windows and implement Windows-only filesystem, watcher, tray, firewall, startup, and packaging behavior.
 - Owned files:
-  - `src-tauri/src/platform/windows/**`
+  - `src-tauri/src/platform/windows/**` (including `firewall.rs` for multicast firewall detection)
   - Windows-specific Tauri config and packaging files
   - Windows-specific tests
   - shared code only when required for platform abstraction compatibility
@@ -66,7 +66,7 @@ Keep the worktree count small. Use one platform worktree per OS plus one integra
 ### Integration Worktree
 
 - Path: `.worktrees/integration`
-- Branch: `codex/lan-sync-integration`
+- Branch: `codex/lanbridge-integration`
 - Purpose: merge macOS and Windows work, resolve interface mismatches, and run two-device integration verification.
 - Owned files:
   - any file required to resolve merge conflicts
@@ -97,7 +97,7 @@ Then commit the documentation baseline:
 
 ```powershell
 git add .gitignore AGENTS.md CLAUDE.md docs
-git commit -m "docs: add LAN folder sync product and development plans"
+git commit -m "docs: add LanBridge product and development plans"
 ```
 
 Expected: the repository has its first commit containing the PRD, platform plans, AI rules, and generated documentation bundle.
@@ -109,9 +109,9 @@ Run these from repository root after the bootstrap docs commit exists:
 The following `git worktree` commands are shell-neutral and can be run from Bash, Git Bash, or PowerShell. Platform-specific plans use Bash for macOS commands and PowerShell for Windows commands.
 
 ```bash
-git worktree add .worktrees/macos -b codex/lan-sync-macos
-git worktree add .worktrees/windows -b codex/lan-sync-windows
-git worktree add .worktrees/integration -b codex/lan-sync-integration
+git worktree add .worktrees/macos -b codex/lanbridge-macos
+git worktree add .worktrees/windows -b codex/lanbridge-windows
+git worktree add .worktrees/integration -b codex/lanbridge-integration
 ```
 
 Before creating project-local worktrees, ensure `.worktrees/` is ignored:
@@ -122,11 +122,12 @@ Before creating project-local worktrees, ensure `.worktrees/` is ignored:
 
 ## Development Order
 
-1. Complete the macOS plan first.
+1. Complete the macOS plan first (including shared auto-discovery transport).
 2. Stabilize shared interfaces and commit the macOS baseline.
 3. Start the Windows plan from the macOS baseline.
-4. Merge both platform branches in the integration worktree.
-5. Verify Mac-to-Windows and Windows-to-Mac task roles over LAN.
+4. Verify UDP multicast auto-discovery works on Windows (firewall handling).
+5. Merge both platform branches in the integration worktree.
+6. Verify Mac-to-Windows and Windows-to-Mac auto-discovery and task roles over LAN.
 
 ## Shared Sync Semantics
 
@@ -151,7 +152,7 @@ Both clients must implement exactly the same product semantics:
 - Large files above the eager hash limit use size and modified time as a hash-unverified fallback.
 - P0 does not follow or synchronize symlinks.
 - P0 treats directory rename/move as delete plus create.
-- P0 cleans stale `.lan-sync-partial` files on startup. During graceful shutdown, the app stops accepting new work and waits up to 30 seconds for the current single-file transfer; if it does not finish, interrupt it and let startup cleanup/retry handle the partial file.
+- P0 cleans stale `.lanbridge-partial` files on startup. During graceful shutdown, the app stops accepting new work and waits up to 30 seconds for the current single-file transfer; if it does not finish, interrupt it and let startup cleanup/retry handle the partial file.
 
 ## Shared Defaults
 
@@ -160,17 +161,57 @@ Both clients must implement exactly the same product semantics:
 - History retention: 30 days or 1 GB per sync task.
 - Log retention: latest 10,000 entries or 7 days, whichever keeps fewer entries.
 - Transfer resumability: not supported in P0; failed transfers restart from byte 0.
-- High-risk default ignores: exact directory `.git/`, exact directory `node_modules/`, `.lan-sync-history/`, platform system trash/history folders, Windows shortcuts `*.lnk`, and platform-specific junk files.
+- High-risk default ignores: exact directory `.git/`, exact directory `node_modules/`, `.lanbridge-history/`, platform system trash/history folders, Windows shortcuts `*.lnk`, and platform-specific junk files.
+- Auto-discovery multicast group: `239.10.10.10`, port `53530`.
+- Auto-discovery announce interval: 5 seconds.
+- Auto-discovery peer timeout: 15 seconds (3 missed announces).
 
 ## Ignore Rule Matching
 
 Platform ignore rules must distinguish exact name matches, exact directory matches, and glob patterns:
 
 - Exact file/name match examples: `.DS_Store`, `Thumbs.db`, `desktop.ini`.
-- Exact directory match examples: `.git/`, `node_modules/`, `.lan-sync-history/`.
+- Exact directory match examples: `.git/`, `node_modules/`, `.lanbridge-history/`.
 - Glob pattern examples: `~$*`, `*.tmp`, `*.lnk`.
 
 The `.git/` rule applies only to a directory named `.git`. Do not treat `.gitignore`, `.gitmodules`, or `.github/` as ignored by this rule.
+
+## Shared Auto-Discovery Transport
+
+Both platforms use the same UDP multicast auto-discovery mechanism:
+
+- Multicast group: `239.10.10.10`, port `53530`.
+- Each device sends a JSON announce every 5 seconds: `{ device_id, display_name, public_key, port }`.
+- Peers not heard from in 15 seconds are marked offline.
+- Uses `socket2` crate for cross-platform multicast socket configuration.
+- Uses `local-ip-address` crate for cross-platform local IP detection.
+- Manual IP connection remains available as a fallback.
+
+The discovery and server code (`src-tauri/src/transport/discovery.rs`, `src-tauri/src/transport/server.rs`) is shared transport code owned by the macOS worktree initially. The Windows worktree inherits this code and only adds platform-specific behavior in `src-tauri/src/platform/windows/firewall.rs` for firewall detection and guidance.
+
+Cross-platform difference: Windows may block multicast UDP by default via Windows Firewall. The Windows platform layer must detect this scenario and show guidance with a copyable PowerShell command to open port 53530. macOS does not typically block multicast.
+
+### Auto-Discovery Known Issues (must fix before P1)
+
+1. **SyncServer 端口未与 DiscoveryService 联动**
+   - 当前 `DiscoveryService` 在 `AppState::new()` 中硬编码端口 `9527`，但 `SyncServer` 尚未启动。
+   - 修复方案：先启动 `SyncServer` 获取实际端口，再传入 `DiscoveryService::new(..., actual_port)`。
+   - 影响：announce 广播的端口信息可能不准确，对端连接会失败。
+
+2. **手动连接模式的 device_id 语义不正确**
+   - `handleManualConnect` 将 IP 地址字符串当作 `peer_deviceId`，`approvePairing` 存储的 `device_id` 不是真正的 Ed25519 公钥指纹。
+   - 修复方案：实现 TLS 握手后，用对端真实 `device_id` 替换 IP 地址。
+   - 影响：可用但语义混乱，数据库中存在假 device_id 记录。
+
+3. **SyncServer 未启动、shutdown 未使用**
+   - `SyncServer::start()` 定义但未在 `main.rs` 中调用。
+   - 修复方案：在启动 DiscoveryService 之前启动 SyncServer，并将实际端口传入。
+   - 影响：当前无接收对端连接的能力。
+
+4. **前端设备列表每次轮询全量替换**
+   - `setDevices(online)` 每 2 秒用全新数组替换，即使设备未变也触发 React 重新渲染。
+   - 修复方案：用 `useMemo` 或浅比较避免无变化时的 setState。
+   - 影响：轻微性能问题，P1 优化即可。
 
 ## Shared Platform Abstraction
 
@@ -236,11 +277,11 @@ Do not overwrite an existing conflict file. If the generated name already exists
 
 Use the macOS plan for initial architecture and working behavior:
 
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-macos-development.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-macos-development.md`
 
 Use the Windows plan only after the macOS baseline exists:
 
-- `docs/superpowers/plans/2026-05-11-lan-folder-sync-windows-development.md`
+- `docs/superpowers/plans/2026-05-11-lanbridge-windows-development.md`
 
 ## AI Worker Rules
 

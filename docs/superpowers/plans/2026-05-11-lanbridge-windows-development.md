@@ -1,12 +1,12 @@
-# LAN Folder Sync Windows Implementation Plan
+# LanBridge Windows Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the Windows client after the macOS baseline is stable, reusing shared sync semantics while implementing Windows-specific filesystem, watcher, tray, firewall, startup, and packaging behavior.
 
-**Architecture:** Start from the macOS/shared baseline. Add a Windows platform layer behind the same platform abstraction, then verify Mac-to-Windows and Windows-to-Mac primary/secondary roles using the same encrypted transport and sync engine.
+**Architecture:** Start from the macOS/shared baseline. Add a Windows platform layer behind the same platform abstraction, then verify Mac-to-Windows and Windows-to-Mac primary/secondary roles using the same encrypted transport and sync engine. Verify UDP multicast auto-discovery works on Windows with proper firewall handling.
 
-**Tech Stack:** Rust, Tauri, React, TypeScript, SQLite, Tokio, notify on Windows/ReadDirectoryChangesW, blake3, tokio-rustls, Windows tray/autostart integration, Vitest, Rust tests, Playwright.
+**Tech Stack:** Rust, Tauri, React, TypeScript, SQLite, Tokio, notify on Windows/ReadDirectoryChangesW, blake3, tokio-rustls, socket2, local-ip-address, Windows tray/autostart integration, Vitest, Rust tests, Playwright.
 
 ---
 
@@ -15,7 +15,7 @@
 All Windows work happens in:
 
 - Path: `.worktrees/windows`
-- Branch: `codex/lan-sync-windows`
+- Branch: `codex/lanbridge-windows`
 
 Do not start this plan until the macOS branch has a passing baseline and stable shared interfaces.
 
@@ -24,10 +24,10 @@ All Windows commands in this plan assume PowerShell unless stated otherwise.
 ## 2. Windows-Specific Requirements
 
 - Use app data directory for identity, SQLite state, logs, and peer pins.
-- Use `.lan-sync-history/` inside each sync root for trash and overwritten files.
+- Use `.lanbridge-history/` inside each sync root for trash and overwritten files.
 - Use `notify` on Windows, backed by ReadDirectoryChangesW.
 - Use scanner fallback because watcher events may be incomplete during sleep, heavy writes, or network interruptions.
-- Ignore `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, exact directory `.git/`, exact directory `node_modules/`, temporary Office lock files, Windows shortcut files, and `.lan-sync-history/` by default.
+- Ignore `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, exact directory `.git/`, exact directory `node_modules/`, temporary Office lock files, Windows shortcut files, and `.lanbridge-history/` by default.
 - Handle Windows path restrictions, including reserved names, invalid characters, drive roots, long paths, trailing spaces, and trailing dots.
 - Treat path comparison carefully because default Windows filesystems are case-insensitive.
 - Do not follow or synchronize symlinks, junctions, or reparse points in P0. Record skipped entries as warnings.
@@ -67,7 +67,7 @@ Run:
 git branch --show-current
 ```
 
-Expected: `codex/lan-sync-windows`.
+Expected: `codex/lanbridge-windows`.
 
 - [ ] **Step 2: Bring in macOS baseline**
 
@@ -129,7 +129,7 @@ $RECYCLE.BIN
 System Volume Information
 .git/
 node_modules/
-.lan-sync-history/
+.lanbridge-history/
 ```
 
 Default glob patterns:
@@ -220,6 +220,12 @@ Only enable startup after explicit user opt-in. Store the setting in app config.
 
 When listening or connecting fails with likely firewall errors, return a structured error with Windows-specific help text. Do not silently retry forever. P0 must not automatically create firewall rules or request elevation. It may show guidance text and a copyable PowerShell command that the user can run manually as administrator.
 
+Additionally, detect when UDP multicast discovery fails (no peers discovered but network is available) and show guidance that Windows Firewall may be blocking multicast UDP on port 53530. Provide a copyable PowerShell command:
+
+```powershell
+New-NetFirewallRule -DisplayName "LanBridge Discovery" -Direction Inbound -Protocol UDP -LocalPort 53530 -Action Allow
+```
+
 - [ ] **Step 4: Test platform commands**
 
 Run:
@@ -245,7 +251,7 @@ Verify scanner handles normal drive paths, nested folders, ignored system files,
 Verify primary delete moves secondary file into:
 
 ```text
-.lan-sync-history/trash/<unix-ms>/<relative-path>
+.lanbridge-history/trash/<unix-ms>/<relative-path>
 ```
 
 - [ ] **Step 3: Test overwrite backup**
@@ -253,7 +259,7 @@ Verify primary delete moves secondary file into:
 Verify confirmed return-sync overwrite moves old primary file into:
 
 ```text
-.lan-sync-history/overwritten/<unix-ms>/<relative-path>
+.lanbridge-history/overwritten/<unix-ms>/<relative-path>
 ```
 
 - [ ] **Step 4: Test locked file behavior**
@@ -270,11 +276,46 @@ cargo test --manifest-path src-tauri/Cargo.toml windows_scanner_planner_history
 
 Expected: Windows filesystem tests pass.
 
-### Task 5: Verify Transport And Pairing On Windows
+### Task 5: Verify Auto-Discovery On Windows
+
+**Files:**
+- Create: `src-tauri/tests/transport/windows_discovery_test.rs`
+
+- [ ] **Step 1: Test multicast socket on Windows**
+
+Verify that `socket2` correctly configures UDP multicast on Windows: join group `239.10.10.10`, bind to port `53530`, set `SO_REUSEADDR`. Verify two local instances discover each other.
+
+- [ ] **Step 2: Test local IP detection on Windows**
+
+Verify `local-ip-address` returns a valid LAN IP on Windows. If multiple adapters exist, verify the announce message includes a reachable IP. This validates the crate's Windows compatibility, not the crate's internal selection logic.
+
+- [ ] **Step 3: Test firewall blocked scenario**
+
+Simulate or manually block multicast UDP and verify the app detects no peers and shows the firewall guidance message with a copyable PowerShell command.
+
+- [ ] **Step 4: Test manual IP fallback**
+
+Verify manual IP connection works on Windows when multicast is blocked, using the existing TLS pairing flow.
+
+**Known issue:** 手动 IP 模式将 IP 地址字符串当作 `peer_device_id`，`approvePairing` 存储的不是真正的 Ed25519 device_id。后续实现 TLS 握手后需用真实 device_id 替换。详见技术开发索引 "Auto-Discovery Known Issues" 第 2 条。
+
+- [ ] **Step 5: Run discovery tests**
+
+Run:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml windows_discovery
+```
+
+Expected: multicast discovery works on Windows, firewall guidance appears when blocked, manual fallback succeeds.
+
+### Task 6: Verify TLS Transport And Pairing On Windows
 
 **Files:**
 - Create: `src-tauri/tests/transport/windows_pairing_transfer_test.rs`
 - Modify transport only if Windows socket behavior requires it.
+
+**Pre-condition:** 在此任务中必须将 `SyncServer` 集成到 `main.rs`，启动后获取实际端口，再传入 `DiscoveryService`。当前 DiscoveryService 端口硬编码 `9527`，需在此任务中修正。详见技术开发索引 "Auto-Discovery Known Issues" 第 1 和第 3 条。
 
 - [ ] **Step 1: Test persistent identity storage**
 
@@ -306,7 +347,7 @@ cargo test --manifest-path src-tauri/Cargo.toml windows_pairing_transfer
 
 Expected: Windows transport tests pass.
 
-### Task 6: Windows UI Adaptation
+### Task 7: Windows UI Adaptation
 
 **Files:**
 - Modify: `src/features/settings/SettingsScreen.tsx`
@@ -322,7 +363,7 @@ Expected output in the worker notes: Windows-specific UX decisions, copy tone, e
 
 - [ ] **Step 2: Add Windows-specific copy**
 
-Pairing and connection errors must mention firewall/network permission when appropriate.
+Pairing and connection errors must mention firewall/network permission when appropriate. When multicast discovery returns no results, show a message suggesting firewall may be blocking UDP multicast with a link to settings or a copyable fix command.
 
 - [ ] **Step 3: Add invalid path messages**
 
@@ -346,7 +387,7 @@ npm test
 
 Expected: UI tests pass.
 
-### Task 7: Windows Build Verification
+### Task 8: Windows Build Verification
 
 **Files:**
 - Modify: Windows-specific Tauri config only if required
@@ -386,6 +427,7 @@ Windows branch is ready for integration when:
 
 ## 6. Integration Scenarios To Verify Later
 
+- Mac discovers Windows via UDP multicast and vice versa.
 - Mac primary to Windows secondary.
 - Windows primary to Mac secondary.
 - Mac primary delete moves Windows secondary file to history.
@@ -394,3 +436,4 @@ Windows branch is ready for integration when:
 - Mac secondary change returns manually to Windows primary.
 - Case collision from Mac to Windows is blocked.
 - Windows invalid path is rejected before transfer.
+- Manual IP fallback works when multicast is blocked on either side.

@@ -1,12 +1,12 @@
-# LAN Folder Sync macOS Implementation Plan
+# LanBridge macOS Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the first working macOS client and shared sync foundation for the LAN folder sync app.
+**Goal:** Build the first working macOS client and shared sync foundation for the LanBridge app.
 
-**Architecture:** Implement the shared Rust/Tauri engine while targeting macOS first. macOS establishes domain models, SQLite state, scanner, history/trash behavior, encrypted pairing, manual IP transport, React UI, and macOS-specific filesystem/watcher/menu-bar behavior.
+**Architecture:** Implement the shared Rust/Tauri engine while targeting macOS first. macOS establishes domain models, SQLite state, scanner, history/trash behavior, encrypted pairing, UDP multicast auto-discovery transport, React UI, and macOS-specific filesystem/watcher/menu-bar behavior.
 
-**Tech Stack:** Rust, Tauri, React, TypeScript, SQLite, Tokio, notify on macOS/FSEvents, blake3, tokio-rustls, Ed25519 identity, Vitest, Rust tests, Playwright.
+**Tech Stack:** Rust, Tauri, React, TypeScript, SQLite, Tokio, notify on macOS/FSEvents, blake3, tokio-rustls, socket2, local-ip-address, Ed25519 identity, Vitest, Rust tests, Playwright.
 
 ---
 
@@ -15,17 +15,17 @@
 All macOS work happens in:
 
 - Path: `.worktrees/macos`
-- Branch: `codex/lan-sync-macos`
+- Branch: `codex/lanbridge-macos`
 
 The macOS worker owns the first implementation of shared modules because macOS is built first.
 
 ## 2. macOS-Specific Requirements
 
 - Use app data directory for identity, SQLite state, logs, and peer pins.
-- Use a per-sync-root `.lan-sync-history/` directory for user-restorable trash and overwritten files.
+- Use a per-sync-root `.lanbridge-history/` directory for user-restorable trash and overwritten files.
 - Use `notify` with macOS FSEvents support for live watching.
 - Use scanner fallback because FSEvents may coalesce or miss details after sleep.
-- Ignore `.DS_Store`, `.AppleDouble`, `.DocumentRevisions-V100`, `.Spotlight-V100`, `.TemporaryItems`, `.Trashes`, exact directory `.git/`, exact directory `node_modules/`, and `.lan-sync-history/` by default. `.gitignore`, `.gitmodules`, and `.github/` are not ignored by the `.git/` rule.
+- Ignore `.DS_Store`, `.AppleDouble`, `.DocumentRevisions-V100`, `.Spotlight-V100`, `.TemporaryItems`, `.Trashes`, exact directory `.git/`, exact directory `node_modules/`, and `.lanbridge-history/` by default. `.gitignore`, `.gitmodules`, and `.github/` are not ignored by the `.git/` rule.
 - Do not follow or synchronize symlinks in P0. Record skipped symlinks as warnings.
 - Preserve file contents and basic modified time; do not attempt full macOS metadata/resource fork sync in P0.
 - Show a menu bar/tray entry with open, pause all, sync now, and quit.
@@ -70,7 +70,7 @@ Run:
 git branch --show-current
 ```
 
-Expected: `codex/lan-sync-macos`.
+Expected: `codex/lanbridge-macos`.
 
 - [ ] **Step 2: Verify root ignores**
 
@@ -230,7 +230,7 @@ Default ignored names:
 .Trashes
 .git/
 node_modules/
-.lan-sync-history/
+.lanbridge-history/
 ```
 
 These are exact directory matches where a trailing slash is shown. The `.git/` rule does not ignore `.gitignore`, `.gitmodules`, or `.github/`.
@@ -280,8 +280,8 @@ Planner emits `ApplyToSecondary`, `MoveSecondaryToHistory`, `MarkPendingReturn`,
 Use:
 
 ```text
-.lan-sync-history/trash/<unix-ms>/<relative-path>
-.lan-sync-history/overwritten/<unix-ms>/<relative-path>
+.lanbridge-history/trash/<unix-ms>/<relative-path>
+.lanbridge-history/overwritten/<unix-ms>/<relative-path>
 ```
 
 History retention defaults to 30 days or 1 GB per sync task. Restore to the original relative path when free; if occupied, restore to a timestamped path such as `name (restored 2026-05-11 143000).ext`.
@@ -302,7 +302,7 @@ cargo test --manifest-path src-tauri/Cargo.toml scanner_planner_history
 
 Expected: delete moves to history, secondary delete does not affect primary, and conflicts are detected.
 
-### Task 5: Implement Pairing And Transport On macOS
+### Task 5: Implement Pairing, Auto-Discovery, And Transport On macOS
 
 **Files:**
 - Create: `src-tauri/src/pairing/identity.rs`
@@ -312,10 +312,12 @@ Expected: delete moves to history, secondary delete does not affect primary, and
 - Create: `src-tauri/src/transport/connection.rs`
 - Create: `src-tauri/src/transport/transfer.rs`
 - Create: `src-tauri/src/transport/discovery.rs`
+- Create: `src-tauri/src/transport/server.rs`
 - Create: `src-tauri/src/transport/mod.rs`
 - Test: `src-tauri/tests/transport/pairing_transfer_test.rs`
+- Test: `src-tauri/tests/transport/discovery_test.rs`
 
-- [ ] **Step 1: Add crypto and TLS dependencies**
+- [ ] **Step 1: Add crypto, TLS, and networking dependencies**
 
 Add:
 
@@ -325,6 +327,8 @@ rand = "0.8"
 rustls = "0.23"
 sha2 = "0.10"
 tokio-rustls = "0.26"
+socket2 = "0.5"
+local-ip-address = "0.6"
 ```
 
 - [ ] **Step 2: Implement persistent identity**
@@ -333,29 +337,46 @@ Create an Ed25519 identity on first launch and store it in the app data director
 
 - [ ] **Step 3: Implement pairing code**
 
-Derive a six-digit code from both public keys and a session nonce. Sort the two public keys lexicographically, then compute `SHA256("lan-sync-pairing-v1" || nonce || min_public_key || max_public_key)`, convert the first bytes to an integer, and take modulo `1_000_000`. Both devices must show the same zero-padded six-digit code.
+Derive a six-digit code from both public keys and a session nonce. Sort the two public keys lexicographically, then compute `SHA256("lanbridge-pairing-v1" || nonce || min_public_key || max_public_key)`, convert the first bytes to an integer, and take modulo `1_000_000`. Both devices must show the same zero-padded six-digit code.
 
 - [ ] **Step 4: Implement pinned encrypted connection**
 
 Use TLS and reject a peer if its identity does not match the pinned public key after pairing. During the initial pairing session, allow a temporary unpinned encrypted connection only for exchanging public keys and verification data; do not mark the peer trusted until both users confirm the same six-digit code. The six-digit code confirmation is the MITM protection for this initial unpinned connection; if codes differ, reject pairing.
 
-- [ ] **Step 5: Implement manual IP connection first**
+- [ ] **Step 5: Implement UDP multicast auto-discovery**
 
-Manual IP and port connection is P0. `src-tauri/src/transport/discovery.rs` may be created in P0 only as an interface or disabled stub. Do not implement real UDP discovery in P0; UDP LAN discovery is P1 and may only be implemented after manual connection works.
+Protocol:
+- Multicast group: `239.10.10.10`, port `53530`.
+- Each device periodically sends a JSON announce message every 5 seconds containing `device_id`, `display_name`, `public_key`, and `port` (the TLS sync server port).
+- Devices must ignore their own announces by comparing `device_id` against the local identity.
+- Devices that have not sent an announce within 15 seconds are marked offline.
+
+Implementation:
+- `DiscoveryService`: owns the UDP multicast socket, sends announces, receives peer announces, filters self-announces, and maintains an in-memory map of online peers. Uses `socket2` for cross-platform multicast socket configuration (join group, set TTL, bind).
+- `SyncServer` (`server.rs`): a TCP/TLS listener that accepts incoming connections from discovered or manually-entered peers. Reuses the existing pinned TLS handshake from Step 4.
+- Use `local-ip-address` crate to detect the local IP for inclusion in announce messages.
+- Manual IP connection remains available as a fallback for networks that block multicast.
+
+**Known issue:** 当前 `DiscoveryService` 端口硬编码为 `9527`，未与 `SyncServer` 联动。在实现 SyncServer 集成时，需先启动 SyncServer 获取实际端口，再传入 DiscoveryService。详见技术开发索引 "Auto-Discovery Known Issues" 第 1 条。
 
 - [ ] **Step 6: Implement safe file transfer**
 
-Write incoming data to `<target>.lan-sync-partial`, verify blake3 hash, then atomically rename. P0 does not support resumable transfer; failed transfers restart from byte 0. On startup, clean stale `.lan-sync-partial` files that are not owned by an active transfer.
+Write incoming data to `<target>.lanbridge-partial`, verify blake3 hash, then atomically rename. P0 does not support resumable transfer; failed transfers restart from byte 0. On startup, clean stale `.lanbridge-partial` files that are not owned by an active transfer.
 
-- [ ] **Step 7: Test local loopback transfer**
+- [ ] **Step 7: Expose list_online_devices command**
+
+Add a `list_online_devices` Tauri command that returns the current in-memory list of discovered peers (device_id, display_name, ip, port, last_seen). The frontend polls this during pairing to populate the device list. Returns an empty list if discovery is not yet initialized.
+
+- [ ] **Step 8: Test auto-discovery and pairing flow**
 
 Run:
 
 ```bash
+cargo test --manifest-path src-tauri/Cargo.toml discovery
 cargo test --manifest-path src-tauri/Cargo.toml pairing_transfer
 ```
 
-Expected: paired local peers transfer a file and destination hash matches source hash.
+Expected: two local peers discover each other via multicast (excluding self), pairing code matches, and file transfer succeeds over TLS.
 
 ### Task 6: Implement macOS Sync Executor
 
@@ -370,7 +391,7 @@ Send file to secondary and update baseline only after secondary confirms write c
 
 - [ ] **Step 2: Apply primary delete**
 
-Send delete notice to secondary. Secondary moves target file into `.lan-sync-history/trash`.
+Send delete notice to secondary. Secondary moves target file into `.lanbridge-history/trash`.
 
 - [ ] **Step 3: Record secondary pending returns**
 
@@ -382,7 +403,7 @@ Selected secondary files copy to primary only when no conflict exists.
 
 - [ ] **Step 5: Execute confirmed overwrite**
 
-Before overwriting primary, move old primary file into `.lan-sync-history/overwritten`.
+Before overwriting primary, move old primary file into `.lanbridge-history/overwritten`.
 
 - [ ] **Step 6: Test executor**
 
@@ -426,7 +447,9 @@ Expected output in the worker notes: chosen UI direction, palette, typography, p
 
 - [ ] **Step 2: Expose backend commands**
 
-Commands must cover identity, pairing, manual IP connect, task create/list, scan now, sync now, pending return list, return-sync selected, conflict decision, history list/restore, and logs.
+Commands must cover identity, pairing, list_online_devices, manual IP connect, task create/list, scan now, sync now, pending return list, return-sync selected, conflict decision, history list/restore, and logs.
+
+在此步骤中必须集成 `SyncServer` 到 `main.rs`：先启动 SyncServer 获取实际端口，再将端口传入 `DiscoveryService`，替换当前硬编码的 `9527`。详见技术开发索引 "Auto-Discovery Known Issues" 第 1 和第 3 条。
 
 Task creation commands must implement a two-device proposal flow: local creates proposal, peer accepts and chooses peer folder, both sides validate folders are empty after ignore rules, both sides persist the same `task_id`, then the first baseline scan runs before automatic sync starts.
 
@@ -436,7 +459,7 @@ UI code must call `src/lib/tauriApi.ts` instead of invoking Tauri commands direc
 
 - [ ] **Step 4: Implement setup and dashboard UI**
 
-Show pairing state, peer state, task status, pending return count, conflict count, transfer progress, and errors. P0 may use simple conditional rendering instead of React Router.
+Pairing screen Step 1 shows a list of auto-discovered online devices (polled via `list_online_devices`). Manual IP entry is available as a collapsible fallback. Show pairing state, peer state, task status, pending return count, conflict count, transfer progress, and errors. P0 may use simple conditional rendering instead of React Router.
 
 - [ ] **Step 5: Implement return-sync and conflict UI**
 
@@ -494,8 +517,9 @@ Before Windows work starts, macOS branch must provide:
 
 - Stable Rust model types.
 - Stable database schema migrations.
-- Stable Tauri command names and response shapes.
+- Stable Tauri command names and response shapes (including `list_online_devices`).
 - Passing scanner/planner/history/executor tests.
 - Passing local loopback transport tests.
-- A working UI smoke flow.
+- Passing UDP multicast auto-discovery tests (two local peers discover each other).
+- A working UI smoke flow (including device list in pairing screen).
 - A written list of platform assumptions that Windows must not inherit blindly.

@@ -10,12 +10,20 @@ Before writing code, read:
 
 - `AGENTS.md`
 - `docs/superpowers/specs/2026-05-11-lanbridge-prd.md`
+<<<<<<< HEAD
 - `docs/superpowers/plans/2026-05-11-lanbridge-technical-development.md`
 
 Then read the platform plan that matches the current task:
 
 - macOS: `docs/superpowers/plans/2026-05-11-lanbridge-macos-development.md`
 - Windows: `docs/superpowers/plans/2026-05-11-lanbridge-windows-development.md`
+=======
+- `docs/architecture/index.md`
+- `docs/architecture/monorepo-map.md`
+- `docs/rules/invariants.md`
+
+Then read the active plan that matches the current task from `plans/active/`.
+>>>>>>> main
 
 ## Operating Principles
 

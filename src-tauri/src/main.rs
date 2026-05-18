@@ -36,8 +36,13 @@ fn run_app() -> Result<()> {
         .init();
 
     // Load identity BEFORE Tauri so discovery can use the real device_id
+    #[cfg(target_os = "macos")]
     let platform: Box<dyn Platform> =
         Box::new(platform::macos::app_dirs::MacPlatform::new().context("failed to init platform")?);
+    #[cfg(target_os = "windows")]
+    let platform: Box<dyn Platform> = Box::new(
+        platform::windows::app_dirs::WinPlatform::new().context("failed to init platform")?,
+    );
     let identity = pairing::DeviceIdentity::load_or_create(
         &platform
             .identity_key_path()
@@ -46,7 +51,9 @@ fn run_app() -> Result<()> {
     .context("failed to load identity")?;
 
     // Start discovery service in its own thread + tokio runtime
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "Device".to_string());
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "Device".to_string());
     let pub_id = identity.public();
     let server = match transport::server::SyncServer::start_in_background(9527) {
         Ok(server) => Some(server),

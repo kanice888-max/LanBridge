@@ -14,6 +14,7 @@ const EXACT_DIR_NAMES: &[&str] = &[
     ".git",
     "node_modules",
     ".lanbridge-history",
+    ".lanbridge-temp",
 ];
 
 /// Glob patterns to ignore.
@@ -42,6 +43,18 @@ pub fn classify_entry(entry_name: &str, is_dir: bool) -> IgnoreDecision {
         if entry_name == *name {
             return IgnoreDecision::Ignored(IgnoreReason::ExactName(name.to_string()));
         }
+    }
+
+    if !is_dir && crate::core::transient::is_lanbridge_partial_file_name(entry_name) {
+        return IgnoreDecision::Ignored(IgnoreReason::GlobPattern(
+            "*.lanbridge-partial*".to_string(),
+        ));
+    }
+
+    if !is_dir && crate::core::transient::is_common_incomplete_download_name(entry_name) {
+        return IgnoreDecision::Ignored(IgnoreReason::GlobPattern(
+            "*.part|*.crdownload|*.download".to_string(),
+        ));
     }
 
     // Check glob patterns

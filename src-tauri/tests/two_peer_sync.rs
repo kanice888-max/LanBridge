@@ -331,12 +331,10 @@ fn test_secondary_delete_does_not_affect_primary() {
     // Step 1: Delete on secondary — empty snapshots
     let snaps = scan_and_store(&task, secondary_dir.path(), &conn, &platform);
 
-    // Step 2: Plan as secondary — should be Noop
+    // Step 2: Plan as secondary — should become an explicit pending delete request.
     let actions = planner::plan_sync(&snaps, &[baseline], DeviceRole::Secondary);
-    assert!(
-        actions.is_empty(),
-        "secondary delete should produce no actions"
-    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].decision, SyncDecision::MarkPendingReturn);
 
     // Primary file should be untouched
     assert!(primary_dir.path().exists());

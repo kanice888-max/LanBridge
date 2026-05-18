@@ -190,4 +190,118 @@ describe("Windows app smoke tests", () => {
       });
     });
   });
+
+  it("keeps manual sync errors visible after refreshing task status", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_identity":
+          return Promise.resolve({
+            device_id: "secondary-device-001",
+            display_name: "Windows Test Device",
+          });
+        case "list_sync_tasks":
+          return Promise.resolve([
+            {
+              id: "task-secondary-1",
+              name: "回传测试",
+              primary_device_id: "primary-device-001",
+              secondary_device_id: "secondary-device-001",
+              local_path: "C:\\Sync\\Secondary",
+              remote_path: "C:\\Sync\\Primary",
+              local_role: "Secondary",
+              enabled: true,
+              created_unix_ms: 1,
+              updated_unix_ms: 1,
+            },
+          ]);
+        case "list_task_invites":
+          return Promise.resolve([]);
+        case "get_pending_count":
+          return Promise.resolve(1);
+        case "detect_conflicts":
+          return Promise.resolve([]);
+        case "scan_task":
+          return Promise.resolve([]);
+        case "sync_now":
+          return Promise.resolve([
+            {
+              relative_path: "offline.txt",
+              success: false,
+              error: "remote scan failed: peer is not connected",
+            },
+          ]);
+        default:
+          return Promise.resolve([]);
+      }
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "回传到主机" }));
+
+    expect(
+      await screen.findByText("offline.txt: remote scan failed: peer is not connected")
+    ).toBeTruthy();
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("offline.txt: remote scan failed: peer is not connected")
+      ).toBeTruthy();
+    });
+  });
+
+  it("keeps primary auto-sync running after leaving the dashboard", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_identity":
+          return Promise.resolve({
+            device_id: "primary-device-001",
+            display_name: "Windows Test Device",
+          });
+        case "list_sync_tasks":
+          return Promise.resolve([
+            {
+              id: "task-primary-1",
+              name: "自动同步测试",
+              primary_device_id: "primary-device-001",
+              secondary_device_id: "secondary-device-001",
+              local_path: "C:\\Sync\\Primary",
+              remote_path: "C:\\Sync\\Secondary",
+              local_role: "Primary",
+              enabled: true,
+              created_unix_ms: 1,
+              updated_unix_ms: 1,
+            },
+          ]);
+        case "get_pending_count":
+          return Promise.resolve(0);
+        case "detect_conflicts":
+          return Promise.resolve([]);
+        case "list_task_invites":
+          return Promise.resolve([]);
+        case "sync_now":
+          return Promise.resolve([]);
+        case "get_settings":
+          return Promise.resolve({
+            history_retention_days: 30,
+            history_size_limit_mb: 1024,
+          });
+        default:
+          return Promise.resolve([]);
+      }
+    });
+
+    render(<App />);
+    await screen.findByText("自动同步测试");
+    fireEvent.click(await screen.findByText("设置"));
+    await screen.findByText("历史保留");
+
+    await waitFor(
+      () => {
+        expect(invokeMock).toHaveBeenCalledWith("sync_now", {
+          taskId: "task-primary-1",
+        });
+      },
+      { timeout: 6500 }
+    );
+  }, 8000);
 });

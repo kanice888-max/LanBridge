@@ -13,6 +13,7 @@ export interface PairedDevice {
   public_key: number[];
   last_seen_unix_ms: number;
   trusted: boolean;
+  last_address: string | null;
 }
 
 export interface SyncTask {
@@ -311,6 +312,12 @@ export async function getPendingCount(taskId: string): Promise<number> {
   return invoke("get_pending_count", { taskId });
 }
 
+export async function refreshPendingReturns(
+  taskId: string
+): Promise<SyncActionResult[]> {
+  return invoke("refresh_pending_returns", { taskId });
+}
+
 export async function executeReturnSync(
   taskId: string,
   selectedPaths: string[]
@@ -387,4 +394,80 @@ export async function writeLog(
 
 export async function getSettings(): Promise<AppSettings> {
   return invoke("get_settings");
+}
+
+export interface InterfaceInfo {
+  name: string;
+  ip: string;
+}
+
+export interface LocalNetworkInfo {
+  interfaces: InterfaceInfo[];
+  tcp_port: number;
+}
+
+export async function getLocalNetworkInfo(): Promise<LocalNetworkInfo> {
+  return invoke("get_local_network_info");
+}
+
+export async function openInFileManager(path: string): Promise<void> {
+  return invoke("open_in_file_manager", { path });
+}
+
+export async function deleteSyncTask(taskId: string): Promise<void> {
+  return invoke("delete_sync_task", { taskId });
+}
+
+export interface TransferProgress {
+  task_id: string;
+  relative_path: string;
+  direction: string;
+  bytes_done: number;
+  bytes_total: number;
+  mbps: number;
+  finished: boolean;
+}
+
+export interface SyncProgress {
+  task_id: string;
+  phase: string;
+  detail?: string | null;
+}
+
+export interface TaskPeerStatus {
+  task_id: string;
+  peer_device_id: string;
+  address: string | null;
+  connected: boolean;
+  last_seen_unix_ms: number;
+  error: string | null;
+}
+
+export interface DeferredTransfer {
+  task_id: string;
+  relative_path: string;
+}
+
+export async function getTransferProgress(): Promise<TransferProgress[]> {
+  return invoke("get_transfer_progress");
+}
+
+export async function getSyncProgress(): Promise<SyncProgress[]> {
+  return invoke("get_sync_progress");
+}
+
+export async function cancelTransfer(taskId: string, relativePath: string): Promise<void> {
+  return invoke("cancel_transfer", { taskId, relativePath });
+}
+
+export async function listDeferredTransfers(): Promise<DeferredTransfer[]> {
+  return invoke("list_deferred_transfers");
+}
+
+export async function resumeTransfer(taskId: string, relativePath: string): Promise<void> {
+  return invoke("resume_transfer", { taskId, relativePath });
+}
+
+export async function getTaskPeerStatus(taskId: string): Promise<TaskPeerStatus> {
+  return invoke("get_task_peer_status", { taskId });
 }

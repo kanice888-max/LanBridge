@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 use crate::core::model::{HistoryEntry, HistoryReason};
 
@@ -121,6 +122,71 @@ impl HistoryStore {
         Ok(dest)
     }
 
+    /// Discover history files that exist on disk even when no database row was
+    /// written, such as files received from a peer-side delete before metadata
+    /// persistence completed.
+    pub fn discover_entries(&self, task_id: Uuid) -> Result<Vec<HistoryEntry>> {
+        let mut entries = Vec::new();
+        for (reason_dir, reason) in [
+            (self.trash_dir(), HistoryReason::Trash),
+            (self.overwritten_dir(), HistoryReason::Overwritten),
+        ] {
+            if !reason_dir.exists() {
+                continue;
+            }
+
+            for entry in walkdir::WalkDir::new(&reason_dir)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+            {
+                if !entry.file_type().is_file() && !entry.file_type().is_dir() {
+                    continue;
+                }
+                let stored_path = entry.path().to_path_buf();
+                if entry.file_type().is_dir() && std::fs::read_dir(&stored_path)?.next().is_some() {
+                    continue;
+                }
+                let relative = stored_path.strip_prefix(&reason_dir)?;
+                let components = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
+                if components.is_empty() {
+                    continue;
+                }
+
+                let (created_unix_ms, original_parts) = match components[0].parse::<i64>() {
+                    Ok(timestamp) if components.len() > 1 => (timestamp, &components[1..]),
+                    Ok(_) => continue,
+                    Err(_) => (
+                        metadata_modified_unix_ms(&stored_path)?,
+                        components.as_slice(),
+                    ),
+                };
+                let original_relative_path = original_parts.join("/");
+                let metadata = std::fs::metadata(&stored_path)?;
+                let stored_path_string = stored_path.to_string_lossy().to_string();
+
+                entries.push(HistoryEntry {
+                    id: stable_history_id(task_id, &stored_path_string),
+                    task_id,
+                    original_relative_path,
+                    stored_path: stored_path_string,
+                    reason,
+                    created_unix_ms,
+                    size: if metadata.is_dir() {
+                        0
+                    } else {
+                        metadata.len() as i64
+                    },
+                });
+            }
+        }
+        entries.sort_by(|a, b| b.created_unix_ms.cmp(&a.created_unix_ms));
+        Ok(entries)
+    }
+
     /// Internal: move file to history directory and create HistoryEntry.
     fn move_to_history(
         &self,
@@ -174,6 +240,57 @@ impl HistoryStore {
         false
     }
 
+    /// Scan the on-disk history directory and check if storage limits are exceeded.
+    ///
+    /// Returns an error if destructive sync operations should be blocked.
+    /// The error can be surfaced directly to the UI.
+    pub fn check_storage_blocked(&self, now_unix_ms: i64) -> Result<()> {
+        let mut total_size: i64 = 0;
+        let mut oldest_ms: i64 = i64::MAX;
+
+        for subdir in &["trash", "overwritten"] {
+            let dir = self.history_dir.join(subdir);
+            if !dir.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&dir)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if entry.file_type().is_file() {
+                    if let Ok(meta) = entry.metadata() {
+                        total_size += meta.len() as i64;
+                    }
+                    if let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
+                        let ms = modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        if ms > 0 && ms < oldest_ms {
+                            oldest_ms = ms;
+                        }
+                    }
+                }
+            }
+        }
+
+        let oldest = if oldest_ms == i64::MAX {
+            now_unix_ms
+        } else {
+            oldest_ms
+        };
+
+        if self.is_storage_full(total_size, oldest, now_unix_ms) {
+            anyhow::bail!(
+                "history storage full ({:.1} MB used); clean up old entries before destructive sync operations",
+                total_size as f64 / (1024.0 * 1024.0)
+            );
+        }
+
+        Ok(())
+    }
+
     /// Clean up old history entries.
     ///
     /// Removes entries older than `retention_days` days and enforces size limit.
@@ -210,4 +327,23 @@ impl HistoryStore {
 
         Ok(deleted)
     }
+}
+
+fn metadata_modified_unix_ms(path: &Path) -> Result<i64> {
+    Ok(std::fs::metadata(path)?
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default())
+}
+
+fn stable_history_id(task_id: Uuid, stored_path: &str) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(task_id.as_bytes());
+    hasher.update(stored_path.as_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }

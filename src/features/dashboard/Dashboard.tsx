@@ -1,12 +1,11 @@
 import { useEffect, useState, useCallback } from "react";
 import {
   acceptTaskInvite,
-  scanTask,
-  syncNow,
   getPendingCount,
   detectConflicts,
   listTaskInvites,
   rejectTaskInvite,
+  deleteSyncTask,
   type IncomingTaskInviteInfo,
   type IdentityInfo,
   type SyncTask,
@@ -18,6 +17,7 @@ import { useTranslation } from "../../lib/i18n/context";
 interface DashboardProps {
   identity: IdentityInfo | null;
   tasks: SyncTask[];
+  selectedTaskId: string | null;
   onSelectTask: (taskId: string) => void;
   onCreateTask: () => void;
   onRefresh: () => void;
@@ -31,16 +31,15 @@ interface TaskStatus {
 }
 
 export function Dashboard({
-  identity,
+  identity: _identity,
   tasks,
+  selectedTaskId,
   onSelectTask,
   onCreateTask,
   onRefresh,
 }: DashboardProps) {
   const { t } = useTranslation();
-  const [taskStatuses, setTaskStatuses] = useState<
-    Record<string, TaskStatus>
-  >({});
+  const [taskStatuses, setTaskStatuses] = useState<Record<string, TaskStatus>>({});
   const [incomingInvites, setIncomingInvites] = useState<IncomingTaskInviteInfo[]>([]);
   const [invitePaths, setInvitePaths] = useState<Record<string, string>>({});
   const [inviteError, setInviteError] = useState<string | null>(null);
@@ -53,94 +52,68 @@ export function Dashboard({
       setInvitePaths((prev) => {
         const next = { ...prev };
         for (const invite of pending) {
-          if (!next[invite.invite_id]) {
-            next[invite.invite_id] = invite.local_path || "";
-          }
+          if (!next[invite.invite_id]) next[invite.invite_id] = invite.local_path || "";
         }
         return next;
       });
-    } catch (e) {
-      setInviteError(String(e));
-    }
+    } catch { /* silent */ }
   }, []);
 
   const refreshStatuses = useCallback(async () => {
-    const statuses: Record<string, TaskStatus> = {};
+    const statuses: Record<string, Omit<TaskStatus, "lastResults">> = {};
     for (const task of tasks) {
       try {
         const [pending, conflicts] = await Promise.all([
           getPendingCount(task.id),
           detectConflicts(task.id),
         ]);
-        statuses[task.id] = {
-          pendingCount: pending,
-          conflictCount: conflicts.length,
-          syncing: false,
-          lastResults: taskStatuses[task.id]?.lastResults ?? [],
-        };
+        statuses[task.id] = { pendingCount: pending, conflictCount: conflicts.length, syncing: false };
       } catch {
-        statuses[task.id] = {
-          pendingCount: 0,
-          conflictCount: 0,
-          syncing: false,
-          lastResults: [],
-        };
+        statuses[task.id] = { pendingCount: 0, conflictCount: 0, syncing: false };
       }
     }
-    setTaskStatuses(statuses);
+    setTaskStatuses((prev) => {
+      const next: Record<string, TaskStatus> = {};
+      for (const task of tasks) {
+        next[task.id] = { ...statuses[task.id], lastResults: prev[task.id]?.lastResults ?? [] };
+      }
+      return next;
+    });
   }, [tasks]);
 
-  useEffect(() => {
-    refreshStatuses();
-  }, [refreshStatuses]);
-
+  useEffect(() => { refreshStatuses(); }, [refreshStatuses]);
   useEffect(() => {
     refreshInvites();
-
-    const invitePoll = window.setInterval(() => {
-      refreshInvites();
-    }, 3000);
-
-    return () => {
-      window.clearInterval(invitePoll);
-    };
+    const id = window.setInterval(() => refreshInvites(), 3000);
+    return () => window.clearInterval(id);
   }, [refreshInvites]);
-
-  const handleRefreshAll = () => {
-    onRefresh();
-    refreshInvites();
-  };
 
   const handleAcceptInvite = async (invite: IncomingTaskInviteInfo) => {
     const localPath = invitePaths[invite.invite_id]?.trim();
-    if (!localPath) {
-      setInviteError(t.dashboard.invitePathRequired);
-      return;
-    }
-
+    if (!localPath) { setInviteError(t.dashboard.invitePathRequired); return; }
     setInviteError(null);
     try {
       await acceptTaskInvite(invite.invite_id, localPath);
       await refreshInvites();
       onRefresh();
-    } catch (e) {
-      setInviteError(String(e));
-    }
+    } catch (e) { setInviteError(String(e)); }
   };
 
   const handlePickInviteFolder = async (invite: IncomingTaskInviteInfo) => {
     setInviteError(null);
     try {
       const folder = await pickFolder(t.dashboard.chooseFolder);
-      if (folder) {
-        setInvitePaths((prev) => ({
-          ...prev,
-          [invite.invite_id]: folder,
-        }));
-      }
-    } catch (e) {
-      setInviteError(String(e));
-    }
+      if (folder) setInvitePaths((prev) => ({ ...prev, [invite.invite_id]: folder }));
+    } catch (e) { setInviteError(String(e)); }
+  };
+
+  const handleDeleteTask = async (e: React.MouseEvent, taskId: string, taskName: string) => {
+    e.stopPropagation();
+    if (!window.confirm(`${t.dashboard.confirmDelete} "${taskName}"`)) return;
+    try {
+      await deleteSyncTask(taskId);
+      onRefresh();
+    } catch (err) { /* silent */ }
   };
 
   const handleRejectInvite = async (invite: IncomingTaskInviteInfo) => {
@@ -148,30 +121,7 @@ export function Dashboard({
     try {
       await rejectTaskInvite(invite.invite_id, "rejected by peer");
       await refreshInvites();
-    } catch (e) {
-      setInviteError(String(e));
-    }
-  };
-
-  const handleScanAndSync = async (taskId: string) => {
-    setTaskStatuses((prev) => ({
-      ...prev,
-      [taskId]: { ...prev[taskId], syncing: true, lastResults: [] },
-    }));
-    try {
-      await scanTask(taskId);
-      const results = await syncNow(taskId);
-      setTaskStatuses((prev) => ({
-        ...prev,
-        [taskId]: { ...prev[taskId], syncing: false, lastResults: results },
-      }));
-      refreshStatuses();
-    } catch (e) {
-      setTaskStatuses((prev) => ({
-        ...prev,
-        [taskId]: { ...prev[taskId], syncing: false },
-      }));
-    }
+    } catch { /* silent */ }
   };
 
   const formatTime = (unixMs: number) => {
@@ -179,189 +129,127 @@ export function Dashboard({
     return new Date(unixMs).toLocaleString();
   };
 
+  const getStatusDot = (task: SyncTask, status?: TaskStatus) => {
+    if (status?.syncing) return "syncing";
+    if (status && status.conflictCount > 0) return "has-issue";
+    if (!task.enabled) return "idle";
+    return "";
+  };
+
   return (
-    <div className="screen-container">
-      <div className="screen-header">
-        <h1>{t.dashboard.title}</h1>
-        <div className="header-actions">
-          <button className="btn btn-secondary" onClick={handleRefreshAll}>
-            {t.dashboard.refresh}
-          </button>
-          <button className="btn btn-primary" onClick={onCreateTask}>
-            {t.dashboard.newTask}
-          </button>
-        </div>
+    <aside className="task-list-panel">
+      <div className="task-list-header">
+        <h2>{t.dashboard.title} · {tasks.length}</h2>
+        <button className="btn btn-ghost btn-small" onClick={() => { onRefresh(); refreshInvites(); }}>
+          {t.dashboard.refresh}
+        </button>
       </div>
 
-      {identity && (
-        <div className="device-info-card">
-          <span className="label">{t.dashboard.thisDevice}</span>
-          <span className="value">{identity.display_name}</span>
-          <span className="device-id">{identity.device_id.slice(0, 16)}...</span>
-        </div>
-      )}
+      <div className="task-list-scroll">
+        {inviteError && <div className="error-message">{inviteError}</div>}
 
-      {inviteError && <div className="error-message">{inviteError}</div>}
-
-      {incomingInvites.length > 0 && (
-        <section className="invite-panel">
-          <div className="invite-panel-header">
-            <h2>{t.dashboard.incomingInvites}</h2>
-            <button className="btn btn-secondary btn-small" onClick={refreshInvites}>
-              {t.dashboard.refresh}
-            </button>
-          </div>
-
-          <div className="invite-list">
+        {incomingInvites.length > 0 && (
+          <div className="invite-section">
+            <div className="invite-section-header">{t.dashboard.incomingInvites} · {incomingInvites.length}</div>
             {incomingInvites.map((invite) => (
-              <div key={invite.invite_id} className="invite-card">
-                <div className="invite-card-main">
-                  <h3>{invite.task_name}</h3>
-                  <p>
-                    {t.dashboard.inviteFrom} {invite.requester_device_id.slice(0, 16)}...
-                  </p>
-                  {invite.requester_path && (
-                    <span className="invite-path">{invite.requester_path}</span>
-                  )}
+              <div key={invite.invite_id} className="invite-item">
+                <div className="invite-item-header">
+                  <strong>{invite.task_name}</strong>
+                  <span>{invite.requester_device_id.slice(0, 12)}...</span>
                 </div>
-
-                <div className="invite-actions">
-                  <div className="path-picker invite-path-picker">
-                    <input
-                      type="text"
-                      placeholder={t.dashboard.invitePathPlaceholder}
-                      value={invitePaths[invite.invite_id] || ""}
-                      onChange={(e) =>
-                        setInvitePaths((prev) => ({
-                          ...prev,
-                          [invite.invite_id]: e.target.value,
-                        }))
-                      }
-                    />
-                    <button
-                      className="btn btn-secondary"
-                      type="button"
-                      onClick={() => handlePickInviteFolder(invite)}
-                    >
-                      {t.dashboard.chooseFolder}
-                    </button>
-                  </div>
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => handleAcceptInvite(invite)}
-                  >
+                {invite.requester_path && (
+                  <div className="invite-item-path">{invite.requester_path}</div>
+                )}
+                <div className="invite-item-actions">
+                  <input
+                    type="text"
+                    placeholder={t.dashboard.invitePathPlaceholder}
+                    value={invitePaths[invite.invite_id] || ""}
+                    onChange={(e) => setInvitePaths((prev) => ({ ...prev, [invite.invite_id]: e.target.value }))}
+                  />
+                  <button className="btn btn-ghost btn-small" onClick={() => handlePickInviteFolder(invite)}>
+                    {t.dashboard.chooseFolder}
+                  </button>
+                  <button className="btn btn-primary btn-small" onClick={() => handleAcceptInvite(invite)}>
                     {t.dashboard.acceptInvite}
                   </button>
-                  <button
-                    className="btn btn-secondary"
-                    onClick={() => handleRejectInvite(invite)}
-                  >
+                  <button className="btn btn-ghost btn-small" onClick={() => handleRejectInvite(invite)}>
                     {t.dashboard.rejectInvite}
                   </button>
                 </div>
               </div>
             ))}
           </div>
-        </section>
-      )}
+        )}
 
-      {tasks.length === 0 ? (
-        <div className="empty-state">
-          <h3>{t.dashboard.noTasks}</h3>
-          <p>{t.dashboard.noTasksDesc}</p>
-          <button className="btn btn-primary" onClick={onCreateTask}>
-            {t.dashboard.createFirst}
-          </button>
-        </div>
-      ) : (
-        <div className="task-grid">
-          {tasks.map((task) => {
-            const status = taskStatuses[task.id];
-            return (
-              <div key={task.id} className="task-card">
-                <div className="task-card-header">
-                  <h3 onClick={() => onSelectTask(task.id)}>{task.name}</h3>
-                  <span
-                    className={`role-badge ${task.local_role.toLowerCase()}`}
-                  >
-                    {task.local_role}
-                  </span>
-                </div>
-
-                <div className="task-card-paths">
-                  <div className="path-row">
-                    <span className="path-label">{t.dashboard.local}</span>
-                    <span className="path-value">{task.local_path}</span>
-                  </div>
-                  <div className="path-row">
-                    <span className="path-label">{t.dashboard.remote}</span>
-                    <span className="path-value">{task.remote_path}</span>
-                  </div>
-                </div>
-
-                <div className="task-card-stats">
-                  <div className="stat">
-                    <span className="stat-value">
-                      {status?.pendingCount ?? 0}
+        {tasks.length === 0 ? (
+          <div className="empty-state" style={{ padding: "var(--space-10) var(--space-4)" }}>
+            <div className="empty-state-icon">
+              <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            </div>
+            <h3>{t.dashboard.noTasks}</h3>
+            <p>{t.dashboard.noTasksDesc}</p>
+            <button className="btn btn-primary" onClick={onCreateTask}>{t.dashboard.createFirst}</button>
+          </div>
+        ) : (
+          <>
+            {tasks.map((task) => {
+              const status = taskStatuses[task.id];
+              const dot = getStatusDot(task, status);
+              return (
+                <div
+                  key={task.id}
+                  className={`task-row ${selectedTaskId === task.id ? "selected" : ""}`}
+                  onClick={() => onSelectTask(task.id)}
+                >
+                  <div className="task-row-top">
+                    <span className={`task-row-dot ${dot}`} />
+                    <span className="task-row-name">{task.name}</span>
+                    <span className={`task-row-role ${task.local_role.toLowerCase()}`}>
+                      {t.role[task.local_role.toLowerCase() as keyof typeof t.role]}
                     </span>
-                    <span className="stat-label">{t.dashboard.pending}</span>
+                    <button className="task-row-more" onClick={(e) => handleDeleteTask(e, task.id, task.name)} title={t.dashboard.deleteTask}>
+                      <svg viewBox="0 0 24 24" style={{width:14,height:14}}>
+                        <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                      </svg>
+                    </button>
                   </div>
-                  <div className="stat">
-                    <span className="stat-value">
-                      {status?.conflictCount ?? 0}
-                    </span>
-                    <span className="stat-label">{t.dashboard.conflicts}</span>
-                  </div>
-                  <div className="stat">
-                    <span className="stat-value">
-                      {formatTime(task.updated_unix_ms)}
-                    </span>
-                    <span className="stat-label">{t.dashboard.lastUpdated}</span>
-                  </div>
-                </div>
 
-                {status?.lastResults && status.lastResults.length > 0 && (
-                  <div className="sync-results">
-                    {status.lastResults.some((r) => !r.success) && (
-                      <div className="sync-errors">
-                        {status.lastResults
-                          .filter((r) => !r.success)
-                          .map((r, i) => (
-                            <div key={i} className="error-item">
-                              {r.relative_path}: {r.error}
-                            </div>
-                          ))}
+                  <div className="task-row-paths">
+                    <span className="task-row-local" title={task.local_path}>{task.local_path.split("/").pop() || task.local_path}</span>
+                    <span className="task-row-arrow">→</span>
+                    <span className="task-row-remote" title={task.remote_path}>{task.remote_path.split("/").pop() || task.remote_path}</span>
+                  </div>
+
+                  {status?.syncing && (
+                    <div className="task-row-progress">
+                      <div className="task-row-progress-bar">
+                        <div className="task-row-progress-fill" style={{ width: "60%" }} />
                       </div>
-                    )}
-                    <div className="sync-summary">
-                      {status.lastResults.filter((r) => r.success).length}{" "}
-                      {t.dashboard.synced},{" "}
-                      {status.lastResults.filter((r) => !r.success).length}{" "}
-                      {t.dashboard.failed}
+                      <div className="task-row-progress-text">{t.dashboard.syncing}</div>
                     </div>
-                  </div>
-                )}
+                  )}
 
-                <div className="task-card-actions">
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => handleScanAndSync(task.id)}
-                    disabled={status?.syncing || !task.enabled}
-                  >
-                    {status?.syncing ? t.dashboard.syncing : t.dashboard.syncNow}
-                  </button>
-                  <button
-                    className="btn btn-secondary"
-                    onClick={() => onSelectTask(task.id)}
-                  >
-                    {t.dashboard.details}
-                  </button>
+                  <div className="task-row-stats">
+                    <span className={`task-row-stat ${status && status.pendingCount > 0 ? "warn" : ""}`}>
+                      {status?.pendingCount ?? 0} {t.dashboard.pending}
+                    </span>
+                    <span className={`task-row-stat ${status && status.conflictCount > 0 ? "warn" : ""}`}>
+                      {status?.conflictCount ?? 0} {t.dashboard.conflicts}
+                    </span>
+                    <span className="task-row-stat">{formatTime(task.updated_unix_ms)}</span>
+                  </div>
                 </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
+              );
+            })}
+
+            <button className="new-task-btn" onClick={onCreateTask}>
+              <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              {t.dashboard.newTask}
+            </button>
+          </>
+        )}
+      </div>
+    </aside>
   );
 }

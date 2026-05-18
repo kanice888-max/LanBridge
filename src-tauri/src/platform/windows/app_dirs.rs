@@ -161,6 +161,16 @@ impl Platform for WinPlatform {
             .filter(|group| group.len() > 1)
             .collect()
     }
+
+    fn start_watcher(
+        &self,
+        sync_root: &Path,
+    ) -> Result<(
+        notify::RecommendedWatcher,
+        std::sync::mpsc::Receiver<crate::platform::traits::PlatformWatcherEvent>,
+    )> {
+        super::watcher::start_watcher(sync_root)
+    }
 }
 
 /// Check if a name is a Windows reserved device name.

@@ -152,6 +152,7 @@ pub struct PairedDevice {
     pub public_key: Vec<u8>,
     pub last_seen_unix_ms: i64,
     pub trusted: bool,
+    pub last_address: Option<String>,
 }
 
 /// Application error types.

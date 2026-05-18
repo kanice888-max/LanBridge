@@ -2,6 +2,7 @@ use lanbridge::core::conflict::{conflict_filename, detect_conflict, ConflictResu
 use lanbridge::core::model::*;
 use lanbridge::core::planner::plan_sync;
 use lanbridge::core::scanner::scan_root;
+use lanbridge::core::transient::cleanup_lanbridge_transient_files;
 use lanbridge::history::store::HistoryStore;
 use lanbridge::platform::windows::WinPlatform;
 use std::path::PathBuf;
@@ -64,6 +65,64 @@ fn test_scanner_skips_ignored() {
 }
 
 #[test]
+fn test_scanner_skips_lanbridge_transient_files() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("ready.txt"), "done").unwrap();
+    std::fs::write(dir.path().join("ready.txt.lanbridge-partial"), "incomplete").unwrap();
+    std::fs::write(
+        dir.path()
+            .join("ready.txt.lanbridge-partial.lanbridge-partial"),
+        "loop",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join(".lanbridge-temp")).unwrap();
+    std::fs::write(
+        dir.path().join(".lanbridge-temp").join("staged.txt"),
+        "staged",
+    )
+    .unwrap();
+
+    let platform = WinPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let results = scan_root(dir.path(), &platform).unwrap();
+    let paths: Vec<String> = results
+        .iter()
+        .map(|r| r.snapshot.relative_path.clone())
+        .collect();
+
+    assert!(paths.contains(&"ready.txt".to_string()));
+    assert!(!paths.contains(&"ready.txt.lanbridge-partial".to_string()));
+    assert!(!paths.contains(&"ready.txt.lanbridge-partial.lanbridge-partial".to_string()));
+    assert!(!paths.iter().any(|path| path.starts_with(".lanbridge-temp")));
+}
+
+#[test]
+fn test_cleanup_removes_only_lanbridge_transient_files() {
+    let dir = TempDir::new().unwrap();
+    let real_file = dir.path().join("ready.txt");
+    let partial_file = dir.path().join("ready.txt.lanbridge-partial");
+    let repeated_partial_file = dir
+        .path()
+        .join("ready.txt.lanbridge-partial.lanbridge-partial");
+    let user_download = dir.path().join("video.mp4.part");
+    let temp_dir = dir.path().join(".lanbridge-temp");
+
+    std::fs::write(&real_file, "done").unwrap();
+    std::fs::write(&partial_file, "partial").unwrap();
+    std::fs::write(&repeated_partial_file, "partial").unwrap();
+    std::fs::write(&user_download, "still user data").unwrap();
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::write(temp_dir.join("staged.txt"), "staged").unwrap();
+
+    cleanup_lanbridge_transient_files(dir.path()).unwrap();
+
+    assert!(real_file.exists());
+    assert!(user_download.exists());
+    assert!(!partial_file.exists());
+    assert!(!repeated_partial_file.exists());
+    assert!(!temp_dir.exists());
+}
+
+#[test]
 fn test_scanner_hashes_small_files() {
     let dir = setup_test_dir();
     let platform = WinPlatform::with_data_dir(PathBuf::from("/tmp/test"));
@@ -91,6 +150,25 @@ fn test_planner_new_primary_file() {
         modified_unix_ms: now_ms(),
         blake3_hash: Some("hash1".to_string()),
         hash_status: HashStatus::Verified,
+        deleted: false,
+        is_symlink: false,
+    };
+
+    let actions = plan_sync(&[snap], &[], DeviceRole::Primary);
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].decision, SyncDecision::ApplyToSecondary);
+}
+
+#[test]
+fn test_planner_new_empty_primary_directory() {
+    let snap = FileSnapshot {
+        task_id: Uuid::nil(),
+        relative_path: "empty-folder".to_string(),
+        kind: EntryKind::Directory,
+        size: 0,
+        modified_unix_ms: 0,
+        blake3_hash: None,
+        hash_status: HashStatus::Unavailable,
         deleted: false,
         is_symlink: false,
     };
@@ -141,7 +219,41 @@ fn test_planner_primary_delete() {
 }
 
 #[test]
-fn test_planner_secondary_delete_ignored() {
+fn test_planner_primary_delete_orders_children_before_parent_directory() {
+    let directory = SyncBaseline {
+        task_id: Uuid::nil(),
+        relative_path: "folder".to_string(),
+        primary_hash: None,
+        primary_hash_status: HashStatus::Unavailable,
+        primary_size: 0,
+        primary_modified_unix_ms: 1000,
+        secondary_hash: None,
+        secondary_hash_status: HashStatus::Unavailable,
+        secondary_modified_unix_ms: 1000,
+        last_synced_unix_ms: 1000,
+    };
+    let child = SyncBaseline {
+        relative_path: "folder/child.txt".to_string(),
+        primary_hash: Some("hash1".to_string()),
+        secondary_hash: Some("hash1".to_string()),
+        primary_hash_status: HashStatus::Verified,
+        secondary_hash_status: HashStatus::Verified,
+        primary_size: 10,
+        primary_modified_unix_ms: 1000,
+        secondary_modified_unix_ms: 1000,
+        last_synced_unix_ms: 1000,
+        task_id: Uuid::nil(),
+    };
+
+    let actions = plan_sync(&[], &[directory, child], DeviceRole::Primary);
+
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0].relative_path, "folder/child.txt");
+    assert_eq!(actions[1].relative_path, "folder");
+}
+
+#[test]
+fn test_planner_secondary_delete_becomes_pending_return() {
     let baseline = SyncBaseline {
         task_id: Uuid::nil(),
         relative_path: "old.txt".to_string(),
@@ -155,9 +267,12 @@ fn test_planner_secondary_delete_ignored() {
         last_synced_unix_ms: 1000,
     };
 
-    // Secondary delete does NOT affect primary
+    // Secondary delete does not affect primary automatically; it becomes an explicit return request.
     let actions = plan_sync(&[], &[baseline], DeviceRole::Secondary);
-    assert!(actions.is_empty());
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].decision, SyncDecision::MarkPendingReturn);
+    assert_eq!(actions[0].relative_path, "old.txt");
+    assert!(actions[0].snapshot.is_none());
 }
 
 #[test]
@@ -370,6 +485,48 @@ fn test_history_move_to_trash() {
     assert_eq!(entry.reason, HistoryReason::Trash);
     assert!(entry.stored_path.contains("trash") || entry.stored_path.contains("trash\\"));
     assert!(std::path::Path::new(&entry.stored_path).exists());
+}
+
+#[test]
+fn test_history_discovers_files_without_database_rows() {
+    let dir = TempDir::new().unwrap();
+    let stored = dir
+        .path()
+        .join(".lanbridge-history")
+        .join("trash")
+        .join("1234")
+        .join("docs")
+        .join("old.txt");
+    std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+    std::fs::write(&stored, "old data").unwrap();
+
+    let store = HistoryStore::new(dir.path());
+    let entries = store.discover_entries(Uuid::nil()).unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].original_relative_path, "docs/old.txt");
+    assert_eq!(entries[0].reason, HistoryReason::Trash);
+    assert_eq!(entries[0].size, 8);
+}
+
+#[test]
+fn test_history_discovers_directories_without_database_rows() {
+    let dir = TempDir::new().unwrap();
+    let stored = dir
+        .path()
+        .join(".lanbridge-history")
+        .join("trash")
+        .join("1234")
+        .join("empty");
+    std::fs::create_dir_all(&stored).unwrap();
+
+    let store = HistoryStore::new(dir.path());
+    let entries = store.discover_entries(Uuid::nil()).unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].original_relative_path, "empty");
+    assert_eq!(entries[0].reason, HistoryReason::Trash);
+    assert_eq!(entries[0].size, 0);
 }
 
 #[test]

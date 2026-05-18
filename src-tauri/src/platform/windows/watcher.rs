@@ -4,14 +4,10 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::platform::traits::PlatformWatcherEvent;
+
 /// Debounce interval for filesystem events (milliseconds).
 const DEBOUNCE_MS: u64 = 500;
-
-/// Event from the filesystem watcher after debouncing.
-#[derive(Debug, Clone)]
-pub struct WatcherEvent {
-    pub paths: Vec<std::path::PathBuf>,
-}
 
 /// Start watching a directory for filesystem changes.
 ///
@@ -21,7 +17,7 @@ pub struct WatcherEvent {
 /// The watcher triggers scan requests, not direct sync decisions.
 pub fn start_watcher(
     sync_root: &Path,
-) -> Result<(RecommendedWatcher, mpsc::Receiver<WatcherEvent>)> {
+) -> Result<(RecommendedWatcher, mpsc::Receiver<PlatformWatcherEvent>)> {
     let (tx, rx) = mpsc::channel();
     let debounce = Duration::from_millis(DEBOUNCE_MS);
 
@@ -37,7 +33,6 @@ pub fn start_watcher(
     let mut watcher = RecommendedWatcher::new(
         move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
-                // Skip events we don't care about
                 match event.kind {
                     EventKind::Any | EventKind::Other | EventKind::Access(_) => return,
                     _ => {}
@@ -48,13 +43,11 @@ pub fn start_watcher(
                 let mut paths = paths_for_callback.lock().unwrap();
 
                 if now.duration_since(*last) >= debounce {
-                    // Quiet period expired — flush accumulated + send current
                     let mut batch = std::mem::take(&mut *paths);
                     batch.extend(event.paths.clone());
                     *last = now;
-                    let _ = tx.send(WatcherEvent { paths: batch });
+                    let _ = tx.send(PlatformWatcherEvent { paths: batch });
                 } else {
-                    // Within debounce window — accumulate
                     paths.extend(event.paths);
                 }
             }

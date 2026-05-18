@@ -168,6 +168,15 @@ fn execute_move_to_history(
         };
     }
 
+    if let Err(e) = history.check_storage_blocked(now) {
+        return ExecutionResult {
+            relative_path: action.relative_path.clone(),
+            success: false,
+            error: Some(e.to_string()),
+            retryable: false,
+        };
+    }
+
     match history.move_to_trash(&source, &action.relative_path, now) {
         Ok(mut entry) => {
             entry.task_id = task.id;
@@ -201,22 +210,18 @@ fn execute_mark_pending(
     conn: &rusqlite::Connection,
     now: i64,
 ) -> ExecutionResult {
-    let snap = match &action.snapshot {
-        Some(s) => s,
-        None => {
+    let change_kind = match (&action.snapshot, &action.baseline) {
+        (None, Some(_)) => ChangeKind::Deleted,
+        (Some(_), Some(_)) => ChangeKind::Modified,
+        (Some(_), None) => ChangeKind::Created,
+        (None, None) => {
             return ExecutionResult {
                 relative_path: action.relative_path.clone(),
                 success: false,
-                error: Some("no snapshot for pending return".to_string()),
+                error: Some("no snapshot or baseline for pending return".to_string()),
                 retryable: false,
             }
         }
-    };
-
-    let change_kind = if action.baseline.is_some() {
-        ChangeKind::Modified
-    } else {
-        ChangeKind::Created
     };
 
     let pending_repo = PendingReturnRepository::new(conn);
@@ -224,9 +229,18 @@ fn execute_mark_pending(
         task_id: task.id,
         relative_path: action.relative_path.clone(),
         change_kind,
-        secondary_hash: snap.blake3_hash.clone(),
-        secondary_hash_status: snap.hash_status,
-        secondary_modified_unix_ms: snap.modified_unix_ms,
+        secondary_hash: action
+            .snapshot
+            .as_ref()
+            .and_then(|snap| snap.blake3_hash.clone()),
+        secondary_hash_status: action
+            .snapshot
+            .as_ref()
+            .map_or(HashStatus::Unavailable, |snap| snap.hash_status),
+        secondary_modified_unix_ms: action
+            .snapshot
+            .as_ref()
+            .map_or(now, |snap| snap.modified_unix_ms),
         created_unix_ms: now,
     };
 
@@ -352,6 +366,7 @@ pub fn execute_return_sync(
     let mut results = Vec::new();
     let pending_repo = PendingReturnRepository::new(conn);
     let baseline_repo = SyncBaselineRepository::new(conn);
+    let history = HistoryStore::new(sync_root);
     let now = now_ms();
 
     // Load all pending changes for this task from DB
@@ -396,6 +411,48 @@ pub fn execute_return_sync(
 
         match conflict {
             crate::core::conflict::ConflictResult::NoConflict => {
+                if pending.change_kind == ChangeKind::Deleted {
+                    let target = sync_root.join(path);
+                    if target.exists() {
+                        if let Err(e) = history.check_storage_blocked(now) {
+                            results.push(ExecutionResult {
+                                relative_path: path.clone(),
+                                success: false,
+                                error: Some(e.to_string()),
+                                retryable: false,
+                            });
+                            continue;
+                        }
+                        match history.move_to_trash(&target, path, now) {
+                            Ok(mut entry) => {
+                                entry.task_id = task.id;
+                                let _ = HistoryRepository::new(conn).insert(&entry);
+                            }
+                            Err(e) => {
+                                results.push(ExecutionResult {
+                                    relative_path: path.clone(),
+                                    success: false,
+                                    error: Some(format!(
+                                        "return-delete move to history failed: {}",
+                                        e
+                                    )),
+                                    retryable: is_retryable_error(&e.to_string()),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    let _ = baseline_repo.remove(&task.id, path);
+                    let _ = pending_repo.remove(&task.id, path);
+                    results.push(ExecutionResult {
+                        relative_path: path.clone(),
+                        success: true,
+                        error: None,
+                        retryable: false,
+                    });
+                    continue;
+                }
+
                 // Copy secondary file to primary location
                 let source = sync_root.join(&task.remote_path).join(path);
                 let dest = sync_root.join(path);
@@ -494,6 +551,17 @@ pub fn execute_confirmed_overwrite(
             error: Some("secondary file missing".to_string()),
             retryable: true,
         };
+    }
+
+    if source.exists() {
+        if let Err(e) = history.check_storage_blocked(now) {
+            return ExecutionResult {
+                relative_path: relative_path.to_string(),
+                success: false,
+                error: Some(e.to_string()),
+                retryable: false,
+            };
+        }
     }
 
     let pending_repo = PendingReturnRepository::new(conn);
@@ -695,19 +763,25 @@ fn copy_file_verified(
     }
 
     let tmp_path = partial_path(dest);
-    std::fs::copy(source, &tmp_path).map_err(|e| format!("failed to copy file: {}", e))?;
 
-    if let Err(e) = verify_copied_file(&tmp_path, expected_hash, expected_status, expected_size) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
+    // Use block_in_place to avoid blocking the tokio runtime during file I/O.
+    // This lets tokio run other tasks on different threads while this one blocks.
+    tokio::task::block_in_place(|| {
+        std::fs::copy(source, &tmp_path).map_err(|e| format!("failed to copy file: {}", e))?;
 
-    if let Err(e) = std::fs::rename(&tmp_path, dest) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("failed to finalize file: {}", e));
-    }
+        if let Err(e) = verify_copied_file(&tmp_path, expected_hash, expected_status, expected_size)
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
 
-    Ok(())
+        if let Err(e) = std::fs::rename(&tmp_path, dest) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("failed to finalize file: {}", e));
+        }
+
+        Ok(())
+    })
 }
 
 fn verify_copied_file(

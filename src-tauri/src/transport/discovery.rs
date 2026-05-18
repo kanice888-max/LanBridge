@@ -406,3 +406,168 @@ fn create_socket_for_interface(
 
     Ok(socket.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_addr(ip: &str, interface: Option<&str>) -> OnlineDeviceAddress {
+        OnlineDeviceAddress {
+            ip: ip.to_string(),
+            port: 9527,
+            interface_name: interface.map(|s| s.to_string()),
+            last_seen_unix_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn address_score_prefers_private_ip() {
+        let private = make_addr("192.168.1.100", None);
+        let loopback = make_addr("127.0.0.1", None);
+        let link_local = make_addr("169.254.1.1", None);
+
+        assert!(
+            address_score(&private) > 0,
+            "private IP should score positively"
+        );
+        assert!(
+            address_score(&loopback) < 0,
+            "loopback should score negatively"
+        );
+        assert!(
+            address_score(&link_local) < 0,
+            "link-local should score negatively"
+        );
+        assert!(address_score(&private) > address_score(&loopback));
+    }
+
+    #[test]
+    fn address_score_penalizes_vpn_interfaces() {
+        let normal = make_addr("192.168.1.100", Some("en0"));
+        let vpn = make_addr("192.168.1.100", Some("utun0"));
+        assert!(address_score(&normal) > address_score(&vpn));
+
+        let hyperv = make_addr("10.0.0.1", Some("vEthernet (Hyper-V)"));
+        assert!(address_score(&normal) > address_score(&hyperv));
+    }
+
+    #[test]
+    fn record_peer_adds_to_device_list() {
+        let state = DiscoveryState::new();
+        let announce = Announce {
+            device_id: "dev-1".to_string(),
+            display_name: "Mac".to_string(),
+            public_key: vec![1, 2, 3],
+            port: 9527,
+        };
+
+        state.record_peer(
+            announce.clone(),
+            "192.168.1.5".to_string(),
+            Some("en0".to_string()),
+        );
+        let devices = state.list_devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "dev-1");
+        assert_eq!(devices[0].display_name, "Mac");
+        assert_eq!(devices[0].ip, "192.168.1.5");
+        assert_eq!(devices[0].port, 9527);
+    }
+
+    #[test]
+    fn record_peer_ignores_zero_port() {
+        let state = DiscoveryState::new();
+        let announce = Announce {
+            device_id: "dev-1".to_string(),
+            display_name: "Ghost".to_string(),
+            public_key: vec![1],
+            port: 0,
+        };
+        state.record_peer(announce, "192.168.1.5".to_string(), None);
+        assert_eq!(state.list_devices().len(), 0);
+    }
+
+    #[test]
+    fn record_peer_updates_existing_device() {
+        let state = DiscoveryState::new();
+        let announce1 = Announce {
+            device_id: "dev-1".to_string(),
+            display_name: "Old".to_string(),
+            public_key: vec![1],
+            port: 9527,
+        };
+        let announce2 = Announce {
+            device_id: "dev-1".to_string(),
+            display_name: "New".to_string(),
+            public_key: vec![2],
+            port: 9528,
+        };
+
+        state.record_peer(announce1, "192.168.1.5".to_string(), None);
+        state.record_peer(announce2, "192.168.1.6".to_string(), None);
+        let devices = state.list_devices();
+        assert_eq!(
+            devices.len(),
+            1,
+            "same device_id should update, not duplicate"
+        );
+        assert_eq!(devices[0].display_name, "New");
+        assert!(devices[0].addresses.len() >= 2);
+    }
+
+    #[test]
+    fn prune_peers_removes_stale_addresses() {
+        let state = DiscoveryState::new();
+        let announce = Announce {
+            device_id: "dev-1".to_string(),
+            display_name: "Stale".to_string(),
+            public_key: vec![1],
+            port: 9527,
+        };
+
+        // Record with a timestamp far in the past
+        {
+            let mut peers = state.peers.lock().unwrap();
+            let mut addresses = std::collections::HashMap::new();
+            addresses.insert(
+                "192.168.1.5".to_string(),
+                OnlineDeviceAddress {
+                    ip: "192.168.1.5".to_string(),
+                    port: 9527,
+                    interface_name: None,
+                    last_seen_unix_ms: now_ms() - 20_000, // 20 seconds ago
+                },
+            );
+            peers.insert(
+                "dev-1".to_string(),
+                PeerRecord {
+                    announce: announce.clone(),
+                    addresses,
+                },
+            );
+        }
+
+        // Pruning should remove the stale peer
+        prune_peers(&state);
+        let devices = state.list_devices();
+        assert!(devices.is_empty(), "stale peers should be pruned");
+    }
+
+    #[test]
+    fn discovery_state_failed() {
+        let state = DiscoveryState::failed("no interfaces".to_string());
+        let status = state.status();
+        assert!(!status.running);
+        assert_eq!(status.error, Some("no interfaces".to_string()));
+    }
+
+    #[test]
+    fn discovery_state_mark_running() {
+        let state = DiscoveryState::new();
+        state.mark_running(vec!["en0".to_string(), "eth0".to_string()]);
+        let status = state.status();
+        assert!(status.running);
+        assert!(status.error.is_none());
+        assert_eq!(status.interfaces.len(), 2);
+    }
+}

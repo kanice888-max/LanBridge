@@ -1,5 +1,13 @@
 export const zh = {
-  // Sidebar
+  // Tab Bar
+  tabBar: {
+    sync: "同步",
+    devices: "设备",
+    history: "历史",
+    logs: "日志",
+  },
+
+  // Sidebar (kept for compatibility)
   sidebar: {
     dashboard: "仪表盘",
     pairing: "配对设备",
@@ -11,6 +19,7 @@ export const zh = {
   // App
   app: {
     dismiss: "关闭",
+    selectTaskHint: "选择一个同步任务查看详情",
   },
 
   // Dashboard
@@ -22,6 +31,9 @@ export const zh = {
     noTasks: "暂无同步任务",
     noTasksDesc: "配对设备并创建同步任务以开始使用。",
     createFirst: "创建首个任务",
+    openFolder: "打开文件夹",
+    deleteTask: "删除任务",
+    confirmDelete: "确定要删除同步任务吗？任务配置将被移除，但本地文件不会被删除。\n\n任务名称：",
     local: "本地：",
     remote: "远程：",
     pending: "待回传",
@@ -31,6 +43,7 @@ export const zh = {
     failed: "个失败",
     syncing: "同步中…",
     syncNow: "立即同步",
+    returnToPrimary: "回传到主机",
     details: "详情",
     never: "从未",
     incomingInvites: "收到的同步邀请",
@@ -87,6 +100,7 @@ export const zh = {
     twoWayMode: "双向同步（即将支持）",
     primary: "单向备份：此电脑 -> 对方",
     secondary: "单向拉取：对方 -> 此电脑",
+    thisDeviceIp: "本机地址：",
     safetyTitle: "数据安全：",
     safetyDesc:
       "删除会先进入同步历史，不会直接永久删除。对端目录由对端应用自动分配，避免手动填写错误路径。",
@@ -102,12 +116,18 @@ export const zh = {
   // Task Detail
   task: {
     back: "返回",
+    close: "关闭",
     loading: "加载中…",
     localPath: "本地路径",
     remotePath: "远程路径",
     status: "状态",
     active: "活跃",
     paused: "已暂停",
+    peerStatus: "对端状态",
+    peerConnected: "已连接",
+    peerDisconnected: "已断开",
+    peerChecking: "检查中…",
+    syncBlockedOffline: "对端已断开，连接恢复后主机会自动同步。",
     created: "创建时间",
     scanAndSync: "扫描并同步",
     syncing: "同步中…",
@@ -116,9 +136,15 @@ export const zh = {
     resume: "恢复",
     pendingReturn: "待回传",
     conflicts: "冲突",
+    noSafeReturnItems: "没有可安全回传的文件，请先处理冲突或等待主机连接后再试。",
     viewHistory: "查看历史 →",
     lastResults: "上次同步结果",
     files: "文件",
+    subTabs: {
+      info: "信息",
+      returnSync: "待回传",
+      history: "历史",
+    },
   },
 
   // Return Sync
@@ -126,8 +152,7 @@ export const zh = {
     title: "待回传同步",
     back: "返回",
     conflictsBanner: "个冲突已检测到",
-    conflictsDesc:
-      "标有 ⚠️ 的文件自上次同步后在主端已发生变更。回传同步需要先解决冲突。",
+    conflictsDesc: "待回传文件与主机现有文件不一致，请先选择保留两份或覆盖主机。",
     noPending: "暂无待回传变更",
     noPendingDesc: "从端创建或修改的文件将显示在此处。",
     selectSafe: "选择安全项目",
@@ -135,30 +160,33 @@ export const zh = {
     syncing: "同步中…",
     returnSyncN: "回传同步",
     file: "个文件",
+    syncOne: "单独同步",
     resolve: "解决",
     results: "回传同步结果",
+    primaryCheckFailed: "主机状态无法检查，暂不能判断哪些文件可安全回传。",
   },
 
   // Conflict Modal
   conflict: {
-    title: "同步冲突",
-    description: "文件",
-    hasConflict: "自上次同步以来，两端都发生了变更。",
-    hashWarning: "该文件的哈希验证不可用。仅使用大小和修改时间进行比较。",
-    primarySide: "主端（当前）",
-    secondarySide: "从端（待回传）",
+    title: "两端都改了这个文件",
+    description: "为避免覆盖，先选择如何处理：",
+    hasConflict: "",
+    hashWarning: "这个大文件暂时无法完整校验哈希，会用大小和修改时间辅助判断。",
+    primarySide: "主机当前版本",
+    secondarySide: "副机待回传版本",
     modified: "修改时间：",
-    note: "提示：",
-    noteDesc: '选择"覆盖主端"会先将当前主端文件备份到历史记录，再进行替换。',
+    note: "不会静默覆盖：",
+    noteDesc: "覆盖主机前会先备份主机当前文件。",
     cancel: "取消",
-    keepBoth: "保留两者",
-    overwrite: "覆盖主端（已备份）",
+    keepBoth: "保留两份",
+    overwrite: "用副机覆盖主机（先备份）",
   },
 
   // History
   history: {
-    title: "同步历史 / 回收站",
+    title: "同步历史",
     back: "返回",
+    allTasks: "全部任务",
     cleanup: "清理旧条目",
     loading: "加载历史记录…",
     noEntries: "暂无历史条目",
@@ -177,6 +205,12 @@ export const zh = {
     loading: "加载日志…",
     noLogs: "暂无日志条目",
     noLogsDesc: "同步事件将记录在此处。",
+  },
+
+  // Roles
+  role: {
+    primary: "主机",
+    secondary: "副机",
   },
 
   // Settings

@@ -1,17 +1,16 @@
+use lanbridge::app_state::AppState;
 use lanbridge::core::model::{
-    DeviceRole, EntryKind, FileSnapshot, HashStatus, LogLevel, PairedDevice, SyncBaseline,
-    SyncDecision, SyncTask,
+    ChangeKind, DeviceRole, EntryKind, FileSnapshot, HashStatus, LogLevel, PairedDevice,
+    SyncBaseline, SyncDecision, SyncTask,
 };
 use lanbridge::core::{planner, scanner};
-use lanbridge::pairing::{
-    derive_pairing_code, generate_nonce, DeviceIdentity, PublicIdentity,
-};
+use lanbridge::pairing::{derive_pairing_code, generate_nonce, DeviceIdentity, PublicIdentity};
 use lanbridge::platform::macos::MacPlatform;
 use lanbridge::state::{
     db,
     repository::{
-        FileSnapshotRepository, LogRepository, PairedDeviceRepository, SyncBaselineRepository,
-        SyncTaskRepository,
+        FileSnapshotRepository, LogRepository, PairedDeviceRepository, PendingReturnRepository,
+        SyncBaselineRepository, SyncTaskRepository,
     },
 };
 use lanbridge::transport::connection::{pin_connected_peer, PeerConnection};
@@ -85,6 +84,7 @@ impl TestNode {
                 public_key: peer.public.public_key.clone(),
                 last_seen_unix_ms: 1,
                 trusted: true,
+                last_address: Some(peer.address()),
             })
             .unwrap();
     }
@@ -103,6 +103,77 @@ impl TestNode {
         self.server
             .register_task_root(task.id.to_string(), &task.local_path)
             .unwrap();
+    }
+}
+
+struct CommandTestNode {
+    _root: TempDir,
+    sync_dir: PathBuf,
+    state: AppState,
+}
+
+impl CommandTestNode {
+    fn new() -> Self {
+        let root = TempDir::new().unwrap();
+        let sync_dir = root.path().join("sync");
+        let app_dir = root.path().join("app-data");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        let identity = DeviceIdentity::generate();
+        let public = identity.public();
+        let server = SyncServer::start_in_background(0).unwrap();
+        server.set_local_identity(public);
+        let state = AppState::new(
+            identity,
+            Box::new(MacPlatform::with_data_dir(app_dir)),
+            DiscoveryState::new(),
+            Some(server),
+        )
+        .unwrap();
+
+        Self {
+            _root: root,
+            sync_dir,
+            state,
+        }
+    }
+
+    fn public(&self) -> PublicIdentity {
+        self.state.identity.public()
+    }
+
+    fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.state._server.as_ref().unwrap().port())
+    }
+
+    fn trust_and_connect(&self, peer: &CommandTestNode) {
+        let peer_public = peer.public();
+        self.state.connections.pin_peer(peer_public.clone());
+        self.state
+            ._server
+            .as_ref()
+            .unwrap()
+            .register_trusted_peer(peer_public.clone());
+        self.state.connections.register_connection(PeerConnection {
+            device_id: peer_public.device_id,
+            address: peer.address(),
+            connected: true,
+            last_seen_unix_ms: 1,
+        });
+    }
+
+    fn insert_task(&self, task: SyncTask) {
+        let db = self.state.db.lock().unwrap();
+        SyncTaskRepository::new(&db).insert(&task).unwrap();
+        if task.enabled {
+            self.state
+                ._server
+                .as_ref()
+                .unwrap()
+                .register_task_root(task.id.to_string(), &task.local_path)
+                .unwrap();
+        }
     }
 }
 
@@ -137,7 +208,8 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
             device_id: discovered.device_id.clone(),
             public_key: discovered.public_key.clone(),
         }),
-    );
+    )
+    .unwrap();
     assert_eq!(connected_id, secondary.public.device_id);
     assert!(primary.manager.is_connected(&secondary.public.device_id));
 
@@ -305,9 +377,11 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
     )
     .await
     .unwrap();
-    assert_eq!(remote_scan.len(), 1);
-    assert_eq!(remote_scan[0].relative_path, "docs/report.txt");
-    assert_eq!(remote_scan[0].blake3_hash, local_snapshots[0].blake3_hash);
+    let remote_file = remote_scan
+        .iter()
+        .find(|file| file.relative_path == "docs/report.txt")
+        .expect("remote scan should include transferred file");
+    assert_eq!(remote_file.blake3_hash, local_snapshots[0].blake3_hash);
 
     let receiver_snapshot = FileSnapshotRepository::new(&secondary.conn)
         .get(&task_id, "docs/report.txt")
@@ -370,13 +444,11 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
         other => panic!("expected delete ack, got {:?}", other),
     }
     assert!(!received_path.exists());
-    assert!(secondary
-        .sync_dir
-        .join(".lanbridge-history")
-        .join("trash")
-        .join("docs")
-        .join("report.txt")
-        .exists());
+    let history_trash = secondary.sync_dir.join(".lanbridge-history").join("trash");
+    assert!(walkdir::WalkDir::new(&history_trash)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.path().ends_with("docs/report.txt")));
     assert!(
         FileSnapshotRepository::new(&secondary.conn)
             .get(&task_id, "docs/report.txt")
@@ -393,6 +465,512 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
                 && entry.relative_path.as_deref() == Some("docs/report.txt")
                 && entry.message.contains("received delete")
         }));
+}
+
+#[tokio::test]
+async fn test_secondary_sync_now_returns_new_file_to_primary() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    primary.insert_task(SyncTask {
+        id: task_id,
+        name: "Secondary Return".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: primary.sync_dir.to_string_lossy().to_string(),
+        remote_path: secondary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: "Secondary Return".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary.sync_dir.to_string_lossy().to_string(),
+        remote_path: primary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+
+    std::fs::create_dir_all(secondary.sync_dir.join("from-secondary")).unwrap();
+    std::fs::write(
+        secondary.sync_dir.join("from-secondary").join("note.txt"),
+        "created on secondary",
+    )
+    .unwrap();
+
+    let results = lanbridge::commands::run_sync_now(&secondary.state, task_id.to_string())
+        .await
+        .unwrap();
+
+    assert!(results
+        .iter()
+        .any(|result| { result.relative_path == "from-secondary/note.txt" && result.success }));
+    assert!(!primary
+        .sync_dir
+        .join("from-secondary")
+        .join("note.txt")
+        .exists());
+    assert_eq!(
+        lanbridge::state::repository::PendingReturnRepository::new(
+            &secondary.state.db.lock().unwrap()
+        )
+        .count_by_task(&task_id)
+        .unwrap(),
+        2
+    );
+
+    let return_results = lanbridge::commands::run_execute_return_sync(
+        &secondary.state,
+        task_id.to_string(),
+        vec![
+            "from-secondary".to_string(),
+            "from-secondary/note.txt".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert!(return_results
+        .iter()
+        .any(|result| result.relative_path == "from-secondary/note.txt" && result.success));
+    assert_eq!(
+        std::fs::read_to_string(primary.sync_dir.join("from-secondary").join("note.txt")).unwrap(),
+        "created on secondary"
+    );
+    assert_eq!(
+        lanbridge::state::repository::PendingReturnRepository::new(
+            &secondary.state.db.lock().unwrap()
+        )
+        .count_by_task(&task_id)
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn test_refresh_pending_returns_discovers_secondary_new_file_without_network() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    let task_id = Uuid::new_v4();
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: "Refresh Pending".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary.sync_dir.to_string_lossy().to_string(),
+        remote_path: primary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+
+    std::fs::write(
+        secondary.sync_dir.join("secondary-note.txt"),
+        "created on secondary",
+    )
+    .unwrap();
+
+    let results =
+        lanbridge::commands::run_refresh_pending_returns(&secondary.state, task_id.to_string())
+            .unwrap();
+
+    assert!(results.iter().any(|result| {
+        result.relative_path == "secondary-note.txt" && result.success && result.error.is_none()
+    }));
+    let pending = PendingReturnRepository::new(&secondary.state.db.lock().unwrap())
+        .list_by_task(&task_id)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].relative_path, "secondary-note.txt");
+    assert!(!primary.sync_dir.join("secondary-note.txt").exists());
+}
+
+#[tokio::test]
+async fn test_secondary_delete_requires_explicit_return_delete() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    primary.insert_task(SyncTask {
+        id: task_id,
+        name: "Secondary Delete Request".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: primary.sync_dir.to_string_lossy().to_string(),
+        remote_path: secondary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: "Secondary Delete Request".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary.sync_dir.to_string_lossy().to_string(),
+        remote_path: primary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+
+    std::fs::write(primary.sync_dir.join("shared.txt"), "same").unwrap();
+    let hash = blake3::hash(b"same").to_hex().to_string();
+    let baseline = SyncBaseline {
+        task_id,
+        relative_path: "shared.txt".to_string(),
+        primary_hash: Some(hash.clone()),
+        primary_hash_status: HashStatus::Verified,
+        primary_size: 4,
+        primary_modified_unix_ms: 1000,
+        secondary_hash: Some(hash),
+        secondary_hash_status: HashStatus::Verified,
+        secondary_modified_unix_ms: 1000,
+        last_synced_unix_ms: 1000,
+    };
+    SyncBaselineRepository::new(&primary.state.db.lock().unwrap())
+        .upsert(&baseline)
+        .unwrap();
+    SyncBaselineRepository::new(&secondary.state.db.lock().unwrap())
+        .upsert(&baseline)
+        .unwrap();
+
+    let results = lanbridge::commands::run_sync_now(&secondary.state, task_id.to_string())
+        .await
+        .unwrap();
+    assert!(results
+        .iter()
+        .any(|result| result.relative_path == "shared.txt" && result.success));
+    assert!(primary.sync_dir.join("shared.txt").exists());
+
+    let pending = PendingReturnRepository::new(&secondary.state.db.lock().unwrap())
+        .list_by_task(&task_id)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].change_kind, ChangeKind::Deleted);
+
+    let delete_results = lanbridge::commands::run_execute_return_sync(
+        &secondary.state,
+        task_id.to_string(),
+        vec!["shared.txt".to_string()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(delete_results.len(), 1);
+    assert!(delete_results[0].success);
+    assert!(!primary.sync_dir.join("shared.txt").exists());
+    assert!(primary.sync_dir.join(".lanbridge-history").exists());
+    assert_eq!(
+        PendingReturnRepository::new(&secondary.state.db.lock().unwrap())
+            .count_by_task(&task_id)
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_secondary_sync_now_keeps_pending_when_primary_has_unbaselined_file() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    primary.insert_task(SyncTask {
+        id: task_id,
+        name: "Secondary Return Conflict".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: primary.sync_dir.to_string_lossy().to_string(),
+        remote_path: secondary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: "Secondary Return Conflict".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary.sync_dir.to_string_lossy().to_string(),
+        remote_path: primary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+
+    std::fs::write(primary.sync_dir.join("same-name.txt"), "primary version").unwrap();
+    std::fs::write(
+        secondary.sync_dir.join("same-name.txt"),
+        "secondary version",
+    )
+    .unwrap();
+
+    let results = lanbridge::commands::run_sync_now(&secondary.state, task_id.to_string())
+        .await
+        .unwrap();
+
+    assert!(results.iter().any(|result| {
+        result.relative_path == "same-name.txt"
+            && !result.success
+            && result.error.as_deref() == Some("local file already exists")
+    }));
+    assert_eq!(
+        std::fs::read_to_string(primary.sync_dir.join("same-name.txt")).unwrap(),
+        "primary version"
+    );
+    assert_eq!(
+        lanbridge::state::repository::PendingReturnRepository::new(
+            &secondary.state.db.lock().unwrap()
+        )
+        .count_by_task(&task_id)
+        .unwrap(),
+        1
+    );
+
+    let return_results = lanbridge::commands::run_execute_return_sync(
+        &secondary.state,
+        task_id.to_string(),
+        vec!["same-name.txt".to_string()],
+    )
+    .await
+    .unwrap();
+    let conflict = return_results
+        .iter()
+        .find(|result| {
+            result.relative_path == "same-name.txt"
+                && !result.success
+                && result.error.as_deref() == Some("primary file already exists")
+        })
+        .expect("explicit return should be blocked by primary-side conflict");
+    assert_eq!(
+        conflict.error.as_deref(),
+        Some("primary file already exists")
+    );
+    assert_eq!(
+        lanbridge::state::repository::PendingReturnRepository::new(
+            &secondary.state.db.lock().unwrap()
+        )
+        .count_by_task(&task_id)
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_secondary_sync_now_reports_remote_scan_failure_and_keeps_pending() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    secondary.state.connections.pin_peer(primary.public());
+    secondary
+        .state
+        ._server
+        .as_ref()
+        .unwrap()
+        .register_trusted_peer(primary.public());
+
+    let task_id = Uuid::new_v4();
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: "Offline Primary Return".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary.sync_dir.to_string_lossy().to_string(),
+        remote_path: primary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+
+    std::fs::write(secondary.sync_dir.join("offline.txt"), "pending only").unwrap();
+
+    let results = lanbridge::commands::run_sync_now(&secondary.state, task_id.to_string())
+        .await
+        .unwrap();
+
+    let result = results
+        .iter()
+        .find(|result| result.relative_path == "offline.txt")
+        .expect("changed secondary file should be reported");
+    assert!(!result.success);
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("remote scan failed"));
+    assert!(!primary.sync_dir.join("offline.txt").exists());
+    assert_eq!(
+        lanbridge::state::repository::PendingReturnRepository::new(
+            &secondary.state.db.lock().unwrap()
+        )
+        .count_by_task(&task_id)
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_primary_recreates_same_content_after_delete_syncs_again() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    primary.insert_task(SyncTask {
+        id: task_id,
+        name: "Recreate Same Name".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: primary.sync_dir.to_string_lossy().to_string(),
+        remote_path: secondary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: "Recreate Same Name".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary.sync_dir.to_string_lossy().to_string(),
+        remote_path: primary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+
+    let primary_file = primary.sync_dir.join("again.txt");
+    let secondary_file = secondary.sync_dir.join("again.txt");
+    std::fs::write(&primary_file, "same content").unwrap();
+    assert!(
+        lanbridge::commands::run_sync_now(&primary.state, task_id.to_string())
+            .await
+            .unwrap()
+            .iter()
+            .any(|result| result.relative_path == "again.txt" && result.success)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&secondary_file).unwrap(),
+        "same content"
+    );
+
+    std::fs::remove_file(&primary_file).unwrap();
+    assert!(
+        lanbridge::commands::run_sync_now(&primary.state, task_id.to_string())
+            .await
+            .unwrap()
+            .iter()
+            .any(|result| result.relative_path == "again.txt" && result.success)
+    );
+    assert!(!secondary_file.exists());
+
+    std::fs::write(&primary_file, "same content").unwrap();
+    let results = lanbridge::commands::run_sync_now(&primary.state, task_id.to_string())
+        .await
+        .unwrap();
+
+    assert!(results
+        .iter()
+        .any(|result| result.relative_path == "again.txt" && result.success));
+    assert_eq!(
+        std::fs::read_to_string(&secondary_file).unwrap(),
+        "same content"
+    );
+}
+
+#[tokio::test]
+async fn test_primary_sync_now_creates_empty_directory_on_secondary() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    primary.insert_task(SyncTask {
+        id: task_id,
+        name: "Empty Directory".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: primary.sync_dir.to_string_lossy().to_string(),
+        remote_path: secondary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: "Empty Directory".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary.sync_dir.to_string_lossy().to_string(),
+        remote_path: primary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+
+    std::fs::create_dir_all(primary.sync_dir.join("empty-dir")).unwrap();
+
+    let results = lanbridge::commands::run_sync_now(&primary.state, task_id.to_string())
+        .await
+        .unwrap();
+
+    assert!(results
+        .iter()
+        .any(|result| result.relative_path == "empty-dir" && result.success));
+    assert!(secondary.sync_dir.join("empty-dir").is_dir());
+}
+
+#[tokio::test]
+async fn test_sync_now_rejects_paused_task() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    primary.insert_task(SyncTask {
+        id: task_id,
+        name: "Paused Task".to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: primary.sync_dir.to_string_lossy().to_string(),
+        remote_path: secondary.sync_dir.to_string_lossy().to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: false,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+    std::fs::write(primary.sync_dir.join("paused.txt"), "do not sync").unwrap();
+
+    let error = lanbridge::commands::run_sync_now(&primary.state, task_id.to_string())
+        .await
+        .expect_err("paused task should not sync");
+
+    assert!(error.contains("paused"));
+    assert!(!secondary.sync_dir.join("paused.txt").exists());
 }
 
 fn scan_task_files(task_id: Uuid, root: &Path) -> Vec<FileSnapshot> {

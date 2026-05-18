@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding new migrations.
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 /// Run all pending migrations.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -17,6 +17,10 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     if version < 2 {
         migrate_v2(conn)?;
+    }
+
+    if version < 3 {
+        migrate_v3(conn)?;
     }
 
     conn.pragma_update(None, "user_version", CURRENT_VERSION)?;
@@ -120,10 +124,89 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
 
 /// Add primary_size to sync_baselines.
 fn migrate_v2(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "sync_baselines", "primary_size")? {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE sync_baselines ADD COLUMN primary_size INTEGER NOT NULL DEFAULT 0;
+            "#,
+        )?;
+    }
+    Ok(())
+}
+
+/// Persist peer addresses and outgoing pending task invites.
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "paired_devices", "last_address")? {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE paired_devices ADD COLUMN last_address TEXT;
+            "#,
+        )?;
+    }
+
     conn.execute_batch(
         r#"
-        ALTER TABLE sync_baselines ADD COLUMN primary_size INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE IF NOT EXISTS pending_outgoing_task_invites (
+            invite_id       TEXT PRIMARY KEY,
+            task_id         TEXT NOT NULL,
+            name            TEXT NOT NULL,
+            local_path      TEXT NOT NULL,
+            peer_device_id  TEXT NOT NULL,
+            local_role      TEXT NOT NULL CHECK (local_role IN ('Primary', 'Secondary')),
+            created_unix_ms INTEGER NOT NULL
+        );
         "#,
     )?;
     Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrations_tolerate_columns_that_already_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v1(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+            ALTER TABLE sync_baselines ADD COLUMN primary_size INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE paired_devices ADD COLUMN last_address TEXT;
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            CURRENT_VERSION
+        );
+        assert!(column_exists(&conn, "sync_baselines", "primary_size").unwrap());
+        assert!(column_exists(&conn, "paired_devices", "last_address").unwrap());
+        assert!(table_exists(&conn, "pending_outgoing_task_invites").unwrap());
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
 }

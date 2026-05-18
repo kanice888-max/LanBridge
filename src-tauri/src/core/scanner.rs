@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -163,9 +164,17 @@ fn walk_dir(
 
 /// Compute blake3 hash of a file.
 pub fn hash_file(path: &Path) -> Result<String> {
-    let data = std::fs::read(path)?;
-    let hash = blake3::hash(&data);
-    Ok(hash.to_hex().to_string())
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Compute the relative path from sync_root to path, using forward slashes.

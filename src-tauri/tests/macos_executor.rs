@@ -264,18 +264,26 @@ fn test_secondary_delete_does_not_affect_primary() {
         last_synced_unix_ms: 1000,
     };
 
-    // Secondary deletes the file — should result in Noop
+    // Secondary deletes the file — should record an explicit pending delete request.
     let actions = lanbridge::core::planner::plan_sync(
         &[], // empty snapshots = deleted
-        &[baseline],
+        &[baseline.clone()],
         DeviceRole::Secondary,
     );
 
-    // Secondary delete produces Noop
-    assert!(
-        actions.is_empty(),
-        "secondary delete should produce no actions"
-    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].decision, SyncDecision::MarkPendingReturn);
+
+    let results = execute_actions(&actions, &task, std::path::Path::new("."), &conn);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].success);
+
+    let pending = PendingReturnRepository::new(&conn)
+        .list_by_task(&task.id)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].relative_path, "file.txt");
+    assert_eq!(pending[0].change_kind, ChangeKind::Deleted);
 }
 
 #[test]
@@ -403,6 +411,61 @@ fn test_return_sync_conflict_blocked() {
 }
 
 #[test]
+fn test_return_sync_blocks_secondary_modify_when_primary_deleted_after_baseline() {
+    let conn = setup_db();
+    let task = create_task(&conn);
+    let dir = TempDir::new().unwrap();
+    let current_primary = HashMap::new();
+
+    let mut baselines = HashMap::new();
+    baselines.insert(
+        "file.txt".to_string(),
+        SyncBaseline {
+            task_id: task.id,
+            relative_path: "file.txt".to_string(),
+            primary_hash: Some("original_hash".to_string()),
+            primary_hash_status: HashStatus::Verified,
+            primary_size: 100,
+            primary_modified_unix_ms: 1000,
+            secondary_hash: Some("original_hash".to_string()),
+            secondary_hash_status: HashStatus::Verified,
+            secondary_modified_unix_ms: 1000,
+            last_synced_unix_ms: 1000,
+        },
+    );
+
+    let pending_repo = PendingReturnRepository::new(&conn);
+    pending_repo
+        .upsert(&PendingReturnChange {
+            task_id: task.id,
+            relative_path: "file.txt".to_string(),
+            change_kind: ChangeKind::Modified,
+            secondary_hash: Some("secondary_hash".to_string()),
+            secondary_hash_status: HashStatus::Verified,
+            secondary_modified_unix_ms: now_ms(),
+            created_unix_ms: now_ms(),
+        })
+        .unwrap();
+
+    let results = execute_return_sync(
+        &task,
+        &["file.txt".to_string()],
+        &current_primary,
+        &baselines,
+        dir.path(),
+        &conn,
+    );
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].success,
+        "primary deletion plus secondary modification should require user decision"
+    );
+    assert!(results[0].error.as_ref().unwrap().contains("conflict"));
+    assert_eq!(pending_repo.count_by_task(&task.id).unwrap(), 1);
+}
+
+#[test]
 fn test_return_sync_no_conflict_succeeds() {
     let conn = setup_db();
     let mut task = create_task(&conn);
@@ -477,4 +540,80 @@ fn test_return_sync_no_conflict_succeeds() {
     // Pending should be removed
     let count = pending_repo.count_by_task(&task.id).unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn test_return_sync_delete_moves_primary_to_history_and_clears_baseline() {
+    let conn = setup_db();
+    let mut task = create_task(&conn);
+    let dir = TempDir::new().unwrap();
+    task.remote_path = dir.path().join("secondary").to_string_lossy().to_string();
+    std::fs::write(dir.path().join("file.txt"), "primary copy").unwrap();
+    let hash = blake3::hash(b"primary copy").to_hex().to_string();
+
+    let mut current_primary = HashMap::new();
+    current_primary.insert(
+        "file.txt".to_string(),
+        FileSnapshot {
+            task_id: task.id,
+            relative_path: "file.txt".to_string(),
+            kind: EntryKind::File,
+            size: "primary copy".len() as i64,
+            modified_unix_ms: 1000,
+            blake3_hash: Some(hash.clone()),
+            hash_status: HashStatus::Verified,
+            deleted: false,
+            is_symlink: false,
+        },
+    );
+
+    let baseline = SyncBaseline {
+        task_id: task.id,
+        relative_path: "file.txt".to_string(),
+        primary_hash: Some(hash.clone()),
+        primary_hash_status: HashStatus::Verified,
+        primary_size: "primary copy".len() as i64,
+        primary_modified_unix_ms: 1000,
+        secondary_hash: Some(hash),
+        secondary_hash_status: HashStatus::Verified,
+        secondary_modified_unix_ms: 1000,
+        last_synced_unix_ms: 1000,
+    };
+    let mut baselines = HashMap::new();
+    baselines.insert("file.txt".to_string(), baseline.clone());
+    SyncBaselineRepository::new(&conn)
+        .upsert(&baseline)
+        .unwrap();
+
+    let pending_repo = PendingReturnRepository::new(&conn);
+    pending_repo
+        .upsert(&PendingReturnChange {
+            task_id: task.id,
+            relative_path: "file.txt".to_string(),
+            change_kind: ChangeKind::Deleted,
+            secondary_hash: None,
+            secondary_hash_status: HashStatus::Unavailable,
+            secondary_modified_unix_ms: now_ms(),
+            created_unix_ms: now_ms(),
+        })
+        .unwrap();
+
+    let results = execute_return_sync(
+        &task,
+        &["file.txt".to_string()],
+        &current_primary,
+        &baselines,
+        dir.path(),
+        &conn,
+    );
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].success);
+    assert!(!dir.path().join("file.txt").exists());
+    assert!(dir.path().join(".lanbridge-history").exists());
+    assert_eq!(pending_repo.count_by_task(&task.id).unwrap(), 0);
+    assert!(SyncBaselineRepository::new(&conn)
+        .get(&task.id, "file.txt")
+        .unwrap()
+        .is_none());
 }

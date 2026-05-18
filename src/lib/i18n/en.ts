@@ -1,7 +1,15 @@
 import type { Translations } from "./context";
 
 export const en: Translations = {
-  // Sidebar
+  // Tab Bar
+  tabBar: {
+    sync: "Sync",
+    devices: "Devices",
+    history: "History",
+    logs: "Logs",
+  },
+
+  // Sidebar (kept for compatibility)
   sidebar: {
     dashboard: "Dashboard",
     pairing: "Pair Device",
@@ -13,6 +21,7 @@ export const en: Translations = {
   // App
   app: {
     dismiss: "Dismiss",
+    selectTaskHint: "Select a sync task to view details",
   },
 
   // Dashboard
@@ -24,6 +33,9 @@ export const en: Translations = {
     noTasks: "No sync tasks yet",
     noTasksDesc: "Pair a device and create a sync task to get started.",
     createFirst: "Create First Task",
+    openFolder: "Open Folder",
+    deleteTask: "Delete Task",
+    confirmDelete: "Are you sure you want to delete this sync task? The task configuration will be removed, but local files will NOT be deleted.\n\nTask:",
     local: "Local:",
     remote: "Remote:",
     pending: "Pending",
@@ -33,6 +45,7 @@ export const en: Translations = {
     failed: "failed",
     syncing: "Syncing...",
     syncNow: "Sync Now",
+    returnToPrimary: "Return to Primary",
     details: "Details",
     never: "Never",
     incomingInvites: "Incoming Sync Invites",
@@ -91,6 +104,7 @@ export const en: Translations = {
     twoWayMode: "Two-way sync (coming soon)",
     primary: "One-way backup: this computer -> peer",
     secondary: "One-way pull: peer -> this computer",
+    thisDeviceIp: "This device:",
     safetyTitle: "Data Safety:",
     safetyDesc:
       "Deletes are moved to sync history first. The peer folder is allocated by the peer app to avoid typing the other computer's path.",
@@ -107,12 +121,18 @@ export const en: Translations = {
   // Task Detail
   task: {
     back: "Back",
+    close: "Close",
     loading: "Loading...",
     localPath: "Local Path",
     remotePath: "Remote Path",
     status: "Status",
     active: "Active",
     paused: "Paused",
+    peerStatus: "Peer Status",
+    peerConnected: "Connected",
+    peerDisconnected: "Disconnected",
+    peerChecking: "Checking...",
+    syncBlockedOffline: "The peer is disconnected. Primary sync will resume automatically after reconnection.",
     created: "Created",
     scanAndSync: "Scan & Sync",
     syncing: "Syncing...",
@@ -121,9 +141,15 @@ export const en: Translations = {
     resume: "Resume",
     pendingReturn: "Pending Return",
     conflicts: "Conflicts",
+    noSafeReturnItems: "No files are safe to return yet. Resolve conflicts or reconnect the primary first.",
     viewHistory: "View History →",
     lastResults: "Last Sync Results",
     files: "Files",
+    subTabs: {
+      info: "Info",
+      returnSync: "Return Sync",
+      history: "History",
+    },
   },
 
   // Return Sync
@@ -132,7 +158,7 @@ export const en: Translations = {
     back: "Back",
     conflictsBanner: "conflict(s) detected",
     conflictsDesc:
-      "Files marked with ⚠️ have been changed on the primary since the last sync. Return-syncing them will require conflict resolution.",
+      "Pending return files differ from the primary. Choose keep both or overwrite primary first.",
     noPending: "No pending changes",
     noPendingDesc: "Secondary-side files will appear here when created or modified.",
     selectSafe: "Select Safe Items",
@@ -140,32 +166,35 @@ export const en: Translations = {
     syncing: "Syncing...",
     returnSyncN: "Return-Sync",
     file: "File(s)",
+    syncOne: "Sync One",
     resolve: "Resolve",
     results: "Return-Sync Results",
+    primaryCheckFailed: "Primary status could not be checked, so safe return-sync is unavailable.",
   },
 
   // Conflict Modal
   conflict: {
-    title: "Sync Conflict",
-    description: "The file",
-    hasConflict: "has been changed on both sides since the last sync.",
+    title: "Both sides changed this file",
+    description: "Choose how to handle it before anything is overwritten:",
+    hasConflict: "",
     hashWarning:
-      "Hash verification unavailable for this file. Comparison uses size and modification time only.",
-    primarySide: "Primary (current)",
-    secondarySide: "Secondary (pending)",
+      "Full hash verification is unavailable for this large file. Size and modification time are used as a fallback.",
+    primarySide: "Primary current version",
+    secondarySide: "Secondary pending version",
     modified: "Modified:",
-    note: "Note:",
+    note: "No silent overwrite:",
     noteDesc:
-      'Choosing "Overwrite Primary" will first back up the current primary file to history before replacing it.',
+      "The primary file is backed up before overwrite.",
     cancel: "Cancel",
     keepBoth: "Keep Both",
-    overwrite: "Overwrite Primary (with backup)",
+    overwrite: "Use Secondary (backup first)",
   },
 
   // History
   history: {
-    title: "Sync History / Trash",
+    title: "Sync History",
     back: "Back",
+    allTasks: "All Tasks",
     cleanup: "Cleanup Old Entries",
     loading: "Loading history...",
     noEntries: "No history entries",
@@ -185,6 +214,12 @@ export const en: Translations = {
     loading: "Loading logs...",
     noLogs: "No log entries",
     noLogsDesc: "Sync events will be recorded here.",
+  },
+
+  // Roles
+  role: {
+    primary: "Primary",
+    secondary: "Secondary",
   },
 
   // Settings

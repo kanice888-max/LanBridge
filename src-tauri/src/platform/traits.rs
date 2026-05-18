@@ -60,4 +60,21 @@ pub trait Platform: Send + Sync {
     /// Detect case-only collisions in a set of relative paths.
     /// Returns list of colliding path groups.
     fn detect_case_collisions(&self, paths: &[String]) -> Vec<Vec<String>>;
+
+    /// Start a filesystem watcher for the given sync root.
+    /// Returns a handle (must be kept alive) and an event receiver.
+    /// Watcher events are used to trigger scans, not direct sync decisions.
+    fn start_watcher(
+        &self,
+        sync_root: &Path,
+    ) -> Result<(
+        notify::RecommendedWatcher,
+        std::sync::mpsc::Receiver<PlatformWatcherEvent>,
+    )>;
+}
+
+/// Watcher event type used across the platform boundary.
+#[derive(Debug, Clone)]
+pub struct PlatformWatcherEvent {
+    pub paths: Vec<std::path::PathBuf>,
 }

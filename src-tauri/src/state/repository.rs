@@ -324,6 +324,14 @@ impl<'a> SyncBaselineRepository<'a> {
         }
         Ok(result)
     }
+
+    pub fn remove(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sync_baselines WHERE task_id = ?1 AND relative_path = ?2",
+            params![task_id.to_string(), relative_path],
+        )?;
+        Ok(())
+    }
 }
 
 /// Repository for pending return changes.
@@ -477,6 +485,14 @@ impl<'a> HistoryRepository<'a> {
         )?;
         Ok(count)
     }
+
+    pub fn remove(&self, task_id: &Uuid, entry_id: &Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM history_entries WHERE task_id = ?1 AND id = ?2",
+            params![task_id.to_string(), entry_id.to_string()],
+        )?;
+        Ok(())
+    }
 }
 
 /// Repository for paired devices.
@@ -491,19 +507,21 @@ impl<'a> PairedDeviceRepository<'a> {
 
     pub fn upsert(&self, device: &PairedDevice) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO paired_devices (device_id, display_name, public_key, last_seen_unix_ms, trusted)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO paired_devices (device_id, display_name, public_key, last_seen_unix_ms, trusted, last_address)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(device_id) DO UPDATE SET
                 display_name = excluded.display_name,
                 public_key = excluded.public_key,
                 last_seen_unix_ms = excluded.last_seen_unix_ms,
-                trusted = excluded.trusted",
+                trusted = excluded.trusted,
+                last_address = excluded.last_address",
             params![
                 device.device_id,
                 device.display_name,
                 device.public_key,
                 device.last_seen_unix_ms,
                 device.trusted as i32,
+                device.last_address,
             ],
         )?;
         Ok(())
@@ -511,7 +529,7 @@ impl<'a> PairedDeviceRepository<'a> {
 
     pub fn get(&self, device_id: &str) -> Result<Option<PairedDevice>> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_id, display_name, public_key, last_seen_unix_ms, trusted
+            "SELECT device_id, display_name, public_key, last_seen_unix_ms, trusted, last_address
              FROM paired_devices WHERE device_id = ?1",
         )?;
         let result = stmt.query_row(params![device_id], |row| {
@@ -521,6 +539,7 @@ impl<'a> PairedDeviceRepository<'a> {
                 public_key: row.get(2)?,
                 last_seen_unix_ms: row.get(3)?,
                 trusted: row.get::<_, i32>(4)? != 0,
+                last_address: row.get(5)?,
             })
         });
         match result {
@@ -532,7 +551,7 @@ impl<'a> PairedDeviceRepository<'a> {
 
     pub fn list_all(&self) -> Result<Vec<PairedDevice>> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_id, display_name, public_key, last_seen_unix_ms, trusted
+            "SELECT device_id, display_name, public_key, last_seen_unix_ms, trusted, last_address
              FROM paired_devices ORDER BY last_seen_unix_ms DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -542,6 +561,7 @@ impl<'a> PairedDeviceRepository<'a> {
                 public_key: row.get(2)?,
                 last_seen_unix_ms: row.get(3)?,
                 trusted: row.get::<_, i32>(4)? != 0,
+                last_address: row.get(5)?,
             })
         })?;
         let mut result = Vec::new();

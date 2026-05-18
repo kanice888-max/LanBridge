@@ -22,13 +22,13 @@ export function ConflictModal({
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2>{t.conflict.title}</h2>
         <p className="conflict-description">
-          {t.conflict.description} <strong>{conflict.relative_path}</strong> {t.conflict.hasConflict}
+          <strong>{conflict.relative_path}</strong>
+          <br />
+          {t.conflict.description}
         </p>
 
         {conflict.hash_unverified && (
-          <div className="hash-warning">
-            {t.conflict.hashWarning}
-          </div>
+          <div className="hash-warning">{t.conflict.hashWarning}</div>
         )}
 
         <div className="conflict-details">
@@ -43,7 +43,7 @@ export function ConflictModal({
         </div>
 
         <div className="safety-notice">
-          <strong>{t.conflict.note}</strong> {t.conflict.noteDesc}
+          <span><strong>{t.conflict.note}</strong> {t.conflict.noteDesc}</span>
         </div>
 
         <div className="modal-actions">

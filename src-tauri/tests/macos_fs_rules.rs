@@ -48,6 +48,42 @@ fn test_history_directory_ignored() {
 }
 
 #[test]
+fn test_lanbridge_temp_directory_ignored() {
+    assert_eq!(
+        fs_rules::classify_entry(".lanbridge-temp", true),
+        IgnoreDecision::Ignored(IgnoreReason::ExactDirectory(".lanbridge-temp".to_string()))
+    );
+}
+
+#[test]
+fn test_lanbridge_partial_files_ignored() {
+    assert!(matches!(
+        fs_rules::classify_entry("photo.jpg.lanbridge-partial", false),
+        IgnoreDecision::Ignored(_)
+    ));
+    assert!(matches!(
+        fs_rules::classify_entry("photo.jpg.lanbridge-partial.lanbridge-partial", false),
+        IgnoreDecision::Ignored(_)
+    ));
+}
+
+#[test]
+fn test_browser_and_download_temp_files_ignored() {
+    assert!(matches!(
+        fs_rules::classify_entry("video.mp4.part", false),
+        IgnoreDecision::Ignored(_)
+    ));
+    assert!(matches!(
+        fs_rules::classify_entry("archive.zip.crdownload", false),
+        IgnoreDecision::Ignored(_)
+    ));
+    assert!(matches!(
+        fs_rules::classify_entry("installer.download", false),
+        IgnoreDecision::Ignored(_)
+    ));
+}
+
+#[test]
 fn test_git_file_not_ignored() {
     // .gitignore is NOT ignored by the .git/ rule
     assert_eq!(

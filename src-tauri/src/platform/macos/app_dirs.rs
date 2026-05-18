@@ -117,4 +117,14 @@ impl Platform for MacPlatform {
             .filter(|group| group.len() > 1)
             .collect()
     }
+
+    fn start_watcher(
+        &self,
+        sync_root: &Path,
+    ) -> Result<(
+        notify::RecommendedWatcher,
+        std::sync::mpsc::Receiver<crate::platform::traits::PlatformWatcherEvent>,
+    )> {
+        super::watcher::start_watcher(sync_root)
+    }
 }

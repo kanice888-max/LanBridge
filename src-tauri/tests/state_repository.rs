@@ -287,12 +287,14 @@ fn test_paired_device() {
         public_key: vec![1, 2, 3, 4],
         last_seen_unix_ms: now_ms(),
         trusted: true,
+        last_address: Some("192.168.1.20:9527".to_string()),
     };
     repo.upsert(&device).unwrap();
 
     let loaded = repo.get("dev-001").unwrap().unwrap();
     assert_eq!(loaded.display_name, "My Mac");
     assert!(loaded.trusted);
+    assert_eq!(loaded.last_address.as_deref(), Some("192.168.1.20:9527"));
 }
 
 #[test]

@@ -1,3 +1,5 @@
+pub mod app_state;
+pub mod commands;
 pub mod core;
 pub mod history;
 pub mod pairing;

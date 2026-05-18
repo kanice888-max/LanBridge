@@ -85,9 +85,9 @@ The primary-secondary direction can be switched only while both configured folde
 
 - Secondary file created: mark as pending return-sync.
 - Secondary file modified: mark as pending return-sync.
-- Secondary file deleted: do not affect primary.
-- Manual return-sync: copy only secondary creates and updates to primary.
-- Manual return-sync must not propagate secondary deletions to primary in V1.
+- Secondary file deleted: mark as a pending return/delete request; do not affect primary automatically.
+- Manual return-sync: copy selected secondary creates/updates to primary, or send selected delete requests to primary.
+- Manual return-delete must be explicit. Primary receive side moves deleted files into history instead of permanently deleting them.
 
 ### Conflict Rule
 
@@ -244,8 +244,9 @@ Required error categories:
 - Deleting a file on primary moves the secondary copy into sync trash/history.
 - Creating a file on secondary marks it as pending return-sync.
 - Editing a file on secondary marks it as pending return-sync.
-- Deleting a file on secondary does not delete the primary file.
+- Deleting a file on secondary creates an explicit pending delete request and does not delete the primary file automatically.
 - Clicking return-sync copies selected secondary creates/updates to primary.
+- Clicking return-sync on a selected delete request moves the primary copy into history only after user action.
 - If primary changed since baseline, return-sync shows a conflict modal.
 - If the user confirms overwrite, the old primary file is saved to history before replacement.
 - Sync state survives app restart.

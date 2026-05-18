@@ -1,9 +1,12 @@
-use crate::core::model::{DeviceRole, FileSnapshot, HashStatus, SyncBaseline, SyncDecision};
+use crate::core::model::{
+    DeviceRole, EntryKind, FileSnapshot, HashStatus, SyncBaseline, SyncDecision,
+};
 
 /// Compare current snapshots with baselines to produce sync decisions.
 ///
-/// For primary role: new/changed files → ApplyToSecondary, deleted → MoveSecondaryToHistory.
-/// For secondary role: new/changed files → MarkPendingReturn, deleted → Noop.
+/// For primary role: new/changed files and new directories → ApplyToSecondary,
+/// deleted entries → MoveSecondaryToHistory.
+/// For secondary role: new/changed/deleted files and new directories → MarkPendingReturn.
 pub fn plan_sync(
     current_snapshots: &[FileSnapshot],
     baselines: &[SyncBaseline],
@@ -20,6 +23,7 @@ pub fn plan_sync(
     // Index current snapshots by relative path
     let snapshot_map: HashMap<&str, &FileSnapshot> = current_snapshots
         .iter()
+        .filter(|s| !s.deleted && !s.is_symlink)
         .map(|s| (s.relative_path.as_str(), s))
         .collect();
 
@@ -33,8 +37,11 @@ pub fn plan_sync(
 
         let decision = match baseline_map.get(snap.relative_path.as_str()) {
             Some(baseline) => {
-                // File exists in baseline: check if changed
-                if has_changed(snap, baseline, local_role) {
+                // Directories have no stable content hash. Once a directory has
+                // a baseline, child entries carry later content changes.
+                if snap.kind == EntryKind::Directory {
+                    SyncDecision::Noop
+                } else if has_changed(snap, baseline, local_role) {
                     match local_role {
                         DeviceRole::Primary => SyncDecision::ApplyToSecondary,
                         DeviceRole::Secondary => SyncDecision::MarkPendingReturn,
@@ -70,7 +77,7 @@ pub fn plan_sync(
         if snapshot_map.get(baseline.relative_path.as_str()).is_none() {
             let decision = match local_role {
                 DeviceRole::Primary => SyncDecision::MoveSecondaryToHistory,
-                DeviceRole::Secondary => SyncDecision::Noop, // Secondary delete doesn't affect primary
+                DeviceRole::Secondary => SyncDecision::MarkPendingReturn,
             };
 
             if decision != SyncDecision::Noop {
@@ -84,7 +91,18 @@ pub fn plan_sync(
         }
     }
 
+    actions.sort_by(|left, right| match (&left.decision, &right.decision) {
+        (SyncDecision::MoveSecondaryToHistory, SyncDecision::MoveSecondaryToHistory) => {
+            path_depth(&right.relative_path).cmp(&path_depth(&left.relative_path))
+        }
+        _ => std::cmp::Ordering::Equal,
+    });
+
     actions
+}
+
+fn path_depth(path: &str) -> usize {
+    path.split('/').filter(|part| !part.is_empty()).count()
 }
 
 /// A planned sync action.
@@ -125,4 +143,269 @@ fn has_changed(snapshot: &FileSnapshot, baseline: &SyncBaseline, local_role: Dev
 
     // Fallback: compare size and modified time
     snapshot.size != baseline.primary_size || snapshot.modified_unix_ms != baseline_modified_unix_ms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::*;
+
+    fn make_snapshot(
+        path: &str,
+        kind: EntryKind,
+        size: i64,
+        mtime: i64,
+        hash: Option<&str>,
+        hash_status: HashStatus,
+    ) -> FileSnapshot {
+        FileSnapshot {
+            task_id: uuid::Uuid::nil(),
+            relative_path: path.to_string(),
+            kind,
+            size,
+            modified_unix_ms: mtime,
+            blake3_hash: hash.map(|s| s.to_string()),
+            hash_status,
+            deleted: false,
+            is_symlink: false,
+        }
+    }
+
+    fn make_baseline(
+        path: &str,
+        primary_hash: Option<&str>,
+        primary_hash_status: HashStatus,
+        primary_size: i64,
+        primary_mtime: i64,
+        secondary_hash: Option<&str>,
+        secondary_mtime: i64,
+    ) -> SyncBaseline {
+        SyncBaseline {
+            task_id: uuid::Uuid::nil(),
+            relative_path: path.to_string(),
+            primary_hash: primary_hash.map(|s| s.to_string()),
+            primary_hash_status,
+            primary_size,
+            primary_modified_unix_ms: primary_mtime,
+            secondary_hash: secondary_hash.map(|s| s.to_string()),
+            secondary_hash_status: primary_hash_status,
+            secondary_modified_unix_ms: secondary_mtime,
+            last_synced_unix_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn has_changed_different_hash_is_change() {
+        let snap = make_snapshot(
+            "a.txt",
+            EntryKind::File,
+            100,
+            2000,
+            Some("aaa"),
+            HashStatus::Verified,
+        );
+        let baseline = make_baseline(
+            "a.txt",
+            Some("bbb"),
+            HashStatus::Verified,
+            100,
+            1000,
+            Some("bbb"),
+            1000,
+        );
+        assert!(has_changed(&snap, &baseline, DeviceRole::Primary));
+    }
+
+    #[test]
+    fn has_changed_same_hash_is_not_change_even_if_mtime_differs() {
+        let snap = make_snapshot(
+            "a.txt",
+            EntryKind::File,
+            100,
+            9999,
+            Some("abc"),
+            HashStatus::Verified,
+        );
+        let baseline = make_baseline(
+            "a.txt",
+            Some("abc"),
+            HashStatus::Verified,
+            100,
+            1000,
+            Some("abc"),
+            1000,
+        );
+        assert!(!has_changed(&snap, &baseline, DeviceRole::Primary));
+    }
+
+    #[test]
+    fn has_changed_fallback_size_differs_no_hash() {
+        let snap = make_snapshot(
+            "a.txt",
+            EntryKind::File,
+            200,
+            2000,
+            None,
+            HashStatus::UnverifiedLargeFile,
+        );
+        let baseline = make_baseline(
+            "a.txt",
+            None,
+            HashStatus::UnverifiedLargeFile,
+            100,
+            1000,
+            None,
+            1000,
+        );
+        assert!(has_changed(&snap, &baseline, DeviceRole::Primary));
+    }
+
+    #[test]
+    fn has_changed_fallback_mtime_differs_no_hash() {
+        let snap = make_snapshot(
+            "a.txt",
+            EntryKind::File,
+            100,
+            3000,
+            None,
+            HashStatus::Unavailable,
+        );
+        let baseline = make_baseline(
+            "a.txt",
+            None,
+            HashStatus::Unavailable,
+            100,
+            1000,
+            None,
+            1000,
+        );
+        assert!(has_changed(&snap, &baseline, DeviceRole::Primary));
+    }
+
+    #[test]
+    fn has_changed_secondary_role_uses_secondary_baseline() {
+        let snap = make_snapshot(
+            "a.txt",
+            EntryKind::File,
+            100,
+            2000,
+            Some("xxx"),
+            HashStatus::Verified,
+        );
+        let baseline = make_baseline(
+            "a.txt",
+            Some("xxx"),
+            HashStatus::Verified,
+            100,
+            1000,
+            Some("yyy"),
+            1000,
+        );
+        // secondary_hash differs → change detected
+        assert!(has_changed(&snap, &baseline, DeviceRole::Secondary));
+    }
+
+    #[test]
+    fn plan_sync_new_primary_file_becomes_apply() {
+        let snap = make_snapshot(
+            "new.txt",
+            EntryKind::File,
+            50,
+            1000,
+            Some("hash1"),
+            HashStatus::Verified,
+        );
+        let actions = plan_sync(&[snap], &[], DeviceRole::Primary);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].decision, SyncDecision::ApplyToSecondary);
+    }
+
+    #[test]
+    fn plan_sync_new_secondary_file_becomes_pending_return() {
+        let snap = make_snapshot(
+            "new.txt",
+            EntryKind::File,
+            50,
+            1000,
+            Some("hash1"),
+            HashStatus::Verified,
+        );
+        let actions = plan_sync(&[snap], &[], DeviceRole::Secondary);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].decision, SyncDecision::MarkPendingReturn);
+    }
+
+    #[test]
+    fn plan_sync_unchanged_file_is_noop() {
+        let snap = make_snapshot(
+            "same.txt",
+            EntryKind::File,
+            100,
+            2000,
+            Some("abc"),
+            HashStatus::Verified,
+        );
+        let baseline = make_baseline(
+            "same.txt",
+            Some("abc"),
+            HashStatus::Verified,
+            100,
+            1000,
+            Some("abc"),
+            1000,
+        );
+        let actions = plan_sync(&[snap], &[baseline], DeviceRole::Primary);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn plan_sync_primary_delete_moves_secondary_to_history() {
+        let baseline = make_baseline(
+            "gone.txt",
+            Some("hash"),
+            HashStatus::Verified,
+            100,
+            1000,
+            Some("hash"),
+            1000,
+        );
+        let actions = plan_sync(&[], &[baseline], DeviceRole::Primary);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].decision, SyncDecision::MoveSecondaryToHistory);
+    }
+
+    #[test]
+    fn plan_sync_secondary_delete_becomes_pending_return() {
+        let baseline = make_baseline(
+            "gone.txt",
+            Some("hash"),
+            HashStatus::Verified,
+            100,
+            1000,
+            Some("hash"),
+            1000,
+        );
+        let actions = plan_sync(&[], &[baseline], DeviceRole::Secondary);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].decision, SyncDecision::MarkPendingReturn);
+        assert_eq!(actions[0].relative_path, "gone.txt");
+        assert!(actions[0].snapshot.is_none());
+    }
+
+    #[test]
+    fn plan_sync_skips_symlinks() {
+        let snap = FileSnapshot {
+            task_id: uuid::Uuid::nil(),
+            relative_path: "link".to_string(),
+            kind: EntryKind::File,
+            size: 0,
+            modified_unix_ms: 0,
+            blake3_hash: None,
+            hash_status: HashStatus::Unavailable,
+            deleted: false,
+            is_symlink: true,
+        };
+        let actions = plan_sync(&[snap], &[], DeviceRole::Primary);
+        assert!(actions.is_empty(), "symlinks should be skipped");
+    }
 }

@@ -4,13 +4,14 @@ use lanbridge::core::model::{
     SyncBaseline, SyncDecision, SyncTask,
 };
 use lanbridge::core::{planner, scanner};
+use lanbridge::history::store::HistoryStore;
 use lanbridge::pairing::{derive_pairing_code, generate_nonce, DeviceIdentity, PublicIdentity};
 use lanbridge::platform::windows::WinPlatform;
 use lanbridge::state::{
     db,
     repository::{
-        FileSnapshotRepository, LogRepository, PairedDeviceRepository, PendingReturnRepository,
-        SyncBaselineRepository, SyncTaskRepository,
+        FileSnapshotRepository, HistoryRepository, LogRepository, PairedDeviceRepository,
+        PendingReturnRepository, SyncBaselineRepository, SyncTaskRepository,
     },
 };
 use lanbridge::transport::connection::{pin_connected_peer, PeerConnection};
@@ -175,6 +176,42 @@ impl CommandTestNode {
                 .unwrap();
         }
     }
+}
+
+fn insert_paired_command_task(
+    primary: &CommandTestNode,
+    secondary: &CommandTestNode,
+    task_id: Uuid,
+    name: &str,
+    primary_root: &Path,
+    secondary_root: &Path,
+) {
+    std::fs::create_dir_all(primary_root).unwrap();
+    std::fs::create_dir_all(secondary_root).unwrap();
+    primary.insert_task(SyncTask {
+        id: task_id,
+        name: name.to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: primary_root.to_string_lossy().to_string(),
+        remote_path: secondary_root.to_string_lossy().to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
+    secondary.insert_task(SyncTask {
+        id: task_id,
+        name: name.to_string(),
+        primary_device_id: primary.public().device_id,
+        secondary_device_id: secondary.public().device_id,
+        local_path: secondary_root.to_string_lossy().to_string(),
+        remote_path: primary_root.to_string_lossy().to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: 1,
+        updated_unix_ms: 1,
+    });
 }
 
 #[tokio::test]
@@ -435,6 +472,12 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
         SyncMessage::FileDelete {
             task_id: task_id.to_string(),
             relative_path: "docs/report.txt".to_string(),
+            expected_kind: None,
+            expected_hash: None,
+            expected_hash_status: None,
+            expected_size: None,
+            expected_modified_unix_ms: None,
+            delete_batch_id: None,
         },
     )
     .await
@@ -449,13 +492,10 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
         .into_iter()
         .filter_map(|entry| entry.ok())
         .any(|entry| entry.path().ends_with("docs/report.txt")));
-    assert!(
-        FileSnapshotRepository::new(&secondary.conn)
-            .get(&task_id, "docs/report.txt")
-            .unwrap()
-            .expect("receiver snapshot should remain addressable")
-            .deleted
-    );
+    assert!(FileSnapshotRepository::new(&secondary.conn)
+        .get(&task_id, "docs/report.txt")
+        .unwrap()
+        .is_none());
     assert!(LogRepository::new(&secondary.conn)
         .list_recent(20)
         .unwrap()
@@ -636,6 +676,7 @@ async fn test_secondary_delete_requires_explicit_return_delete() {
         primary_hash: Some(hash.clone()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 4,
+        secondary_size: 4,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some(hash),
         secondary_hash_status: HashStatus::Verified,
@@ -944,6 +985,275 @@ async fn test_primary_sync_now_creates_empty_directory_on_secondary() {
 }
 
 #[tokio::test]
+async fn test_primary_sync_now_copies_nested_folder_tree_and_directory_baselines() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    insert_paired_command_task(
+        &primary,
+        &secondary,
+        task_id,
+        "Nested Folder",
+        &primary.sync_dir,
+        &secondary.sync_dir,
+    );
+
+    std::fs::create_dir_all(primary.sync_dir.join("folder").join("sub")).unwrap();
+    std::fs::write(
+        primary.sync_dir.join("folder").join("sub").join("a.txt"),
+        "a",
+    )
+    .unwrap();
+    std::fs::write(primary.sync_dir.join("folder").join("b.txt"), "b").unwrap();
+
+    let results = lanbridge::commands::run_sync_now(&primary.state, task_id.to_string())
+        .await
+        .unwrap();
+
+    assert!(results
+        .iter()
+        .any(|result| result.relative_path == "folder" && result.success));
+    assert_eq!(
+        std::fs::read_to_string(secondary.sync_dir.join("folder").join("sub").join("a.txt"))
+            .unwrap(),
+        "a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(secondary.sync_dir.join("folder").join("b.txt")).unwrap(),
+        "b"
+    );
+    let db = primary.state.db.lock().unwrap();
+    let baselines = SyncBaselineRepository::new(&db);
+    assert!(baselines.get(&task_id, "folder").unwrap().is_some());
+    assert!(baselines.get(&task_id, "folder/sub").unwrap().is_some());
+    assert!(baselines
+        .get(&task_id, "folder/sub/a.txt")
+        .unwrap()
+        .is_some());
+    assert!(baselines.get(&task_id, "folder/b.txt").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_primary_cross_task_folder_move_deletes_source_and_syncs_target() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let primary_task1_root = primary._root.path().join("primary-task-1");
+    let primary_task2_root = primary._root.path().join("primary-task-2");
+    let secondary_task1_root = secondary._root.path().join("secondary-task-1");
+    let secondary_task2_root = secondary._root.path().join("secondary-task-2");
+    let task1_id = Uuid::new_v4();
+    let task2_id = Uuid::new_v4();
+    insert_paired_command_task(
+        &primary,
+        &secondary,
+        task1_id,
+        "Task One",
+        &primary_task1_root,
+        &secondary_task1_root,
+    );
+    insert_paired_command_task(
+        &primary,
+        &secondary,
+        task2_id,
+        "Task Two",
+        &primary_task2_root,
+        &secondary_task2_root,
+    );
+
+    std::fs::create_dir_all(primary_task1_root.join("moved-folder").join("sub")).unwrap();
+    std::fs::write(
+        primary_task1_root
+            .join("moved-folder")
+            .join("sub")
+            .join("a.txt"),
+        "payload",
+    )
+    .unwrap();
+
+    assert!(
+        lanbridge::commands::run_sync_now(&primary.state, task1_id.to_string())
+            .await
+            .unwrap()
+            .iter()
+            .any(|result| result.relative_path == "moved-folder/sub/a.txt" && result.success)
+    );
+    assert!(secondary_task1_root
+        .join("moved-folder")
+        .join("sub")
+        .join("a.txt")
+        .exists());
+
+    std::fs::rename(
+        primary_task1_root.join("moved-folder"),
+        primary_task2_root.join("moved-folder"),
+    )
+    .unwrap();
+
+    let source_results = lanbridge::commands::run_sync_now(&primary.state, task1_id.to_string())
+        .await
+        .unwrap();
+    assert!(source_results
+        .iter()
+        .any(|result| result.relative_path == "moved-folder" && result.success));
+    assert!(!secondary_task1_root.join("moved-folder").exists());
+    assert!(walkdir::WalkDir::new(
+        secondary_task1_root
+            .join(".lanbridge-history")
+            .join("trash")
+    )
+    .into_iter()
+    .filter_map(|entry| entry.ok())
+    .any(|entry| entry.path().ends_with("moved-folder/sub/a.txt")));
+    let db_entries = HistoryRepository::new(&secondary.state.db.lock().unwrap())
+        .list_by_task(&task1_id)
+        .unwrap();
+    assert_eq!(db_entries.len(), 1);
+    assert_eq!(db_entries[0].original_relative_path, "moved-folder");
+    let discovered_entries = HistoryStore::new(&secondary_task1_root)
+        .discover_entries(task1_id)
+        .unwrap();
+    assert_eq!(discovered_entries.len(), 1);
+    assert_eq!(discovered_entries[0].original_relative_path, "moved-folder");
+
+    let target_results = lanbridge::commands::run_sync_now(&primary.state, task2_id.to_string())
+        .await
+        .unwrap();
+    assert!(target_results
+        .iter()
+        .any(|result| result.relative_path == "moved-folder/sub/a.txt" && result.success));
+    assert_eq!(
+        std::fs::read_to_string(
+            secondary_task2_root
+                .join("moved-folder")
+                .join("sub")
+                .join("a.txt")
+        )
+        .unwrap(),
+        "payload"
+    );
+}
+
+#[tokio::test]
+async fn test_primary_cross_task_folder_move_repeats_without_stale_source_copy() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let primary_task1_root = primary._root.path().join("repeat-primary-task-1");
+    let primary_task2_root = primary._root.path().join("repeat-primary-task-2");
+    let secondary_task1_root = secondary._root.path().join("repeat-secondary-task-1");
+    let secondary_task2_root = secondary._root.path().join("repeat-secondary-task-2");
+    let task1_id = Uuid::new_v4();
+    let task2_id = Uuid::new_v4();
+    insert_paired_command_task(
+        &primary,
+        &secondary,
+        task1_id,
+        "Repeat Task One",
+        &primary_task1_root,
+        &secondary_task1_root,
+    );
+    insert_paired_command_task(
+        &primary,
+        &secondary,
+        task2_id,
+        "Repeat Task Two",
+        &primary_task2_root,
+        &secondary_task2_root,
+    );
+
+    std::fs::create_dir_all(primary_task1_root.join("moved-folder").join("sub")).unwrap();
+    std::fs::write(
+        primary_task1_root
+            .join("moved-folder")
+            .join("sub")
+            .join("a.txt"),
+        "round-0",
+    )
+    .unwrap();
+    lanbridge::commands::run_sync_now(&primary.state, task1_id.to_string())
+        .await
+        .unwrap();
+
+    let mut current_task = 1;
+    for round in 1..=5 {
+        let (
+            source_id,
+            target_id,
+            source_primary,
+            target_primary,
+            source_secondary,
+            target_secondary,
+        ) = if current_task == 1 {
+            (
+                task1_id,
+                task2_id,
+                &primary_task1_root,
+                &primary_task2_root,
+                &secondary_task1_root,
+                &secondary_task2_root,
+            )
+        } else {
+            (
+                task2_id,
+                task1_id,
+                &primary_task2_root,
+                &primary_task1_root,
+                &secondary_task2_root,
+                &secondary_task1_root,
+            )
+        };
+        std::fs::rename(
+            source_primary.join("moved-folder"),
+            target_primary.join("moved-folder"),
+        )
+        .unwrap();
+        std::fs::write(
+            target_primary
+                .join("moved-folder")
+                .join("sub")
+                .join("a.txt"),
+            format!("round-{round}"),
+        )
+        .unwrap();
+
+        let source_results =
+            lanbridge::commands::run_sync_now(&primary.state, source_id.to_string())
+                .await
+                .unwrap();
+        assert!(
+            source_results
+                .iter()
+                .any(|result| result.relative_path == "moved-folder" && result.success),
+            "source delete should succeed on round {round}: {source_results:?}"
+        );
+        assert!(!source_secondary.join("moved-folder").exists());
+
+        lanbridge::commands::run_sync_now(&primary.state, target_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                target_secondary
+                    .join("moved-folder")
+                    .join("sub")
+                    .join("a.txt")
+            )
+            .unwrap(),
+            format!("round-{round}")
+        );
+        current_task = if current_task == 1 { 2 } else { 1 };
+    }
+}
+
+#[tokio::test]
 async fn test_sync_now_rejects_paused_task() {
     let primary = CommandTestNode::new();
     let secondary = CommandTestNode::new();
@@ -996,6 +1306,7 @@ fn persist_primary_success(conn: &Connection, snapshot: &FileSnapshot) {
             primary_hash: snapshot.blake3_hash.clone(),
             primary_hash_status: snapshot.hash_status,
             primary_size: snapshot.size,
+            secondary_size: snapshot.size,
             primary_modified_unix_ms: snapshot.modified_unix_ms,
             secondary_hash: snapshot.blake3_hash.clone(),
             secondary_hash_status: HashStatus::Verified,

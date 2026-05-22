@@ -120,18 +120,21 @@ pub struct PlannedAction {
 /// the file has NOT changed even if mtime differs.
 /// If hashes are unavailable, fall back to size + mtime comparison.
 fn has_changed(snapshot: &FileSnapshot, baseline: &SyncBaseline, local_role: DeviceRole) -> bool {
-    let (baseline_hash, baseline_hash_status, baseline_modified_unix_ms) = match local_role {
-        DeviceRole::Primary => (
-            &baseline.primary_hash,
-            baseline.primary_hash_status,
-            baseline.primary_modified_unix_ms,
-        ),
-        DeviceRole::Secondary => (
-            &baseline.secondary_hash,
-            baseline.secondary_hash_status,
-            baseline.secondary_modified_unix_ms,
-        ),
-    };
+    let (baseline_hash, baseline_hash_status, baseline_size, baseline_modified_unix_ms) =
+        match local_role {
+            DeviceRole::Primary => (
+                &baseline.primary_hash,
+                baseline.primary_hash_status,
+                baseline.primary_size,
+                baseline.primary_modified_unix_ms,
+            ),
+            DeviceRole::Secondary => (
+                &baseline.secondary_hash,
+                baseline.secondary_hash_status,
+                baseline.secondary_size,
+                baseline.secondary_modified_unix_ms,
+            ),
+        };
 
     // If both hashes are verified and available, compare hashes
     if snapshot.hash_status == HashStatus::Verified && baseline_hash_status == HashStatus::Verified
@@ -142,7 +145,7 @@ fn has_changed(snapshot: &FileSnapshot, baseline: &SyncBaseline, local_role: Dev
     }
 
     // Fallback: compare size and modified time
-    snapshot.size != baseline.primary_size || snapshot.modified_unix_ms != baseline_modified_unix_ms
+    snapshot.size != baseline_size || snapshot.modified_unix_ms != baseline_modified_unix_ms
 }
 
 #[cfg(test)]
@@ -186,6 +189,7 @@ mod tests {
             primary_hash: primary_hash.map(|s| s.to_string()),
             primary_hash_status,
             primary_size,
+            secondary_size: primary_size,
             primary_modified_unix_ms: primary_mtime,
             secondary_hash: secondary_hash.map(|s| s.to_string()),
             secondary_hash_status: primary_hash_status,
@@ -279,6 +283,31 @@ mod tests {
             None,
             1000,
         );
+        assert!(has_changed(&snap, &baseline, DeviceRole::Primary));
+    }
+
+    #[test]
+    fn has_changed_secondary_fallback_uses_secondary_size() {
+        let snap = make_snapshot(
+            "a.txt",
+            EntryKind::File,
+            200,
+            3000,
+            None,
+            HashStatus::UnverifiedLargeFile,
+        );
+        let mut baseline = make_baseline(
+            "a.txt",
+            None,
+            HashStatus::UnverifiedLargeFile,
+            100,
+            1000,
+            None,
+            3000,
+        );
+        baseline.secondary_size = 200;
+
+        assert!(!has_changed(&snap, &baseline, DeviceRole::Secondary));
         assert!(has_changed(&snap, &baseline, DeviceRole::Primary));
     }
 

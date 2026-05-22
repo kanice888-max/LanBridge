@@ -205,6 +205,7 @@ mod tests {
             primary_hash: Some(hash.to_string()),
             primary_hash_status: HashStatus::Verified,
             primary_size: 12,
+            secondary_size: 12,
             primary_modified_unix_ms: 1_000,
             secondary_hash: Some(hash.to_string()),
             secondary_hash_status: HashStatus::Verified,

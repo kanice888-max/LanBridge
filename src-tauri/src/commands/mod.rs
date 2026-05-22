@@ -5,11 +5,11 @@ pub use pairing::*;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
 use uuid::Uuid;
 
@@ -17,6 +17,7 @@ use crate::app_state::{AppState, PendingOutgoingTaskInvite, SyncRunAdmission};
 use crate::core::conflict;
 use crate::core::executor;
 use crate::core::model::*;
+use crate::core::path_safety;
 use crate::core::planner;
 use crate::core::scanner;
 use crate::history::store::HistoryStore;
@@ -26,11 +27,62 @@ use crate::transport::{connection, SyncMessage};
 
 const MAX_NETWORK_ATTEMPTS: usize = 3;
 
+#[derive(Debug, Clone)]
+struct NetworkActionResult {
+    result: executor::ExecutionResult,
+    transferred_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PullActionResult {
+    result: executor::ExecutionResult,
+    transferred_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteExpectation {
+    expected_kind: EntryKind,
+    expected_hash: Option<String>,
+    expected_hash_status: HashStatus,
+    expected_size: i64,
+    expected_modified_unix_ms: i64,
+}
+
+fn network_result(result: executor::ExecutionResult) -> NetworkActionResult {
+    NetworkActionResult {
+        result,
+        transferred_hash: None,
+    }
+}
+
+fn pull_result(result: executor::ExecutionResult) -> PullActionResult {
+    PullActionResult {
+        result,
+        transferred_hash: None,
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn deferred_transfer_key(relative_path: &str, direction: &str) -> String {
+    format!("{}\n{}", relative_path, direction)
+}
+
+fn deferred_transfer_set(records: &[DeferredTransferRecord], task_id: Uuid) -> HashSet<String> {
+    records
+        .iter()
+        .filter(|record| record.task_id == task_id)
+        .map(|record| deferred_transfer_key(&record.relative_path, &record.direction))
+        .collect()
+}
+
+fn is_path_deferred(deferred: &HashSet<String>, relative_path: &str, direction: &str) -> bool {
+    deferred.contains(&deferred_transfer_key(relative_path, direction))
 }
 
 fn is_retryable_network_error(error: &anyhow::Error) -> bool {
@@ -42,6 +94,7 @@ fn is_retryable_network_error(error: &anyhow::Error) -> bool {
         || message.contains("invalid path")
         || message.contains("permission denied")
         || message.contains("transfer cancelled")
+        || message.contains("transfer deferred")
         || message.contains("already exists")
         || message.contains("changed since last sync")
         || message.contains("remote file changed")
@@ -328,6 +381,19 @@ pub fn accept_task_invite(
         validate_no_overlapping_task_roots(&existing, &local_path)?;
     }
     let server = state._server.as_ref().ok_or("sync server is not running")?;
+    if let Some(invite) = server
+        .list_task_invites()
+        .into_iter()
+        .find(|invite| invite.invite_id == invite_id)
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        ensure_paired_device_public_key_matches(
+            &db,
+            &invite.requester_device_id,
+            &invite.requester_public_key,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let invite = server
         .accept_task_invite(&invite_id, &local_path)
         .map_err(|e| e.to_string())?;
@@ -354,6 +420,8 @@ pub fn accept_task_invite(
     };
     let db = state.db.lock().map_err(|e| e.to_string())?;
     if !invite.requester_public_key.is_empty() {
+        ensure_paired_device_public_key_matches(&db, &peer_device_id, &invite.requester_public_key)
+            .map_err(|e| e.to_string())?;
         state.connections.pin_peer(crate::pairing::PublicIdentity {
             device_id: peer_device_id.clone(),
             public_key: invite.requester_public_key.clone(),
@@ -497,10 +565,38 @@ pub async fn create_sync_task(
         }
     }
 
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let repo = repository::SyncTaskRepository::new(&db);
-    repo.insert(&task).map_err(|e| e.to_string())?;
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let repo = repository::SyncTaskRepository::new(&db);
+        repo.insert(&task).map_err(|e| e.to_string())?;
+    }
+    state.start_task_watcher(&task).map_err(|e| e.to_string())?;
+    if task.local_role == DeviceRole::Primary {
+        state.dirty_tasks.mark_task_dirty(task.id);
+    }
     Ok(task)
+}
+
+fn ensure_paired_device_public_key_matches(
+    db: &rusqlite::Connection,
+    device_id: &str,
+    public_key: &[u8],
+) -> Result<(), String> {
+    if public_key.is_empty() {
+        return Ok(());
+    }
+    let existing = repository::PairedDeviceRepository::new(db)
+        .get(device_id)
+        .map_err(|e| e.to_string())?;
+    if let Some(existing) = existing {
+        if existing.public_key != public_key {
+            return Err(format!(
+                "paired device public key changed for device {}; reject and re-pair before accepting this invite",
+                device_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn send_task_invite_to_peer(
@@ -661,6 +757,63 @@ mod tests {
     }
 
     #[test]
+    fn paired_device_public_key_mismatch_is_rejected() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::state::db::migrate(&conn).unwrap();
+        repository::PairedDeviceRepository::new(&conn)
+            .upsert(&PairedDevice {
+                device_id: "peer-1".to_string(),
+                display_name: "Peer".to_string(),
+                public_key: vec![1; 32],
+                last_seen_unix_ms: 1,
+                trusted: true,
+                last_address: None,
+            })
+            .unwrap();
+
+        let result = ensure_paired_device_public_key_matches(&conn, "peer-1", &[2; 32]);
+
+        assert!(result.unwrap_err().contains("public key changed"));
+        let loaded = repository::PairedDeviceRepository::new(&conn)
+            .get("peer-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.public_key, vec![1; 32]);
+    }
+
+    #[test]
+    fn primary_missing_baseline_detects_file_moved_without_watcher_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().to_string_lossy().to_string();
+        let task = task_with_local_path(&local_path);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::state::db::migrate(&conn).unwrap();
+        repository::SyncTaskRepository::new(&conn)
+            .insert(&task)
+            .unwrap();
+        repository::SyncBaselineRepository::new(&conn)
+            .upsert(&SyncBaseline {
+                task_id: task.id,
+                relative_path: "moved.zip".to_string(),
+                primary_hash: Some("hash".to_string()),
+                primary_hash_status: HashStatus::Verified,
+                primary_size: 1,
+                secondary_size: 1,
+                primary_modified_unix_ms: 1,
+                secondary_hash: Some("hash".to_string()),
+                secondary_hash_status: HashStatus::Verified,
+                secondary_modified_unix_ms: 1,
+                last_synced_unix_ms: 1,
+            })
+            .unwrap();
+
+        assert!(primary_task_has_missing_baseline(&task, &conn).unwrap());
+
+        std::fs::write(dir.path().join("moved.zip"), b"x").unwrap();
+        assert!(!primary_task_has_missing_baseline(&task, &conn).unwrap());
+    }
+
+    #[test]
     fn successful_apply_hashes_unverified_file_for_baseline() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("large.bin"), "contents").unwrap();
@@ -694,10 +847,152 @@ mod tests {
             baseline: None,
         };
 
-        let (hash, status) = verified_hash_for_successful_apply(&task, &action, &snap);
+        let (hash, status) = verified_hash_for_successful_apply(&task, &action, &snap, None);
 
         assert_eq!(status, HashStatus::Verified);
         assert_eq!(hash, Some(blake3::hash(b"contents").to_hex().to_string()));
+    }
+
+    #[test]
+    fn successful_apply_reuses_transferred_hash_for_baseline() {
+        let task = task_with_local_path("/tmp/does-not-need-to-exist");
+        let snap = FileSnapshot {
+            task_id: task.id,
+            relative_path: "large.bin".to_string(),
+            kind: EntryKind::File,
+            size: crate::core::scanner::EAGER_HASH_LIMIT + 1,
+            modified_unix_ms: 0,
+            blake3_hash: None,
+            hash_status: HashStatus::UnverifiedLargeFile,
+            deleted: false,
+            is_symlink: false,
+        };
+        let action = planner::PlannedAction {
+            relative_path: "large.bin".to_string(),
+            decision: SyncDecision::ApplyToSecondary,
+            snapshot: Some(snap.clone()),
+            baseline: None,
+        };
+
+        let (hash, status) =
+            verified_hash_for_successful_apply(&task, &action, &snap, Some("streamed-hash"));
+
+        assert_eq!(status, HashStatus::Verified);
+        assert_eq!(hash, Some("streamed-hash".to_string()));
+    }
+
+    #[test]
+    fn metadata_delta_detects_new_and_missing_paths() {
+        let old = vec![FileSnapshot {
+            task_id: Uuid::nil(),
+            relative_path: "folder/old.txt".to_string(),
+            kind: EntryKind::File,
+            size: 3,
+            modified_unix_ms: 1,
+            blake3_hash: Some("hash".to_string()),
+            hash_status: HashStatus::Verified,
+            deleted: false,
+            is_symlink: false,
+        }];
+        let same = vec![FileSnapshot {
+            blake3_hash: None,
+            hash_status: HashStatus::Unavailable,
+            ..old[0].clone()
+        }];
+        assert!(!metadata_delta(&old, &same));
+        assert!(metadata_delta(&old, &[]));
+        let mut with_new = same.clone();
+        with_new.push(FileSnapshot {
+            task_id: Uuid::nil(),
+            relative_path: "folder/new.txt".to_string(),
+            kind: EntryKind::File,
+            size: 4,
+            modified_unix_ms: 2,
+            blake3_hash: None,
+            hash_status: HashStatus::Unavailable,
+            deleted: false,
+            is_symlink: false,
+        });
+        assert!(metadata_delta(&old, &with_new));
+    }
+
+    #[test]
+    fn recovered_delete_requires_verified_remote_match_without_baseline() {
+        let hash = blake3::hash(b"same").to_hex().to_string();
+        let action = planner::PlannedAction {
+            relative_path: "old.txt".to_string(),
+            decision: SyncDecision::MoveSecondaryToHistory,
+            snapshot: Some(FileSnapshot {
+                task_id: Uuid::nil(),
+                relative_path: "old.txt".to_string(),
+                kind: EntryKind::File,
+                size: 4,
+                modified_unix_ms: 1,
+                blake3_hash: Some(hash.clone()),
+                hash_status: HashStatus::Verified,
+                deleted: false,
+                is_symlink: false,
+            }),
+            baseline: None,
+        };
+        let matching = RemoteFileState {
+            relative_path: "old.txt".to_string(),
+            kind: EntryKind::File,
+            blake3_hash: Some(hash),
+            hash_status: HashStatus::Verified,
+            size: 4,
+            modified_unix_ms: 1,
+        };
+        let remote = HashMap::from([("old.txt", &matching)]);
+        assert_eq!(remote_delete_safety_error(&action, &remote), None);
+
+        let changed = RemoteFileState {
+            relative_path: "old.txt".to_string(),
+            kind: EntryKind::File,
+            blake3_hash: Some("changed".to_string()),
+            hash_status: HashStatus::Verified,
+            size: 4,
+            modified_unix_ms: 1,
+        };
+        let remote = HashMap::from([("old.txt", &changed)]);
+        assert_eq!(
+            remote_delete_safety_error(&action, &remote).as_deref(),
+            Some("remote changed since last sync")
+        );
+    }
+
+    #[test]
+    fn baseline_delete_defers_verified_large_file_check_to_receiver() {
+        let baseline = SyncBaseline {
+            task_id: Uuid::nil(),
+            relative_path: "large.bin".to_string(),
+            primary_hash: Some("hash".to_string()),
+            primary_hash_status: HashStatus::Verified,
+            primary_size: crate::core::scanner::EAGER_HASH_LIMIT + 1,
+            secondary_size: crate::core::scanner::EAGER_HASH_LIMIT + 1,
+            primary_modified_unix_ms: 1,
+            secondary_hash: Some("hash".to_string()),
+            secondary_hash_status: HashStatus::Verified,
+            secondary_modified_unix_ms: 1,
+            last_synced_unix_ms: 1,
+        };
+        let action = planner::PlannedAction {
+            relative_path: "large.bin".to_string(),
+            decision: SyncDecision::MoveSecondaryToHistory,
+            snapshot: None,
+            baseline: Some(baseline),
+        };
+        let remote = RemoteFileState {
+            relative_path: "large.bin".to_string(),
+            kind: EntryKind::File,
+            blake3_hash: None,
+            hash_status: HashStatus::UnverifiedLargeFile,
+            size: crate::core::scanner::EAGER_HASH_LIMIT + 1,
+            modified_unix_ms: 1,
+        };
+        let remote_map = HashMap::from([("large.bin", &remote)]);
+
+        assert_eq!(remote_delete_safety_error(&action, &remote_map), None);
     }
 }
 
@@ -737,10 +1032,16 @@ fn create_task_from_invite(
             .map_err(|e| e.to_string())?;
     }
 
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    repository::SyncTaskRepository::new(&db)
-        .insert(&task)
-        .map_err(|e| e.to_string())?;
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::SyncTaskRepository::new(&db)
+            .insert(&task)
+            .map_err(|e| e.to_string())?;
+    }
+    state.start_task_watcher(&task).map_err(|e| e.to_string())?;
+    if task.local_role == DeviceRole::Primary {
+        state.dirty_tasks.mark_task_dirty(task.id);
+    }
     Ok(task)
 }
 
@@ -853,12 +1154,13 @@ pub fn toggle_task_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let repo = repository::SyncTaskRepository::new(&db);
-    let task = repo
-        .get(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or("task not found")?;
+    let task = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let repo = repository::SyncTaskRepository::new(&db);
+        repo.get(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or("task not found")?
+    };
     if enabled {
         if let Some(server) = &state._server {
             server
@@ -866,16 +1168,154 @@ pub fn toggle_task_enabled(
                 .map_err(|e| e.to_string())?;
         }
     }
-    repo.update_enabled(&id, enabled, now_ms())
-        .map_err(|e| e.to_string())?;
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let repo = repository::SyncTaskRepository::new(&db);
+        repo.update_enabled(&id, enabled, now_ms())
+            .map_err(|e| e.to_string())?;
+    }
+    if enabled {
+        state.start_task_watcher(&task).map_err(|e| e.to_string())?;
+        if task.local_role == DeviceRole::Primary {
+            state.dirty_tasks.mark_task_dirty(task.id);
+        }
+    }
     if !enabled {
         if let Some(server) = &state._server {
             server
                 .unregister_task_root(&task_id)
                 .map_err(|e| e.to_string())?;
         }
+        state.dirty_tasks.clear(id);
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn list_ready_auto_sync_tasks(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let ready_ids = state.dirty_tasks.ready_task_ids();
+    let mut ready_set = ready_ids.into_iter().collect::<HashSet<_>>();
+
+    let task_states = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let tasks = repository::SyncTaskRepository::new(&db)
+            .list_all()
+            .map_err(|e| e.to_string())?;
+        let baseline_repo = repository::SyncBaselineRepository::new(&db);
+        let snapshot_repo = repository::FileSnapshotRepository::new(&db);
+        let mut task_states = Vec::new();
+        for task in tasks {
+            let baselines = baseline_repo
+                .list_by_task(&task.id)
+                .map_err(|e| e.to_string())?;
+            let cached_snapshots = snapshot_repo
+                .list_by_task(&task.id)
+                .map_err(|e| e.to_string())?;
+            task_states.push((task, baselines, cached_snapshots));
+        }
+        task_states
+    };
+
+    for (task, baselines, cached_snapshots) in &task_states {
+        if task.enabled && task.local_role == DeviceRole::Primary {
+            let reasons =
+                primary_task_needs_sync_sweep(task, baselines, cached_snapshots, &*state.platform)
+                    .map_err(|e| e.to_string())?;
+            if !reasons.is_empty() {
+                tracing::info!(
+                    auto_sync_ready = true,
+                    task_id = %task.id,
+                    ready_reason = %reasons.join(",")
+                );
+                ready_set.insert(task.id);
+            }
+        }
+    }
+    if ready_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(task_states
+        .into_iter()
+        .map(|(task, _, _)| task)
+        .filter(|task| {
+            task.enabled && task.local_role == DeviceRole::Primary && ready_set.contains(&task.id)
+        })
+        .map(|task| task.id.to_string())
+        .collect())
+}
+
+#[cfg(test)]
+fn primary_task_has_missing_baseline(
+    task: &SyncTask,
+    db: &rusqlite::Connection,
+) -> anyhow::Result<bool> {
+    let root = Path::new(&task.local_path);
+    let baselines = repository::SyncBaselineRepository::new(db).list_by_task(&task.id)?;
+    for baseline in baselines {
+        let path = path_safety::safe_join(root, &baseline.relative_path)?;
+        if !path.exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn primary_task_needs_sync_sweep(
+    task: &SyncTask,
+    baselines: &[SyncBaseline],
+    cached_snapshots: &[FileSnapshot],
+    platform: &dyn crate::platform::Platform,
+) -> anyhow::Result<Vec<&'static str>> {
+    let root = Path::new(&task.local_path);
+    let mut reasons = Vec::new();
+    for baseline in baselines {
+        let path = path_safety::safe_join(root, &baseline.relative_path)?;
+        if !path.exists() {
+            reasons.push("missing_baseline");
+            break;
+        }
+    }
+
+    let current_metadata = scanner::scan_root_metadata(root, platform)?;
+    if metadata_delta(cached_snapshots, &current_metadata) {
+        reasons.push("metadata_delta");
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    Ok(reasons)
+}
+
+fn metadata_delta(cached_snapshots: &[FileSnapshot], current_metadata: &[FileSnapshot]) -> bool {
+    let old_map = cached_snapshots
+        .iter()
+        .filter(|snapshot| !snapshot.deleted && !snapshot.is_symlink)
+        .map(|snapshot| (snapshot.relative_path.as_str(), snapshot))
+        .collect::<HashMap<_, _>>();
+    let current_map = current_metadata
+        .iter()
+        .filter(|snapshot| !snapshot.deleted && !snapshot.is_symlink)
+        .map(|snapshot| (snapshot.relative_path.as_str(), snapshot))
+        .collect::<HashMap<_, _>>();
+
+    for (path, old) in &old_map {
+        let Some(current) = current_map.get(path) else {
+            return true;
+        };
+        if snapshot_metadata_changed(old, current) {
+            return true;
+        }
+    }
+    current_map.keys().any(|path| !old_map.contains_key(path))
+}
+
+fn snapshot_metadata_changed(old: &FileSnapshot, current: &FileSnapshot) -> bool {
+    if old.kind != current.kind {
+        return true;
+    }
+    if old.kind == EntryKind::Directory {
+        return false;
+    }
+    old.size != current.size || old.modified_unix_ms != current.modified_unix_ms
 }
 
 // ─── Scan ───
@@ -883,17 +1323,27 @@ pub fn toggle_task_enabled(
 #[tauri::command]
 pub fn scan_task(state: State<'_, AppState>, task_id: String) -> Result<Vec<FileSnapshot>, String> {
     let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let task_repo = repository::SyncTaskRepository::new(&db);
-    let task = task_repo
-        .get(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or("task not found")?;
+    let (task, cached_snapshots) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let task_repo = repository::SyncTaskRepository::new(&db);
+        let task = task_repo
+            .get(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or("task not found")?;
+        let cached_snapshots = repository::FileSnapshotRepository::new(&db)
+            .list_by_task(&id)
+            .map_err(|e| e.to_string())?;
+        (task, cached_snapshots)
+    };
 
     let sync_root = std::path::Path::new(&task.local_path);
-    let results = scanner::scan_root(sync_root, &*state.platform).map_err(|e| e.to_string())?;
+    let cached_snapshot_list = cached_snapshots;
+    let cache = snapshot_cache_by_path(cached_snapshot_list.clone());
+    let results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
+        .map_err(|e| e.to_string())?;
 
     let mut snapshots = Vec::new();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
     let snap_repo = repository::FileSnapshotRepository::new(&db);
     for result in &results {
         let mut snap = result.snapshot.clone();
@@ -909,7 +1359,15 @@ pub fn scan_task(state: State<'_, AppState>, task_id: String) -> Result<Vec<File
 
 fn refresh_task_snapshots(state: &AppState, task: &SyncTask) -> Result<Vec<FileSnapshot>, String> {
     let sync_root = std::path::Path::new(&task.local_path);
-    let results = scanner::scan_root(sync_root, &*state.platform).map_err(|e| e.to_string())?;
+    let cached_snapshots = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::FileSnapshotRepository::new(&db)
+            .list_by_task(&task.id)
+            .map_err(|e| e.to_string())?
+    };
+    let cache = snapshot_cache_by_path(cached_snapshots);
+    let results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
+        .map_err(|e| e.to_string())?;
 
     let snapshots = results
         .into_iter()
@@ -928,6 +1386,13 @@ fn refresh_task_snapshots(state: &AppState, task: &SyncTask) -> Result<Vec<FileS
     Ok(snapshots)
 }
 
+fn snapshot_cache_by_path(snapshots: Vec<FileSnapshot>) -> HashMap<String, FileSnapshot> {
+    snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.relative_path.clone(), snapshot))
+        .collect()
+}
+
 // ─── Sync ───
 
 #[derive(Debug, Clone, Serialize)]
@@ -942,6 +1407,13 @@ pub struct SyncProgress {
     pub task_id: String,
     pub phase: String,
     pub detail: Option<String>,
+    pub items_done: Option<u64>,
+    pub items_total: Option<u64>,
+    pub bytes_done: Option<u64>,
+    pub bytes_total: Option<u64>,
+    pub finished: Option<bool>,
+    #[serde(skip_serializing)]
+    pub finished_at_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -958,6 +1430,9 @@ pub struct TaskPeerStatus {
 pub struct DeferredTransfer {
     pub task_id: String,
     pub relative_path: String,
+    pub direction: String,
+    pub reason: String,
+    pub created_unix_ms: i64,
 }
 
 static SYNC_PROGRESS: std::sync::LazyLock<Mutex<HashMap<String, SyncProgress>>> =
@@ -966,20 +1441,76 @@ static SYNC_PROGRESS: std::sync::LazyLock<Mutex<HashMap<String, SyncProgress>>> 
 fn record_sync_progress(task_id: Uuid, phase: &str, detail: Option<String>) {
     if let Ok(mut progress) = SYNC_PROGRESS.lock() {
         let key = task_id.to_string();
-        progress.insert(
-            key.clone(),
-            SyncProgress {
-                task_id: key,
-                phase: phase.to_string(),
-                detail,
-            },
+        let entry = progress.entry(key.clone()).or_insert_with(|| SyncProgress {
+            task_id: key,
+            phase: phase.to_string(),
+            detail: detail.clone(),
+            items_done: None,
+            items_total: None,
+            bytes_done: None,
+            bytes_total: None,
+            finished: Some(false),
+            finished_at_unix_ms: None,
+        });
+        entry.phase = phase.to_string();
+        entry.detail = detail;
+        entry.finished = Some(false);
+        entry.finished_at_unix_ms = None;
+    }
+}
+
+fn record_sync_progress_totals(task_id: Uuid, items_total: u64, bytes_total: u64) {
+    if let Ok(mut progress) = SYNC_PROGRESS.lock() {
+        let key = task_id.to_string();
+        let entry = progress.entry(key.clone()).or_insert_with(|| SyncProgress {
+            task_id: key,
+            phase: "同步中".to_string(),
+            detail: None,
+            items_done: Some(0),
+            items_total: Some(items_total),
+            bytes_done: Some(0),
+            bytes_total: Some(bytes_total),
+            finished: Some(false),
+            finished_at_unix_ms: None,
+        });
+        entry.items_done = Some(0);
+        entry.items_total = Some(items_total);
+        entry.bytes_done = Some(0);
+        entry.bytes_total = Some(bytes_total);
+        entry.finished = Some(false);
+        entry.finished_at_unix_ms = None;
+    }
+}
+
+fn advance_sync_progress(task_id: Uuid, bytes_done_delta: u64) {
+    if let Ok(mut progress) = SYNC_PROGRESS.lock() {
+        let Some(entry) = progress.get_mut(&task_id.to_string()) else {
+            return;
+        };
+        entry.items_done = Some(entry.items_done.unwrap_or(0).saturating_add(1));
+        entry.bytes_done = Some(
+            entry
+                .bytes_done
+                .unwrap_or(0)
+                .saturating_add(bytes_done_delta),
         );
     }
 }
 
 fn finish_sync_progress(task_id: Uuid) {
     if let Ok(mut progress) = SYNC_PROGRESS.lock() {
-        progress.remove(&task_id.to_string());
+        if let Some(entry) = progress.get_mut(&task_id.to_string()) {
+            entry.phase = "同步完成".to_string();
+            entry.detail = None;
+            entry.finished = Some(true);
+            entry.finished_at_unix_ms = Some(now_ms());
+            if let Some(total) = entry.items_total {
+                entry.items_done = Some(total);
+            }
+            if let Some(total) = entry.bytes_total {
+                entry.bytes_done = Some(total);
+            }
+        }
     }
 }
 
@@ -1006,6 +1537,7 @@ pub async fn run_sync_now(
     }
 
     record_sync_progress(id, "准备同步", None);
+    state.dirty_tasks.clear(id);
     let mut all_results = Vec::new();
     loop {
         match run_sync_now_once(state, id).await {
@@ -1025,8 +1557,9 @@ pub async fn run_sync_now(
 }
 
 async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionResult>, String> {
+    let sync_start = Instant::now();
     record_sync_progress(id, "扫描本机", None);
-    let (task, actions, snapshots, baselines) = {
+    let (task, cached_snapshots, baselines, deferred_transfers) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
 
         let task_repo = repository::SyncTaskRepository::new(&db);
@@ -1038,32 +1571,74 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
             return Err("task is paused".to_string());
         }
 
-        let sync_root = Path::new(&task.local_path);
-
-        // Scan the current filesystem state so deletes are visible even when the
-        // UI did not call scan_task immediately before sync_now.
-        let scan_results =
-            scanner::scan_root(sync_root, &*state.platform).map_err(|e| e.to_string())?;
-        let mut snapshots = Vec::new();
         let snap_repo = repository::FileSnapshotRepository::new(&db);
-        for result in &scan_results {
-            let mut snap = result.snapshot.clone();
-            snap.task_id = id;
-            snapshots.push(snap);
-        }
-        snap_repo
-            .replace_for_task(&id, &snapshots)
-            .map_err(|e| e.to_string())?;
-
-        // Get all baselines so files missing from current snapshots become delete actions.
+        let cached_snapshots = snap_repo.list_by_task(&id).map_err(|e| e.to_string())?;
         let baseline_repo = repository::SyncBaselineRepository::new(&db);
         let baselines = baseline_repo.list_by_task(&id).map_err(|e| e.to_string())?;
-
-        let mut actions = planner::plan_sync(&snapshots, &baselines, task.local_role);
-        sort_actions_by_priority(&mut actions);
-        (task, actions, snapshots, baselines)
+        let deferred_transfers = repository::DeferredTransferRepository::new(&db)
+            .list_all()
+            .map_err(|e| e.to_string())?;
+        (task, cached_snapshots, baselines, deferred_transfers)
     };
+    let deferred_transfers = deferred_transfer_set(&deferred_transfers, id);
 
+    let sync_root = Path::new(&task.local_path);
+
+    // Scan outside the SQLite lock; hashing can be the slowest local stage.
+    let local_scan_start = Instant::now();
+    let cached_snapshot_list = cached_snapshots;
+    let cache = snapshot_cache_by_path(cached_snapshot_list.clone());
+    let scan_results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
+        .map_err(|e| e.to_string())?;
+    let local_scan_ms = local_scan_start.elapsed().as_millis() as u64;
+    let snapshots = scan_results
+        .into_iter()
+        .map(|result| {
+            let mut snap = result.snapshot;
+            snap.task_id = id;
+            snap
+        })
+        .collect::<Vec<_>>();
+
+    let local_snapshot_db_start = Instant::now();
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::FileSnapshotRepository::new(&db)
+            .replace_for_task(&id, &snapshots)
+            .map_err(|e| e.to_string())?;
+    }
+    let local_snapshot_db_ms = local_snapshot_db_start.elapsed().as_millis() as u64;
+
+    let plan_start = Instant::now();
+    let mut actions = planner::plan_sync(&snapshots, &baselines, task.local_role);
+    if task.local_role == DeviceRole::Primary {
+        let recovered_delete_count = append_recovered_delete_actions(
+            &mut actions,
+            &cached_snapshot_list,
+            &snapshots,
+            &baselines,
+        );
+        if recovered_delete_count > 0 {
+            tracing::info!(
+                sync_timing = true,
+                task_id = %id,
+                ready_reason = "safe_recovered_delete",
+                recovered_delete_count
+            );
+        }
+    }
+    compress_directory_delete_actions(&mut actions);
+    sort_actions_by_priority(&mut actions);
+    record_sync_progress_totals(
+        id,
+        actions.len() as u64,
+        actions.iter().map(action_progress_bytes).sum(),
+    );
+    let plan_ms = plan_start.elapsed().as_millis() as u64;
+
+    let remote_scan_ms;
+    let transfer_total_ms;
+    let mut baseline_update_ms = 0;
     record_sync_progress(
         id,
         "请求对端状态",
@@ -1072,6 +1647,7 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
     let results = if task.local_role == DeviceRole::Primary {
         let connections = state.connections.clone();
         let sync_root = Path::new(&task.local_path);
+        let remote_scan_start = Instant::now();
         let remote_scan = request_scan_with_retry(
             &connections,
             &state.identity,
@@ -1079,7 +1655,9 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
             task.id.to_string(),
         )
         .await;
-        let mut results = match remote_scan {
+        remote_scan_ms = remote_scan_start.elapsed().as_millis() as u64;
+        let transfer_start = Instant::now();
+        let mut network_results = match remote_scan {
             Ok(remote_files) => {
                 record_sync_progress(id, "传输中", Some(format!("{} 个动作", actions.len())));
                 execute_primary_actions_over_network(
@@ -1089,51 +1667,80 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
                     &connections,
                     &state.identity,
                     &remote_files,
+                    &deferred_transfers,
                 )
                 .await
             }
             Err(e) => actions
                 .iter()
                 .map(|action| {
-                    network_error(
+                    network_result(network_error(
                         &action.relative_path,
                         &format!("remote scan failed: {}", e),
                         true,
-                    )
+                    ))
                 })
                 .collect(),
         };
+        transfer_total_ms = transfer_start.elapsed().as_millis() as u64;
+        let baseline_update_start = Instant::now();
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        persist_network_successes(&actions, &task, &mut results, &db);
-        results
+        persist_network_successes(&actions, &task, &mut network_results, &db);
+        baseline_update_ms = baseline_update_start.elapsed().as_millis() as u64;
+        mark_dirty_if_directory_tree_changed_after_sync(
+            state,
+            id,
+            sync_root,
+            &snapshots,
+            &actions,
+            &network_results,
+        );
+        network_results
+            .into_iter()
+            .map(|network_result| network_result.result)
+            .collect()
     } else {
         let connections = state.connections.clone();
         let sync_root = Path::new(&task.local_path);
-        match request_scan_with_retry(
+        let remote_scan_start = Instant::now();
+        let remote_scan = request_scan_with_retry(
             &connections,
             &state.identity,
             &task.primary_device_id,
             task.id.to_string(),
         )
-        .await
-        {
+        .await;
+        remote_scan_ms = remote_scan_start.elapsed().as_millis() as u64;
+        match remote_scan {
             Ok(mut remote_files) => {
                 sort_remote_files_by_priority(&mut remote_files);
+                record_sync_progress_totals(
+                    id,
+                    (actions.len() + remote_files.len()) as u64,
+                    actions.iter().map(action_progress_bytes).sum::<u64>()
+                        + remote_files.iter().map(remote_progress_bytes).sum::<u64>(),
+                );
                 record_sync_progress(
                     id,
                     "处理本机变更",
                     Some(format!("{} 个动作", actions.len())),
                 );
+                let transfer_start = Instant::now();
                 let mut local_results = {
                     let db = state.db.lock().map_err(|e| e.to_string())?;
                     executor::execute_actions(&actions, &task, sync_root, &db)
                 };
+                for (action, result) in actions.iter().zip(local_results.iter()) {
+                    if result.success {
+                        advance_sync_progress(id, action_progress_bytes(action));
+                    }
+                }
                 record_sync_progress(
                     id,
                     "拉取主机变更",
                     Some(format!("{} 个远端条目", remote_files.len())),
                 );
-                let mut results = execute_secondary_pull_over_network(
+                let mut pull_results = execute_secondary_pull_over_network(
                     &task,
                     sync_root,
                     &connections,
@@ -1141,19 +1748,34 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
                     &remote_files,
                     &snapshots,
                     &baselines,
+                    &deferred_transfers,
                 )
                 .await;
+                transfer_total_ms = transfer_start.elapsed().as_millis() as u64;
+                let baseline_update_start = Instant::now();
                 let db = state.db.lock().map_err(|e| e.to_string())?;
-                persist_secondary_pull_successes(&task, &mut results, sync_root, &db);
-                local_results.extend(results);
+                persist_secondary_pull_successes(&task, &mut pull_results, sync_root, &db);
+                baseline_update_ms = baseline_update_start.elapsed().as_millis() as u64;
+                local_results.extend(
+                    pull_results
+                        .into_iter()
+                        .map(|pull_result| pull_result.result),
+                );
                 let results = local_results;
                 results
             }
             Err(e) => {
+                let transfer_start = Instant::now();
                 let mut local_results = {
                     let db = state.db.lock().map_err(|e| e.to_string())?;
                     executor::execute_actions(&actions, &task, sync_root, &db)
                 };
+                for (action, result) in actions.iter().zip(local_results.iter()) {
+                    if result.success {
+                        advance_sync_progress(id, action_progress_bytes(action));
+                    }
+                }
+                transfer_total_ms = transfer_start.elapsed().as_millis() as u64;
                 for (action, result) in actions.iter().zip(local_results.iter_mut()) {
                     if action.decision == SyncDecision::MarkPendingReturn && result.success {
                         result.success = false;
@@ -1166,6 +1788,20 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
         }
     };
 
+    tracing::info!(
+        sync_timing = true,
+        task_id = %id,
+        role = ?task.local_role,
+        local_scan_ms,
+        local_snapshot_db_ms,
+        remote_scan_ms,
+        plan_ms,
+        actions_count = actions.len(),
+        transfer_total_ms,
+        baseline_update_ms,
+        total_ms = sync_start.elapsed().as_millis() as u64,
+    );
+
     Ok(results
         .into_iter()
         .map(|r| SyncActionResult {
@@ -1174,6 +1810,165 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
             error: r.error,
         })
         .collect())
+}
+
+fn append_recovered_delete_actions(
+    actions: &mut Vec<planner::PlannedAction>,
+    cached_snapshots: &[FileSnapshot],
+    current_snapshots: &[FileSnapshot],
+    baselines: &[SyncBaseline],
+) -> usize {
+    let current_paths = current_snapshots
+        .iter()
+        .filter(|snapshot| !snapshot.deleted && !snapshot.is_symlink)
+        .map(|snapshot| snapshot.relative_path.as_str())
+        .collect::<HashSet<_>>();
+    let baseline_paths = baselines
+        .iter()
+        .map(|baseline| baseline.relative_path.as_str())
+        .collect::<HashSet<_>>();
+    let action_paths = actions
+        .iter()
+        .map(|action| action.relative_path.clone())
+        .collect::<HashSet<_>>();
+
+    let mut added = 0;
+    for snapshot in cached_snapshots {
+        if snapshot.deleted
+            || snapshot.is_symlink
+            || current_paths.contains(snapshot.relative_path.as_str())
+            || baseline_paths.contains(snapshot.relative_path.as_str())
+            || action_paths.contains(&snapshot.relative_path)
+        {
+            continue;
+        }
+        actions.push(planner::PlannedAction {
+            relative_path: snapshot.relative_path.clone(),
+            decision: SyncDecision::MoveSecondaryToHistory,
+            snapshot: Some(snapshot.clone()),
+            baseline: None,
+        });
+        added += 1;
+    }
+    added
+}
+
+fn compress_directory_delete_actions(actions: &mut Vec<planner::PlannedAction>) {
+    let directory_deletes = actions
+        .iter()
+        .filter(|action| {
+            action.decision == SyncDecision::MoveSecondaryToHistory
+                && action_is_directory_delete(action)
+        })
+        .map(|action| action.relative_path.clone())
+        .collect::<Vec<_>>();
+    if directory_deletes.is_empty() {
+        return;
+    }
+
+    actions.retain(|action| {
+        if action.decision != SyncDecision::MoveSecondaryToHistory {
+            return true;
+        }
+        !directory_deletes.iter().any(|dir| {
+            action.relative_path != *dir && is_descendant_path(&action.relative_path, dir)
+        })
+    });
+}
+
+fn action_is_directory_delete(action: &planner::PlannedAction) -> bool {
+    matches!(
+        action.snapshot.as_ref().map(|snapshot| snapshot.kind),
+        Some(EntryKind::Directory)
+    ) || action
+        .baseline
+        .as_ref()
+        .is_some_and(baseline_looks_like_directory)
+}
+
+fn action_progress_bytes(action: &planner::PlannedAction) -> u64 {
+    action
+        .snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.kind == EntryKind::File)
+        .map(|snapshot| snapshot.size.max(0) as u64)
+        .unwrap_or(0)
+}
+
+fn remote_progress_bytes(remote: &RemoteFileState) -> u64 {
+    if remote.kind == EntryKind::File {
+        remote.size.max(0) as u64
+    } else {
+        0
+    }
+}
+
+fn baseline_looks_like_directory(baseline: &SyncBaseline) -> bool {
+    baseline.primary_hash.is_none()
+        && baseline.secondary_hash.is_none()
+        && baseline.primary_hash_status == HashStatus::Unavailable
+        && baseline.secondary_hash_status == HashStatus::Unavailable
+        && baseline.primary_size == 0
+        && baseline.secondary_size == 0
+}
+
+fn mark_dirty_if_directory_tree_changed_after_sync(
+    state: &AppState,
+    task_id: Uuid,
+    sync_root: &Path,
+    original_snapshots: &[FileSnapshot],
+    actions: &[planner::PlannedAction],
+    results: &[NetworkActionResult],
+) {
+    let synced_dirs = actions
+        .iter()
+        .zip(results.iter())
+        .filter_map(|(action, result)| {
+            if result.result.success
+                && action.decision == SyncDecision::ApplyToSecondary
+                && matches!(
+                    action.snapshot.as_ref().map(|snapshot| snapshot.kind),
+                    Some(EntryKind::Directory)
+                )
+            {
+                Some(action.relative_path.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if synced_dirs.is_empty() {
+        return;
+    }
+
+    let original_paths = original_snapshots
+        .iter()
+        .filter(|snapshot| !snapshot.deleted && !snapshot.is_symlink)
+        .map(|snapshot| snapshot.relative_path.as_str())
+        .collect::<HashSet<_>>();
+    let Ok(current_metadata) = scanner::scan_root_metadata(sync_root, &*state.platform) else {
+        return;
+    };
+    let has_new_descendant = current_metadata.iter().any(|snapshot| {
+        !original_paths.contains(snapshot.relative_path.as_str())
+            && synced_dirs
+                .iter()
+                .any(|dir| is_descendant_path(&snapshot.relative_path, dir))
+    });
+    if has_new_descendant {
+        tracing::info!(
+            sync_timing = true,
+            task_id = %task_id,
+            ready_reason = "metadata_delta",
+            directory_rescan_delta = true
+        );
+        state.dirty_tasks.mark_task_dirty(task_id);
+    }
+}
+
+fn is_descendant_path(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Priority for scheduling transfer actions. Lower value = higher priority.
@@ -1246,7 +2041,8 @@ async fn execute_primary_actions_over_network(
     connections: &connection::ConnectionManager,
     local_identity: &crate::pairing::DeviceIdentity,
     remote_files: &[RemoteFileState],
-) -> Vec<executor::ExecutionResult> {
+    deferred_transfers: &HashSet<String>,
+) -> Vec<NetworkActionResult> {
     let remote_map = remote_files
         .iter()
         .map(|file| (file.relative_path.as_str(), file))
@@ -1255,14 +2051,14 @@ async fn execute_primary_actions_over_network(
     for action in actions {
         let result = match action.decision {
             SyncDecision::ApplyToSecondary => match remote_conflict(action, &remote_map) {
-                Some(error) => executor::ExecutionResult {
+                Some(error) => network_result(executor::ExecutionResult {
                     relative_path: action.relative_path.clone(),
                     success: false,
                     error: Some(error),
                     retryable: false,
-                },
+                }),
                 None => match action.snapshot.as_ref().map(|snapshot| snapshot.kind) {
-                    Some(EntryKind::Directory) => {
+                    Some(EntryKind::Directory) => network_result(
                         send_directory_action(
                             action,
                             &task.secondary_device_id,
@@ -1270,7 +2066,14 @@ async fn execute_primary_actions_over_network(
                             connections,
                             local_identity,
                         )
-                        .await
+                        .await,
+                    ),
+                    _ if is_path_deferred(deferred_transfers, &action.relative_path, "upload") => {
+                        network_result(network_error(
+                            &action.relative_path,
+                            "transfer deferred by user",
+                            false,
+                        ))
                     }
                     _ => {
                         send_file_action(action, task, sync_root, connections, local_identity).await
@@ -1278,30 +2081,96 @@ async fn execute_primary_actions_over_network(
                 },
             },
             SyncDecision::MoveSecondaryToHistory => {
-                send_delete_action(action, task, connections, local_identity).await
+                match remote_delete_safety_error(action, &remote_map) {
+                    Some(error) => {
+                        network_result(network_error(&action.relative_path, &error, false))
+                    }
+                    None => network_result(
+                        send_delete_action(action, task, connections, local_identity).await,
+                    ),
+                }
             }
-            SyncDecision::RequireConflictDecision => executor::ExecutionResult {
+            SyncDecision::RequireConflictDecision => network_result(executor::ExecutionResult {
                 relative_path: action.relative_path.clone(),
                 success: false,
                 error: Some("conflict requires user decision".to_string()),
                 retryable: false,
-            },
-            SyncDecision::KeepBoth | SyncDecision::MarkPendingReturn => executor::ExecutionResult {
-                relative_path: action.relative_path.clone(),
-                success: false,
-                error: Some("unsupported network action for primary sync".to_string()),
-                retryable: false,
-            },
-            SyncDecision::Noop => executor::ExecutionResult {
+            }),
+            SyncDecision::KeepBoth | SyncDecision::MarkPendingReturn => {
+                network_result(executor::ExecutionResult {
+                    relative_path: action.relative_path.clone(),
+                    success: false,
+                    error: Some("unsupported network action for primary sync".to_string()),
+                    retryable: false,
+                })
+            }
+            SyncDecision::Noop => network_result(executor::ExecutionResult {
                 relative_path: action.relative_path.clone(),
                 success: true,
                 error: None,
                 retryable: false,
-            },
+            }),
         };
+        if result.result.success {
+            advance_sync_progress(task.id, action_progress_bytes(action));
+        }
         results.push(result);
     }
     results
+}
+
+fn remote_delete_safety_error(
+    action: &planner::PlannedAction,
+    remote_map: &HashMap<&str, &RemoteFileState>,
+) -> Option<String> {
+    let Some(remote) = remote_map.get(action.relative_path.as_str()) else {
+        return None;
+    };
+
+    if let Some(baseline) = &action.baseline {
+        return if remote_matches_baseline_for_delete(remote, baseline) {
+            None
+        } else {
+            Some("remote changed since last sync".to_string())
+        };
+    }
+
+    let Some(snapshot) = &action.snapshot else {
+        return Some("delete requires baseline or verified previous snapshot".to_string());
+    };
+    if snapshot.kind != remote.kind {
+        return Some("remote changed since last sync".to_string());
+    }
+    if snapshot.kind == EntryKind::Directory {
+        return Some("directory delete requires baseline".to_string());
+    }
+    if snapshot.hash_status == HashStatus::Verified
+        && remote.hash_status == HashStatus::Verified
+        && snapshot.blake3_hash == remote.blake3_hash
+    {
+        None
+    } else {
+        Some("remote changed since last sync".to_string())
+    }
+}
+
+fn remote_matches_baseline_for_delete(remote: &RemoteFileState, baseline: &SyncBaseline) -> bool {
+    if baseline_looks_like_directory(baseline) {
+        return remote.kind == EntryKind::Directory;
+    }
+    if remote.kind != EntryKind::File {
+        return false;
+    }
+
+    if baseline.secondary_hash_status == HashStatus::Verified && baseline.secondary_hash.is_some() {
+        return remote.hash_status != HashStatus::Verified
+            || baseline.secondary_hash == remote.blake3_hash;
+    }
+
+    baseline.secondary_hash_status != HashStatus::Verified
+        && remote.hash_status != HashStatus::Verified
+        && baseline.secondary_size == remote.size
+        && baseline.secondary_modified_unix_ms == remote.modified_unix_ms
 }
 
 fn remote_conflict(
@@ -1353,9 +2222,13 @@ async fn send_file_action(
     sync_root: &Path,
     connections: &connection::ConnectionManager,
     local_identity: &crate::pairing::DeviceIdentity,
-) -> executor::ExecutionResult {
+) -> NetworkActionResult {
     if action.snapshot.is_none() {
-        return network_error(&action.relative_path, "no snapshot for apply action", false);
+        return network_result(network_error(
+            &action.relative_path,
+            "no snapshot for apply action",
+            false,
+        ));
     }
 
     let source = sync_root.join(&action.relative_path);
@@ -1369,18 +2242,22 @@ async fn send_file_action(
     )
     .await
     {
-        Ok(()) => executor::ExecutionResult {
-            relative_path: action.relative_path.clone(),
-            success: true,
-            error: None,
-            retryable: false,
+        Ok(outcome) => NetworkActionResult {
+            result: executor::ExecutionResult {
+                relative_path: action.relative_path.clone(),
+                success: true,
+                error: None,
+                retryable: false,
+            },
+            transferred_hash: Some(outcome.blake3_hash),
         },
         Err(e) => {
-            return network_error(
+            let retryable = is_retryable_network_error(&e);
+            network_result(network_error(
                 &action.relative_path,
                 &format!("network file transfer failed: {}", e),
-                true,
-            )
+                retryable,
+            ))
         }
     }
 }
@@ -1392,23 +2269,11 @@ async fn send_file_with_retry(
     task_id: String,
     relative_path: String,
     source: &Path,
-) -> anyhow::Result<()> {
-    connection::clear_transfer_cancel(&task_id, &relative_path);
-    if connection::is_transfer_deferred(&task_id, &relative_path) {
+) -> anyhow::Result<connection::FileTransferOutcome> {
+    connection::clear_transfer_cancel(&task_id, &relative_path, Some("upload"));
+    if connection::is_transfer_deferred(&task_id, &relative_path, "upload") {
         return Err(anyhow::anyhow!("transfer deferred by user"));
     }
-    let total = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
-    connection::record_transfer_progress(connection::TransferProgress {
-        task_id: task_id.clone(),
-        relative_path: relative_path.clone(),
-        direction: "upload".to_string(),
-        bytes_done: 0,
-        bytes_total: total,
-        mbps: 0.0,
-        wire_bytes: 0,
-        protocol_version: String::new(),
-        finished: false,
-    });
 
     let mut last_error = None;
     for attempt in 0..MAX_NETWORK_ATTEMPTS {
@@ -1428,13 +2293,11 @@ async fn send_file_with_retry(
         };
 
         match transfer_result {
-            Ok(()) => {
-                connection::finish_transfer_progress(&task_id, &relative_path);
-                return Ok(());
+            Ok(outcome) => {
+                return Ok(outcome);
             }
             Err(e) => {
-                if connection::is_transfer_cancelled(&task_id, &relative_path) {
-                    connection::finish_transfer_progress(&task_id, &relative_path);
+                if connection::is_transfer_cancelled(&task_id, &relative_path, "upload") {
                     return Err(e);
                 }
                 let retryable = is_retryable_network_error(&e);
@@ -1448,7 +2311,6 @@ async fn send_file_with_retry(
         }
     }
 
-    connection::finish_transfer_progress(&task_id, &relative_path);
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("network file transfer failed")))
 }
 
@@ -1459,23 +2321,12 @@ async fn download_file_with_retry(
     task_id: String,
     relative_path: String,
     target: &Path,
-    total_bytes: u64,
-) -> anyhow::Result<()> {
-    connection::clear_transfer_cancel(&task_id, &relative_path);
-    if connection::is_transfer_deferred(&task_id, &relative_path) {
+    _total_bytes: u64,
+) -> anyhow::Result<connection::FileTransferOutcome> {
+    connection::clear_transfer_cancel(&task_id, &relative_path, Some("download"));
+    if connection::is_transfer_deferred(&task_id, &relative_path, "download") {
         return Err(anyhow::anyhow!("transfer deferred by user"));
     }
-    connection::record_transfer_progress(connection::TransferProgress {
-        task_id: task_id.clone(),
-        relative_path: relative_path.clone(),
-        direction: "download".to_string(),
-        bytes_done: 0,
-        bytes_total: total_bytes,
-        mbps: 0.0,
-        wire_bytes: 0,
-        protocol_version: String::new(),
-        finished: false,
-    });
 
     let mut last_error = None;
     for attempt in 0..MAX_NETWORK_ATTEMPTS {
@@ -1489,13 +2340,11 @@ async fn download_file_with_retry(
         )
         .await
         {
-            Ok(()) => {
-                connection::finish_transfer_progress(&task_id, &relative_path);
-                return Ok(());
+            Ok(outcome) => {
+                return Ok(outcome);
             }
             Err(error) => {
-                if connection::is_transfer_cancelled(&task_id, &relative_path) {
-                    connection::finish_transfer_progress(&task_id, &relative_path);
+                if connection::is_transfer_cancelled(&task_id, &relative_path, "download") {
                     return Err(error);
                 }
                 let retryable = is_retryable_network_error(&error);
@@ -1509,7 +2358,6 @@ async fn download_file_with_retry(
         }
     }
 
-    connection::finish_transfer_progress(&task_id, &relative_path);
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("network file download failed")))
 }
 
@@ -1523,6 +2371,7 @@ async fn send_delete_action(
         &task.secondary_device_id,
         task.id,
         &action.relative_path,
+        delete_expectation_from_action(action),
         connections,
         local_identity,
     )
@@ -1533,12 +2382,28 @@ async fn send_delete_to_peer(
     peer_device_id: &str,
     task_id: Uuid,
     relative_path: &str,
+    expectation: Option<DeleteExpectation>,
     connections: &connection::ConnectionManager,
     local_identity: &crate::pairing::DeviceIdentity,
 ) -> executor::ExecutionResult {
+    let delete_batch_id = expectation
+        .as_ref()
+        .map(|_| format!("{}-{}", now_ms(), Uuid::new_v4()));
     let msg = SyncMessage::FileDelete {
         task_id: task_id.to_string(),
         relative_path: relative_path.to_string(),
+        expected_kind: expectation.as_ref().map(|expected| expected.expected_kind),
+        expected_hash: expectation
+            .as_ref()
+            .and_then(|expected| expected.expected_hash.clone()),
+        expected_hash_status: expectation
+            .as_ref()
+            .map(|expected| expected.expected_hash_status),
+        expected_size: expectation.as_ref().map(|expected| expected.expected_size),
+        expected_modified_unix_ms: expectation
+            .as_ref()
+            .map(|expected| expected.expected_modified_unix_ms),
+        delete_batch_id,
     };
     expect_file_ack(
         peer_device_id,
@@ -1548,6 +2413,31 @@ async fn send_delete_to_peer(
         msg,
     )
     .await
+}
+
+fn delete_expectation_from_action(action: &planner::PlannedAction) -> Option<DeleteExpectation> {
+    if let Some(baseline) = &action.baseline {
+        let expected_kind = if baseline_looks_like_directory(baseline) {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        };
+        return Some(DeleteExpectation {
+            expected_kind,
+            expected_hash: baseline.secondary_hash.clone(),
+            expected_hash_status: baseline.secondary_hash_status,
+            expected_size: baseline.secondary_size,
+            expected_modified_unix_ms: baseline.secondary_modified_unix_ms,
+        });
+    }
+    let snapshot = action.snapshot.as_ref()?;
+    Some(DeleteExpectation {
+        expected_kind: snapshot.kind,
+        expected_hash: snapshot.blake3_hash.clone(),
+        expected_hash_status: snapshot.hash_status,
+        expected_size: snapshot.size,
+        expected_modified_unix_ms: snapshot.modified_unix_ms,
+    })
 }
 
 async fn expect_file_ack(
@@ -1590,14 +2480,15 @@ async fn expect_file_ack(
 fn persist_network_successes(
     actions: &[planner::PlannedAction],
     task: &SyncTask,
-    results: &mut [executor::ExecutionResult],
+    results: &mut [NetworkActionResult],
     db: &rusqlite::Connection,
 ) {
     let now = now_ms();
     let baseline_repo = repository::SyncBaselineRepository::new(db);
     let snap_repo = repository::FileSnapshotRepository::new(db);
 
-    for (action, result) in actions.iter().zip(results.iter_mut()) {
+    for (action, network_result) in actions.iter().zip(results.iter_mut()) {
+        let result = &mut network_result.result;
         if !result.success {
             continue;
         }
@@ -1606,13 +2497,30 @@ fn persist_network_successes(
                 let Some(snap) = &action.snapshot else {
                     continue;
                 };
-                let (hash, hash_status) = verified_hash_for_successful_apply(task, action, snap);
+                if let Err(e) = ensure_parent_directory_baselines(
+                    &baseline_repo,
+                    task.id,
+                    &action.relative_path,
+                    now,
+                ) {
+                    result.success = false;
+                    result.error = Some(format!("parent baseline update failed: {}", e));
+                    result.retryable = true;
+                    continue;
+                }
+                let (hash, hash_status) = verified_hash_for_successful_apply(
+                    task,
+                    action,
+                    snap,
+                    network_result.transferred_hash.as_deref(),
+                );
                 let baseline = SyncBaseline {
                     task_id: task.id,
                     relative_path: action.relative_path.clone(),
                     primary_hash: hash.clone(),
                     primary_hash_status: hash_status,
                     primary_size: snap.size,
+                    secondary_size: snap.size,
                     primary_modified_unix_ms: snap.modified_unix_ms,
                     secondary_hash: hash,
                     secondary_hash_status: hash_status,
@@ -1626,13 +2534,13 @@ fn persist_network_successes(
                 }
             }
             SyncDecision::MoveSecondaryToHistory => {
-                if let Err(e) = snap_repo.mark_deleted(&task.id, &action.relative_path) {
+                if let Err(e) = snap_repo.remove_tree(&task.id, &action.relative_path) {
                     result.success = false;
-                    result.error = Some(format!("snapshot delete marker failed: {}", e));
+                    result.error = Some(format!("snapshot delete cleanup failed: {}", e));
                     result.retryable = true;
                     continue;
                 }
-                if let Err(e) = baseline_repo.remove(&task.id, &action.relative_path) {
+                if let Err(e) = baseline_repo.remove_tree(&task.id, &action.relative_path) {
                     result.success = false;
                     result.error = Some(format!("baseline remove failed: {}", e));
                     result.retryable = true;
@@ -1643,11 +2551,58 @@ fn persist_network_successes(
     }
 }
 
+fn ensure_parent_directory_baselines(
+    baseline_repo: &repository::SyncBaselineRepository<'_>,
+    task_id: Uuid,
+    relative_path: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    for parent in parent_directory_paths(relative_path) {
+        baseline_repo.upsert(&directory_baseline(task_id, parent, now))?;
+    }
+    Ok(())
+}
+
+fn parent_directory_paths(relative_path: &str) -> Vec<String> {
+    let parts = relative_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    let mut parents = Vec::new();
+    for depth in 1..parts.len() {
+        parents.push(parts[..depth].join("/"));
+    }
+    parents
+}
+
+fn directory_baseline(task_id: Uuid, relative_path: String, now: i64) -> SyncBaseline {
+    SyncBaseline {
+        task_id,
+        relative_path,
+        primary_hash: None,
+        primary_hash_status: HashStatus::Unavailable,
+        primary_size: 0,
+        secondary_size: 0,
+        primary_modified_unix_ms: 0,
+        secondary_hash: None,
+        secondary_hash_status: HashStatus::Unavailable,
+        secondary_modified_unix_ms: 0,
+        last_synced_unix_ms: now,
+    }
+}
+
 fn verified_hash_for_successful_apply(
     task: &SyncTask,
     action: &planner::PlannedAction,
     snap: &FileSnapshot,
+    transferred_hash: Option<&str>,
 ) -> (Option<String>, HashStatus) {
+    if let Some(hash) = transferred_hash {
+        return (Some(hash.to_string()), HashStatus::Verified);
+    }
     if snap.hash_status == HashStatus::Verified {
         return (snap.blake3_hash.clone(), snap.hash_status);
     }
@@ -1666,7 +2621,8 @@ async fn execute_secondary_pull_over_network(
     remote_files: &[RemoteFileState],
     local_snapshots: &[FileSnapshot],
     baselines: &[SyncBaseline],
-) -> Vec<executor::ExecutionResult> {
+    deferred_transfers: &HashSet<String>,
+) -> Vec<PullActionResult> {
     let local_map = local_snapshots
         .iter()
         .map(|snapshot| (snapshot.relative_path.as_str(), snapshot))
@@ -1682,25 +2638,51 @@ async fn execute_secondary_pull_over_network(
             continue;
         }
         if let Some(error) = secondary_pull_conflict(remote, &local_map, &baseline_map) {
-            results.push(network_error(&remote.relative_path, &error, false));
+            results.push(pull_result(network_error(
+                &remote.relative_path,
+                &error,
+                false,
+            )));
             continue;
         }
 
-        let target = sync_root.join(&remote.relative_path);
+        let target = match path_safety::safe_join(sync_root, &remote.relative_path) {
+            Ok(target) => target,
+            Err(e) => {
+                results.push(pull_result(network_error(
+                    &remote.relative_path,
+                    &format!("invalid remote path: {}", e),
+                    false,
+                )));
+                continue;
+            }
+        };
         if remote.kind == EntryKind::Directory {
             match std::fs::create_dir_all(&target) {
-                Ok(()) => results.push(executor::ExecutionResult {
-                    relative_path: remote.relative_path.clone(),
-                    success: true,
-                    error: None,
-                    retryable: false,
-                }),
-                Err(e) => results.push(network_error(
+                Ok(()) => {
+                    advance_sync_progress(task.id, 0);
+                    results.push(pull_result(executor::ExecutionResult {
+                        relative_path: remote.relative_path.clone(),
+                        success: true,
+                        error: None,
+                        retryable: false,
+                    }));
+                }
+                Err(e) => results.push(pull_result(network_error(
                     &remote.relative_path,
                     &format!("directory create failed: {}", e),
                     true,
-                )),
+                ))),
             }
+            continue;
+        }
+
+        if is_path_deferred(deferred_transfers, &remote.relative_path, "download") {
+            results.push(pull_result(network_error(
+                &remote.relative_path,
+                "transfer deferred by user",
+                false,
+            )));
             continue;
         }
 
@@ -1715,17 +2697,26 @@ async fn execute_secondary_pull_over_network(
         )
         .await
         {
-            Ok(()) => results.push(executor::ExecutionResult {
-                relative_path: remote.relative_path.clone(),
-                success: true,
-                error: None,
-                retryable: false,
-            }),
-            Err(e) => results.push(network_error(
-                &remote.relative_path,
-                &format!("network file download failed: {}", e),
-                true,
-            )),
+            Ok(outcome) => {
+                advance_sync_progress(task.id, remote_progress_bytes(remote));
+                results.push(PullActionResult {
+                    result: executor::ExecutionResult {
+                        relative_path: remote.relative_path.clone(),
+                        success: true,
+                        error: None,
+                        retryable: false,
+                    },
+                    transferred_hash: Some(outcome.blake3_hash),
+                });
+            }
+            Err(e) => {
+                let retryable = is_retryable_network_error(&e);
+                results.push(pull_result(network_error(
+                    &remote.relative_path,
+                    &format!("network file download failed: {}", e),
+                    retryable,
+                )));
+            }
         }
     }
 
@@ -1778,7 +2769,7 @@ fn secondary_pull_conflict(
 
 fn persist_secondary_pull_successes(
     task: &SyncTask,
-    results: &mut [executor::ExecutionResult],
+    results: &mut [PullActionResult],
     sync_root: &Path,
     db: &rusqlite::Connection,
 ) {
@@ -1787,7 +2778,8 @@ fn persist_secondary_pull_successes(
     let baseline_repo = repository::SyncBaselineRepository::new(db);
     let pending_repo = repository::PendingReturnRepository::new(db);
 
-    for result in results {
+    for pull_result in results {
+        let result = &mut pull_result.result;
         if !result.success {
             continue;
         }
@@ -1803,6 +2795,13 @@ fn persist_secondary_pull_successes(
         };
         let (kind, size, hash, hash_status) = if metadata.is_dir() {
             (EntryKind::Directory, 0, None, HashStatus::Unavailable)
+        } else if let Some(hash) = pull_result.transferred_hash.as_ref() {
+            (
+                EntryKind::File,
+                metadata.len() as i64,
+                Some(hash.clone()),
+                HashStatus::Verified,
+            )
         } else {
             match crate::core::scanner::hash_file(&path) {
                 Ok(hash) => (
@@ -1842,12 +2841,21 @@ fn persist_secondary_pull_successes(
             result.retryable = true;
             continue;
         }
+        if let Err(e) =
+            ensure_parent_directory_baselines(&baseline_repo, task.id, &result.relative_path, now)
+        {
+            result.success = false;
+            result.error = Some(format!("pulled parent baseline update failed: {}", e));
+            result.retryable = true;
+            continue;
+        }
         if let Err(e) = baseline_repo.upsert(&SyncBaseline {
             task_id: task.id,
             relative_path: result.relative_path.clone(),
             primary_hash: hash.clone(),
             primary_hash_status: hash_status,
             primary_size: size,
+            secondary_size: size,
             primary_modified_unix_ms: modified_unix_ms,
             secondary_hash: hash,
             secondary_hash_status: hash_status,
@@ -1910,11 +2918,20 @@ pub fn run_refresh_pending_returns(
     task_id: String,
 ) -> Result<Vec<SyncActionResult>, String> {
     let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let task = repository::SyncTaskRepository::new(&db)
-        .get(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or("task not found")?;
+    let (task, cached_snapshots, baselines) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let task = repository::SyncTaskRepository::new(&db)
+            .get(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or("task not found")?;
+        let cached_snapshots = repository::FileSnapshotRepository::new(&db)
+            .list_by_task(&id)
+            .map_err(|e| e.to_string())?;
+        let baselines = repository::SyncBaselineRepository::new(&db)
+            .list_by_task(&id)
+            .map_err(|e| e.to_string())?;
+        (task, cached_snapshots, baselines)
+    };
 
     if !task.enabled {
         return Err("task is paused".to_string());
@@ -1924,8 +2941,9 @@ pub fn run_refresh_pending_returns(
     }
 
     let sync_root = Path::new(&task.local_path);
-    let scan_results =
-        scanner::scan_root(sync_root, &*state.platform).map_err(|e| e.to_string())?;
+    let cache = snapshot_cache_by_path(cached_snapshots);
+    let scan_results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
+        .map_err(|e| e.to_string())?;
     let snapshots = scan_results
         .into_iter()
         .map(|result| {
@@ -1935,13 +2953,11 @@ pub fn run_refresh_pending_returns(
         })
         .collect::<Vec<_>>();
 
+    let db = state.db.lock().map_err(|e| e.to_string())?;
     repository::FileSnapshotRepository::new(&db)
         .replace_for_task(&id, &snapshots)
         .map_err(|e| e.to_string())?;
 
-    let baselines = repository::SyncBaselineRepository::new(&db)
-        .list_by_task(&id)
-        .map_err(|e| e.to_string())?;
     let mut actions = planner::plan_sync(&snapshots, &baselines, DeviceRole::Secondary)
         .into_iter()
         .filter(|action| action.decision == SyncDecision::MarkPendingReturn)
@@ -1990,15 +3006,19 @@ pub async fn run_execute_return_sync(
     };
 
     let results = if task.local_role == DeviceRole::Secondary {
-        let (pending, baselines) = {
+        let (pending, baselines, deferred_transfers) = {
             let db = state.db.lock().map_err(|e| e.to_string())?;
             let pending_repo = repository::PendingReturnRepository::new(&db);
             let baseline_repo = repository::SyncBaselineRepository::new(&db);
             (
                 pending_repo.list_by_task(&id).map_err(|e| e.to_string())?,
                 baseline_repo.list_by_task(&id).map_err(|e| e.to_string())?,
+                repository::DeferredTransferRepository::new(&db)
+                    .list_all()
+                    .map_err(|e| e.to_string())?,
             )
         };
+        let deferred_transfers = deferred_transfer_set(&deferred_transfers, id);
         let pending_map: HashMap<String, PendingReturnChange> = pending
             .into_iter()
             .map(|change| (change.relative_path.clone(), change))
@@ -2022,6 +3042,7 @@ pub async fn run_execute_return_sync(
             &state.identity,
             &remote_files,
             &baselines,
+            &deferred_transfers,
         )
         .await;
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -2076,6 +3097,7 @@ async fn execute_secondary_return_over_network_checked(
     local_identity: &crate::pairing::DeviceIdentity,
     remote_files: &[RemoteFileState],
     baselines: &[SyncBaseline],
+    deferred_transfers: &HashSet<String>,
 ) -> Vec<executor::ExecutionResult> {
     let remote_map = remote_files
         .iter()
@@ -2107,11 +3129,17 @@ async fn execute_secondary_return_over_network_checked(
                     &task.primary_device_id,
                     task.id,
                     path,
+                    None,
                     connections,
                     local_identity,
                 )
                 .await,
             );
+            continue;
+        }
+
+        if is_path_deferred(deferred_transfers, path, "upload") {
+            results.push(network_error(path, "transfer deferred by user", false));
             continue;
         }
 
@@ -2146,17 +3174,20 @@ async fn execute_secondary_return_over_network_checked(
         )
         .await
         {
-            Ok(()) => results.push(executor::ExecutionResult {
+            Ok(_outcome) => results.push(executor::ExecutionResult {
                 relative_path: path.clone(),
                 success: true,
                 error: None,
                 retryable: false,
             }),
-            Err(e) => results.push(network_error(
-                path,
-                &format!("network file transfer failed: {}", e),
-                true,
-            )),
+            Err(e) => {
+                let retryable = is_retryable_network_error(&e);
+                results.push(network_error(
+                    path,
+                    &format!("network file transfer failed: {}", e),
+                    retryable,
+                ));
+            }
         }
     }
     results
@@ -2267,6 +3298,7 @@ fn persist_return_successes(
             primary_hash: change.secondary_hash.clone(),
             primary_hash_status: change.secondary_hash_status,
             primary_size,
+            secondary_size: primary_size,
             primary_modified_unix_ms: change.secondary_modified_unix_ms,
             secondary_hash: change.secondary_hash.clone(),
             secondary_hash_status: change.secondary_hash_status,
@@ -2463,7 +3495,18 @@ pub fn list_history(
         .map_err(|e| e.to_string())?
         .ok_or("task not found")?;
     let repo = repository::HistoryRepository::new(&db);
-    let mut entries = repo.list_by_task(&id).map_err(|e| e.to_string())?;
+    let entries = repo.list_by_task(&id).map_err(|e| e.to_string())?;
+    let mut entries = entries
+        .into_iter()
+        .filter(|entry| {
+            if Path::new(&entry.stored_path).exists() {
+                true
+            } else {
+                let _ = repo.remove(&id, &entry.id);
+                false
+            }
+        })
+        .collect::<Vec<_>>();
     let mut known_paths = entries
         .iter()
         .map(|entry| entry.stored_path.clone())
@@ -2541,6 +3584,15 @@ pub fn cleanup_history(state: State<'_, AppState>, task_id: String) -> Result<us
     history_repo
         .delete_older_than(&id, cutoff)
         .map_err(|e| e.to_string())?;
+    let existing_paths = store
+        .discover_entries(id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|entry| entry.stored_path)
+        .collect::<Vec<_>>();
+    history_repo
+        .remove_missing_stored_paths(&id, &existing_paths)
+        .map_err(|e| e.to_string())?;
 
     Ok(deleted)
 }
@@ -2617,10 +3669,23 @@ pub fn get_transfer_progress() -> Result<Vec<connection::TransferProgress>, Stri
 }
 
 #[tauri::command]
+pub fn has_active_transfers() -> Result<bool, String> {
+    Ok(connection::has_active_transfers())
+}
+
+#[tauri::command]
 pub fn get_sync_progress() -> Result<Vec<SyncProgress>, String> {
+    let now = now_ms();
     Ok(SYNC_PROGRESS
         .lock()
-        .map(|progress| progress.values().cloned().collect())
+        .map(|mut progress| {
+            progress.retain(|_, entry| {
+                entry
+                    .finished_at_unix_ms
+                    .map_or(true, |finished_at| now - finished_at <= 2_000)
+            });
+            progress.values().cloned().collect()
+        })
         .unwrap_or_default())
 }
 
@@ -2629,29 +3694,93 @@ pub fn cancel_transfer(
     state: State<'_, AppState>,
     task_id: String,
     relative_path: String,
+    direction: Option<String>,
 ) -> Result<(), String> {
-    connection::cancel_transfer(&task_id, &relative_path);
-    if let Some(server) = &state._server {
-        server
-            .cancel_incoming_transfer(&task_id, &relative_path)
+    let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let direction = direction.unwrap_or_else(|| "upload".to_string());
+    connection::cancel_transfer(&task_id, &relative_path, &direction);
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::DeferredTransferRepository::new(&db)
+            .upsert(&DeferredTransferRecord {
+                task_id: id,
+                relative_path: relative_path.clone(),
+                direction: direction.clone(),
+                reason: "cancelled by user".to_string(),
+                created_unix_ms: now_ms(),
+            })
             .map_err(|e| e.to_string())?;
+    }
+    if direction == "receive" {
+        if let Some(server) = &state._server {
+            server
+                .cancel_incoming_transfer(&task_id, &relative_path)
+                .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn resume_transfer(task_id: String, relative_path: String) -> Result<(), String> {
-    connection::resume_deferred_transfer(&task_id, &relative_path);
+pub fn resume_transfer(
+    state: State<'_, AppState>,
+    task_id: String,
+    relative_path: String,
+    direction: Option<String>,
+) -> Result<(), String> {
+    let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let still_deferred = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let repo = repository::DeferredTransferRepository::new(&db);
+        repo.remove(&id, &relative_path, direction.as_deref())
+            .map_err(|e| e.to_string())?;
+        repo.exists(&id, &relative_path, None)
+            .map_err(|e| e.to_string())?
+    };
+    if let Some(direction) = direction.as_deref() {
+        connection::resume_deferred_transfer(&task_id, &relative_path, Some(direction));
+        if still_deferred {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            for record in repository::DeferredTransferRepository::new(&db)
+                .list_all()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|record| record.task_id == id && record.relative_path == relative_path)
+            {
+                connection::defer_transfer(&task_id, &relative_path, &record.direction);
+            }
+        }
+    } else if still_deferred {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        for record in repository::DeferredTransferRepository::new(&db)
+            .list_all()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|record| record.task_id == id && record.relative_path == relative_path)
+        {
+            connection::defer_transfer(&task_id, &relative_path, &record.direction);
+        }
+    } else {
+        connection::resume_deferred_transfer(&task_id, &relative_path, None);
+    }
     Ok(())
 }
 
 #[tauri::command]
-pub fn list_deferred_transfers() -> Result<Vec<DeferredTransfer>, String> {
-    Ok(connection::list_deferred_transfers()
+pub fn list_deferred_transfers(
+    state: State<'_, AppState>,
+) -> Result<Vec<DeferredTransfer>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(repository::DeferredTransferRepository::new(&db)
+        .list_all()
+        .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|(task_id, relative_path)| DeferredTransfer {
-            task_id,
-            relative_path,
+        .map(|record| DeferredTransfer {
+            task_id: record.task_id.to_string(),
+            relative_path: record.relative_path,
+            direction: record.direction,
+            reason: record.reason,
+            created_unix_ms: record.created_unix_ms,
         })
         .collect())
 }
@@ -2862,6 +3991,7 @@ mod return_sync_tests {
             primary_hash: hash.map(str::to_string),
             primary_hash_status: hash_status,
             primary_size: size,
+            secondary_size: size,
             primary_modified_unix_ms: modified_unix_ms,
             secondary_hash: Some("baseline_secondary_hash".to_string()),
             secondary_hash_status: HashStatus::Verified,

@@ -1,8 +1,14 @@
 use anyhow::Result;
+use rusqlite::types::Type;
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
 use crate::core::model::*;
+
+fn parse_uuid_text(value: String, col: usize) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(&value)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(col, Type::Text, Box::new(e)))
+}
 
 /// Repository for sync task CRUD operations.
 pub struct SyncTaskRepository<'a> {
@@ -42,7 +48,7 @@ impl<'a> SyncTaskRepository<'a> {
         let result = stmt.query_row(params![id.to_string()], |row| {
             let role_str: String = row.get(6)?;
             Ok(SyncTask {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                id: parse_uuid_text(row.get(0)?, 0)?,
                 name: row.get(1)?,
                 primary_device_id: row.get(2)?,
                 secondary_device_id: row.get(3)?,
@@ -72,7 +78,7 @@ impl<'a> SyncTaskRepository<'a> {
         let tasks = stmt.query_map([], |row| {
             let role_str: String = row.get(6)?;
             Ok(SyncTask {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                id: parse_uuid_text(row.get(0)?, 0)?,
                 name: row.get(1)?,
                 primary_device_id: row.get(2)?,
                 secondary_device_id: row.get(3)?,
@@ -147,7 +153,7 @@ impl<'a> FileSnapshotRepository<'a> {
         )?;
         let result = stmt.query_row(params![task_id.to_string(), relative_path], |row| {
             Ok(FileSnapshot {
-                task_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                task_id: parse_uuid_text(row.get(0)?, 0)?,
                 relative_path: row.get(1)?,
                 kind: match row.get::<_, String>(2)?.as_str() {
                     "Directory" => EntryKind::Directory,
@@ -179,7 +185,7 @@ impl<'a> FileSnapshotRepository<'a> {
         )?;
         let rows = stmt.query_map(params![task_id.to_string()], |row| {
             Ok(FileSnapshot {
-                task_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                task_id: parse_uuid_text(row.get(0)?, 0)?,
                 relative_path: row.get(1)?,
                 kind: match row.get::<_, String>(2)?.as_str() {
                     "Directory" => EntryKind::Directory,
@@ -205,12 +211,45 @@ impl<'a> FileSnapshotRepository<'a> {
     }
 
     pub fn replace_for_task(&self, task_id: &Uuid, snapshots: &[FileSnapshot]) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM file_snapshots WHERE task_id = ?1",
-            params![task_id.to_string()],
-        )?;
-        for snap in snapshots {
-            self.upsert(snap)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> rusqlite::Result<()> {
+            self.conn.execute(
+                "DELETE FROM file_snapshots WHERE task_id = ?1",
+                params![task_id.to_string()],
+            )?;
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO file_snapshots (task_id, relative_path, kind, size, modified_unix_ms, blake3_hash, hash_status, deleted, is_symlink)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(task_id, relative_path) DO UPDATE SET
+                    kind = excluded.kind,
+                    size = excluded.size,
+                    modified_unix_ms = excluded.modified_unix_ms,
+                    blake3_hash = excluded.blake3_hash,
+                    hash_status = excluded.hash_status,
+                    deleted = excluded.deleted,
+                    is_symlink = excluded.is_symlink",
+            )?;
+            for snap in snapshots {
+                stmt.execute(params![
+                    snap.task_id.to_string(),
+                    snap.relative_path,
+                    format!("{:?}", snap.kind),
+                    snap.size,
+                    snap.modified_unix_ms,
+                    snap.blake3_hash,
+                    format!("{:?}", snap.hash_status),
+                    snap.deleted as i32,
+                    snap.is_symlink as i32,
+                ])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -219,6 +258,16 @@ impl<'a> FileSnapshotRepository<'a> {
         self.conn.execute(
             "UPDATE file_snapshots SET deleted = 1 WHERE task_id = ?1 AND relative_path = ?2",
             params![task_id.to_string(), relative_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_tree(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
+        let prefix = format!("{}/%", relative_path.trim_end_matches('/'));
+        self.conn.execute(
+            "DELETE FROM file_snapshots
+             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3)",
+            params![task_id.to_string(), relative_path, prefix],
         )?;
         Ok(())
     }
@@ -236,12 +285,13 @@ impl<'a> SyncBaselineRepository<'a> {
 
     pub fn upsert(&self, baseline: &SyncBaseline) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sync_baselines (task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO sync_baselines (task_id, relative_path, primary_hash, primary_hash_status, primary_size, secondary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(task_id, relative_path) DO UPDATE SET
                 primary_hash = excluded.primary_hash,
                 primary_hash_status = excluded.primary_hash_status,
                 primary_size = excluded.primary_size,
+                secondary_size = excluded.secondary_size,
                 primary_modified_unix_ms = excluded.primary_modified_unix_ms,
                 secondary_hash = excluded.secondary_hash,
                 secondary_hash_status = excluded.secondary_hash_status,
@@ -253,6 +303,7 @@ impl<'a> SyncBaselineRepository<'a> {
                 baseline.primary_hash,
                 format!("{:?}", baseline.primary_hash_status),
                 baseline.primary_size,
+                baseline.secondary_size,
                 baseline.primary_modified_unix_ms,
                 baseline.secondary_hash,
                 format!("{:?}", baseline.secondary_hash_status),
@@ -265,7 +316,7 @@ impl<'a> SyncBaselineRepository<'a> {
 
     pub fn get(&self, task_id: &Uuid, relative_path: &str) -> Result<Option<SyncBaseline>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms
+            "SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, secondary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms
              FROM sync_baselines WHERE task_id = ?1 AND relative_path = ?2",
         )?;
         let result = stmt.query_row(params![task_id.to_string(), relative_path], |row| {
@@ -275,16 +326,17 @@ impl<'a> SyncBaselineRepository<'a> {
                 _ => HashStatus::Unavailable,
             };
             Ok(SyncBaseline {
-                task_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                task_id: parse_uuid_text(row.get(0)?, 0)?,
                 relative_path: row.get(1)?,
                 primary_hash: row.get(2)?,
                 primary_hash_status: parse_hs(row.get(3)?),
                 primary_size: row.get(4)?,
-                primary_modified_unix_ms: row.get(5)?,
-                secondary_hash: row.get(6)?,
-                secondary_hash_status: parse_hs(row.get(7)?),
-                secondary_modified_unix_ms: row.get(8)?,
-                last_synced_unix_ms: row.get(9)?,
+                secondary_size: row.get(5)?,
+                primary_modified_unix_ms: row.get(6)?,
+                secondary_hash: row.get(7)?,
+                secondary_hash_status: parse_hs(row.get(8)?),
+                secondary_modified_unix_ms: row.get(9)?,
+                last_synced_unix_ms: row.get(10)?,
             })
         });
         match result {
@@ -296,7 +348,7 @@ impl<'a> SyncBaselineRepository<'a> {
 
     pub fn list_by_task(&self, task_id: &Uuid) -> Result<Vec<SyncBaseline>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms
+            "SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, secondary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms
              FROM sync_baselines WHERE task_id = ?1",
         )?;
         let rows = stmt.query_map(params![task_id.to_string()], |row| {
@@ -306,16 +358,17 @@ impl<'a> SyncBaselineRepository<'a> {
                 _ => HashStatus::Unavailable,
             };
             Ok(SyncBaseline {
-                task_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                task_id: parse_uuid_text(row.get(0)?, 0)?,
                 relative_path: row.get(1)?,
                 primary_hash: row.get(2)?,
                 primary_hash_status: parse_hs(row.get(3)?),
                 primary_size: row.get(4)?,
-                primary_modified_unix_ms: row.get(5)?,
-                secondary_hash: row.get(6)?,
-                secondary_hash_status: parse_hs(row.get(7)?),
-                secondary_modified_unix_ms: row.get(8)?,
-                last_synced_unix_ms: row.get(9)?,
+                secondary_size: row.get(5)?,
+                primary_modified_unix_ms: row.get(6)?,
+                secondary_hash: row.get(7)?,
+                secondary_hash_status: parse_hs(row.get(8)?),
+                secondary_modified_unix_ms: row.get(9)?,
+                last_synced_unix_ms: row.get(10)?,
             })
         })?;
         let mut result = Vec::new();
@@ -329,6 +382,16 @@ impl<'a> SyncBaselineRepository<'a> {
         self.conn.execute(
             "DELETE FROM sync_baselines WHERE task_id = ?1 AND relative_path = ?2",
             params![task_id.to_string(), relative_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_tree(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
+        let prefix = format!("{}/%", relative_path.trim_end_matches('/'));
+        self.conn.execute(
+            "DELETE FROM sync_baselines
+             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3)",
+            params![task_id.to_string(), relative_path, prefix],
         )?;
         Ok(())
     }
@@ -378,7 +441,7 @@ impl<'a> PendingReturnRepository<'a> {
                 _ => HashStatus::Unavailable,
             };
             Ok(PendingReturnChange {
-                task_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                task_id: parse_uuid_text(row.get(0)?, 0)?,
                 relative_path: row.get(1)?,
                 change_kind: match row.get::<_, String>(2)?.as_str() {
                     "Created" => ChangeKind::Created,
@@ -450,8 +513,8 @@ impl<'a> HistoryRepository<'a> {
         )?;
         let rows = stmt.query_map(params![task_id.to_string()], |row| {
             Ok(HistoryEntry {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
-                task_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap(),
+                id: parse_uuid_text(row.get(0)?, 0)?,
+                task_id: parse_uuid_text(row.get(1)?, 1)?,
                 original_relative_path: row.get(2)?,
                 stored_path: row.get(3)?,
                 reason: match row.get::<_, String>(4)?.as_str() {
@@ -492,6 +555,122 @@ impl<'a> HistoryRepository<'a> {
             params![task_id.to_string(), entry_id.to_string()],
         )?;
         Ok(())
+    }
+
+    pub fn remove_missing_stored_paths(
+        &self,
+        task_id: &Uuid,
+        existing_stored_paths: &[String],
+    ) -> Result<usize> {
+        let mut entries = self.list_by_task(task_id)?;
+        let existing = existing_stored_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut removed = 0;
+        for entry in entries.drain(..) {
+            if !existing.contains(&entry.stored_path) {
+                self.remove(task_id, &entry.id)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Repository for user-deferred transfers.
+pub struct DeferredTransferRepository<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> DeferredTransferRepository<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+
+    pub fn upsert(&self, transfer: &DeferredTransferRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO deferred_transfers (task_id, relative_path, direction, reason, created_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(task_id, relative_path, direction) DO UPDATE SET
+                reason = excluded.reason,
+                created_unix_ms = excluded.created_unix_ms",
+            params![
+                transfer.task_id.to_string(),
+                transfer.relative_path,
+                transfer.direction,
+                transfer.reason,
+                transfer.created_unix_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_all(&self) -> Result<Vec<DeferredTransferRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, relative_path, direction, reason, created_unix_ms
+             FROM deferred_transfers ORDER BY created_unix_ms, relative_path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DeferredTransferRecord {
+                task_id: parse_uuid_text(row.get(0)?, 0)?,
+                relative_path: row.get(1)?,
+                direction: row.get(2)?,
+                reason: row.get(3)?,
+                created_unix_ms: row.get(4)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn exists(
+        &self,
+        task_id: &Uuid,
+        relative_path: &str,
+        direction: Option<&str>,
+    ) -> Result<bool> {
+        let count: i64 = if let Some(direction) = direction {
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM deferred_transfers
+                 WHERE task_id = ?1 AND relative_path = ?2 AND direction = ?3",
+                params![task_id.to_string(), relative_path, direction],
+                |row| row.get(0),
+            )?
+        } else {
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM deferred_transfers
+                 WHERE task_id = ?1 AND relative_path = ?2",
+                params![task_id.to_string(), relative_path],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count > 0)
+    }
+
+    pub fn remove(
+        &self,
+        task_id: &Uuid,
+        relative_path: &str,
+        direction: Option<&str>,
+    ) -> Result<usize> {
+        let count = if let Some(direction) = direction {
+            self.conn.execute(
+                "DELETE FROM deferred_transfers
+                 WHERE task_id = ?1 AND relative_path = ?2 AND direction = ?3",
+                params![task_id.to_string(), relative_path, direction],
+            )?
+        } else {
+            self.conn.execute(
+                "DELETE FROM deferred_transfers
+                 WHERE task_id = ?1 AND relative_path = ?2",
+                params![task_id.to_string(), relative_path],
+            )?
+        };
+        Ok(count)
     }
 }
 

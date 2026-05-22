@@ -1,11 +1,13 @@
 import { useEffect, useState, useRef } from "react";
 import {
   cancelTransfer,
+  getSyncProgress,
   getTransferProgress,
   listDeferredTransfers,
   resumeTransfer,
   syncNow,
   type DeferredTransfer,
+  type SyncProgress,
 } from "../lib/tauriApi";
 
 interface DisplayItem {
@@ -14,6 +16,7 @@ interface DisplayItem {
   relativePath: string;
   path: string;
   direction: string;
+  rawDirection: string;
   percent: number;
   mbps: number;
   visible: boolean;
@@ -35,18 +38,29 @@ function directionLabel(direction: string) {
   }
 }
 
+function syncPercent(progress: SyncProgress) {
+  if (progress.items_total && progress.items_total > 0) {
+    return Math.round(((progress.items_done ?? 0) / progress.items_total) * 100);
+  }
+  if (progress.bytes_total && progress.bytes_total > 0) {
+    return Math.round(((progress.bytes_done ?? 0) / progress.bytes_total) * 100);
+  }
+  return progress.finished ? 100 : 0;
+}
+
 export function ProgressBar() {
   const [items, setItems] = useState<DisplayItem[]>([]);
   const [deferred, setDeferred] = useState<DeferredTransfer[]>([]);
-  const [dismissedDeferred, setDismissedDeferred] = useState<Set<string>>(new Set());
   const completedRef = useRef<Map<string, number>>(new Map());
+  const percentRef = useRef<Map<string, number>>(new Map());
   const totalRef = useRef(0);
 
   useEffect(() => {
     const poll = async () => {
       try {
-        const [transfers, deferredTransfers] = await Promise.all([
+        const [transfers, syncProgress, deferredTransfers] = await Promise.all([
           getTransferProgress(),
+          getSyncProgress(),
           listDeferredTransfers(),
         ]);
         const now = Date.now();
@@ -54,30 +68,70 @@ export function ProgressBar() {
 
         const active = transfers
           .filter((t) => !t.finished)
-          .map((t) => ({
-            key: `${t.task_id}:${t.relative_path}:${t.direction}`,
-            taskId: t.task_id,
-            relativePath: t.relative_path,
-            path: t.relative_path.split("/").pop() || t.relative_path,
-            direction: directionLabel(t.direction),
-            percent: t.bytes_total > 0 ? Math.round((t.bytes_done / t.bytes_total) * 100) : 0,
-            mbps: t.mbps,
+          .map((t) => {
+            const key = t.transfer_id || `${t.task_id}:${t.relative_path}:${t.direction}`;
+            const rawPercent = t.bytes_total > 0 ? Math.round((t.bytes_done / t.bytes_total) * 100) : 0;
+            const previousPercent = percentRef.current.get(key);
+            const percent = previousPercent == null ? rawPercent : Math.max(previousPercent, rawPercent);
+            percentRef.current.set(key, percent);
+            return {
+              key,
+              taskId: t.task_id,
+              relativePath: t.relative_path,
+              path: t.relative_path.split("/").pop() || t.relative_path,
+              direction: directionLabel(t.direction),
+              rawDirection: t.direction,
+              percent,
+              mbps: t.mbps,
+              visible: true,
+              fading: false,
+              cancellable: Boolean(t.relative_path),
+              indeterminate: false,
+            };
+          })
+          .sort((a, b) => {
+            const left = `${a.taskId}:${a.relativePath}:${a.rawDirection}:${a.key}`;
+            const right = `${b.taskId}:${b.relativePath}:${b.rawDirection}:${b.key}`;
+            return left.localeCompare(right);
+          });
+
+        const syncItems = syncProgress.map((p) => {
+          const key = `sync:${p.task_id}`;
+          const rawPercent = syncPercent(p);
+          const previousPercent = percentRef.current.get(key);
+          const percent = previousPercent == null ? rawPercent : Math.max(previousPercent, rawPercent);
+          percentRef.current.set(key, percent);
+          const done = p.items_done ?? 0;
+          const total = p.items_total ?? 0;
+          return {
+            key,
+            taskId: p.task_id,
+            relativePath: "",
+            path: total > 0 ? `${done}/${total} 项` : (p.detail || p.phase),
+            direction: p.phase,
+            rawDirection: "sync",
+            percent,
+            mbps: 0,
             visible: true,
-            fading: false,
-            cancellable: Boolean(t.relative_path),
-            indeterminate: false,
-          }));
+            fading: Boolean(p.finished),
+            cancellable: false,
+            indeterminate: total === 0 && !(p.bytes_total && p.bytes_total > 0),
+          };
+        });
 
-        totalRef.current = active.length;
+        totalRef.current = active.length + syncItems.length;
 
-        const prevKeys = new Set(active.map((a) => a.key));
+        const prevKeys = new Set([...active.map((a) => a.key), ...syncItems.map((a) => a.key)]);
         completedRef.current.forEach((_, key) => {
           if (!prevKeys.has(key)) completedRef.current.delete(key);
+        });
+        percentRef.current.forEach((_, key) => {
+          if (!prevKeys.has(key)) percentRef.current.delete(key);
         });
 
         const transferred: DisplayItem[] = [];
         transfers.filter((t) => t.finished).forEach((t) => {
-          const key = `${t.task_id}:${t.relative_path}:${t.direction}`;
+          const key = t.transfer_id || `${t.task_id}:${t.relative_path}:${t.direction}`;
           if (!completedRef.current.has(key)) {
             completedRef.current.set(key, now);
             const pct = t.bytes_total > 0 ? Math.round((t.bytes_done / t.bytes_total) * 100) : 100;
@@ -87,6 +141,7 @@ export function ProgressBar() {
               relativePath: t.relative_path,
               path: t.relative_path.split("/").pop() || t.relative_path,
               direction: directionLabel(t.direction),
+              rawDirection: t.direction,
               percent: pct,
               mbps: 0,
               visible: false,
@@ -101,7 +156,7 @@ export function ProgressBar() {
           if (now - ts > 2000) completedRef.current.delete(key);
         });
 
-        setItems([...active, ...transferred]);
+        setItems([...syncItems, ...active, ...transferred.sort((a, b) => a.key.localeCompare(b.key))]);
       } catch {
         setItems([]);
       }
@@ -114,23 +169,18 @@ export function ProgressBar() {
   const handleCancel = async (item: DisplayItem) => {
     if (!item.cancellable) return;
     try {
-      await cancelTransfer(item.taskId, item.relativePath);
+      await cancelTransfer(item.taskId, item.relativePath, item.rawDirection);
     } catch {
       // The next poll will reflect the transfer state.
     }
   };
 
-  const deferredKey = (item: DeferredTransfer) => `${item.task_id}:${item.relative_path}`;
-  const prompt = deferred.find((item) => !dismissedDeferred.has(deferredKey(item))) ?? null;
+  const deferredKey = (item: DeferredTransfer) => `${item.task_id}:${item.relative_path}:${item.direction}`;
+  const deferredItems = [...deferred].sort((a, b) => deferredKey(a).localeCompare(deferredKey(b)));
 
   const handleResume = async (item: DeferredTransfer) => {
     try {
-      await resumeTransfer(item.task_id, item.relative_path);
-      setDismissedDeferred((prev) => {
-        const next = new Set(prev);
-        next.delete(deferredKey(item));
-        return next;
-      });
+      await resumeTransfer(item.task_id, item.relative_path, item.direction);
       setDeferred((prev) => prev.filter((entry) => deferredKey(entry) !== deferredKey(item)));
       await syncNow(item.task_id);
     } catch {
@@ -138,30 +188,23 @@ export function ProgressBar() {
     }
   };
 
-  const handleSkip = (item: DeferredTransfer) => {
-    setDismissedDeferred((prev) => new Set(prev).add(deferredKey(item)));
-  };
-
-  if (items.length === 0 && !prompt) return null;
+  if (items.length === 0 && deferredItems.length === 0) return null;
 
   return (
     <div className="global-progress">
-      {prompt && (
-        <div className="deferred-transfer-prompt">
+      {deferredItems.map((prompt) => (
+        <div key={deferredKey(prompt)} className="deferred-transfer-prompt">
           <div className="deferred-transfer-copy">
-            <strong>文件已取消</strong>
-            <span>{prompt.relative_path.split("/").pop() || prompt.relative_path}</span>
+            <strong>待处理传输</strong>
+            <span>{directionLabel(prompt.direction)} {prompt.relative_path.split("/").pop() || prompt.relative_path}</span>
           </div>
           <div className="deferred-transfer-actions">
-            <button className="btn btn-secondary btn-small" type="button" onClick={() => handleSkip(prompt)}>
-              本次不同步
-            </button>
             <button className="btn btn-primary btn-small" type="button" onClick={() => handleResume(prompt)}>
-              继续传输
+              重新同步
             </button>
           </div>
         </div>
-      )}
+      ))}
       {items.map((item) => (
         <div key={item.key} className={`progress-row ${item.fading ? "progress-fade" : ""}`}>
           <div className="progress-row-header">

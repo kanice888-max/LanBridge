@@ -2,13 +2,14 @@ use anyhow::Result;
 use notify::RecommendedWatcher;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::core::model::DeviceRole;
+use crate::core::model::{DeviceRole, SyncTask};
 use crate::pairing::DeviceIdentity;
-use crate::platform::traits::Platform;
+use crate::platform::traits::{Platform, PlatformWatcherEvent};
 use crate::state::db;
 use crate::transport::server::SyncServer;
 use crate::transport::{ConnectionManager, DiscoveryState};
@@ -73,10 +74,81 @@ pub struct AppState {
     pub _server: Option<SyncServer>,
     pub pending_outgoing_invites: Mutex<HashMap<String, PendingOutgoingTaskInvite>>,
     pub sync_runs: SyncRunCoordinator,
+    pub dirty_tasks: TaskDirtyTracker,
     /// File watchers kept alive for the lifetime of the app.
     /// Each watcher monitors one task's sync root.
-    /// Event receivers are consumed by background drain threads.
+    /// Event receivers are consumed by background dirty-marker threads.
     pub _watchers: Mutex<Vec<(String, RecommendedWatcher)>>,
+}
+
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(2_500);
+
+#[derive(Debug, Clone)]
+pub struct TaskDirtyTracker {
+    tasks: Arc<Mutex<HashMap<Uuid, TaskDirtyState>>>,
+    debounce: Duration,
+}
+
+#[derive(Debug)]
+struct TaskDirtyState {
+    dirty_paths: HashSet<PathBuf>,
+    last_event_at: Instant,
+    sync_scheduled: bool,
+}
+
+impl Default for TaskDirtyTracker {
+    fn default() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            debounce: WATCHER_DEBOUNCE,
+        }
+    }
+}
+
+impl TaskDirtyTracker {
+    pub fn mark_task_dirty(&self, task_id: Uuid) {
+        self.mark_dirty_paths_at(task_id, Vec::new(), Instant::now());
+    }
+
+    pub fn mark_dirty_paths(&self, task_id: Uuid, paths: Vec<PathBuf>) {
+        self.mark_dirty_paths_at(task_id, paths, Instant::now());
+    }
+
+    fn mark_dirty_paths_at(&self, task_id: Uuid, paths: Vec<PathBuf>, now: Instant) {
+        let mut tasks = self.tasks.lock().unwrap();
+        let state = tasks.entry(task_id).or_insert_with(|| TaskDirtyState {
+            dirty_paths: HashSet::new(),
+            last_event_at: now,
+            sync_scheduled: false,
+        });
+        state.dirty_paths.extend(paths);
+        state.last_event_at = now;
+        state.sync_scheduled = true;
+    }
+
+    pub fn ready_task_ids(&self) -> Vec<Uuid> {
+        self.ready_task_ids_at(Instant::now())
+    }
+
+    fn ready_task_ids_at(&self, now: Instant) -> Vec<Uuid> {
+        let tasks = self.tasks.lock().unwrap();
+        tasks
+            .iter()
+            .filter_map(|(task_id, state)| {
+                if state.sync_scheduled && now.duration_since(state.last_event_at) >= self.debounce
+                {
+                    Some(*task_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn clear(&self, task_id: Uuid) {
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.remove(&task_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,9 +189,72 @@ mod tests {
 
         assert_eq!(coordinator.begin(task_id), SyncRunAdmission::Started);
     }
+
+    #[test]
+    fn dirty_tracker_debounces_watcher_events() {
+        let tracker = TaskDirtyTracker::default();
+        let task_id = Uuid::new_v4();
+        let now = Instant::now();
+
+        tracker.mark_dirty_paths_at(task_id, vec![PathBuf::from("file.txt")], now);
+        assert!(tracker
+            .ready_task_ids_at(now + Duration::from_millis(500))
+            .is_empty());
+        assert_eq!(
+            tracker.ready_task_ids_at(now + WATCHER_DEBOUNCE + Duration::from_millis(1)),
+            vec![task_id]
+        );
+        tracker.clear(task_id);
+        assert!(tracker
+            .ready_task_ids_at(now + WATCHER_DEBOUNCE + Duration::from_millis(2))
+            .is_empty());
+    }
+
+    #[test]
+    fn watcher_filter_ignores_protocol_internal_paths() {
+        let root = PathBuf::from("/tmp/lanbridge-task");
+        let paths = vec![
+            root.join(".lanbridge-history")
+                .join("trash")
+                .join("1")
+                .join("a.txt"),
+            root.join(".lanbridge-temp").join("upload.tmp"),
+            root.join("folder").join("keep.txt"),
+        ];
+
+        assert_eq!(
+            filter_external_watcher_paths(&root, paths),
+            vec![root.join("folder").join("keep.txt")]
+        );
+        assert!(filter_external_watcher_paths(
+            &root,
+            vec![root.join(".lanbridge-history").join("trash").join("1")]
+        )
+        .is_empty());
+    }
 }
 
 impl AppState {
+    pub fn start_task_watcher(&self, task: &SyncTask) -> Result<()> {
+        let task_id = task.id.to_string();
+        {
+            let watchers = self._watchers.lock().unwrap();
+            if watchers.iter().any(|(id, _)| id == &task_id) {
+                return Ok(());
+            }
+        }
+        let (watcher, rx) = self.platform.start_watcher(Path::new(&task.local_path))?;
+        spawn_dirty_watcher_thread(
+            task.id,
+            task.name.clone(),
+            task.local_path.clone(),
+            self.dirty_tasks.clone(),
+            rx,
+        );
+        self._watchers.lock().unwrap().push((task_id, watcher));
+        Ok(())
+    }
+
     pub fn new(
         identity: DeviceIdentity,
         platform: Box<dyn Platform>,
@@ -162,6 +297,14 @@ impl AppState {
                 }
             }
         }
+        let deferred_repo = crate::state::repository::DeferredTransferRepository::new(&conn);
+        for transfer in deferred_repo.list_all()? {
+            crate::transport::connection::defer_transfer(
+                &transfer.task_id.to_string(),
+                &transfer.relative_path,
+                &transfer.direction,
+            );
+        }
         let repo = crate::state::repository::SyncTaskRepository::new(&conn);
         let tasks = repo.list_all()?;
         if let Some(server) = &server {
@@ -172,6 +315,7 @@ impl AppState {
                 .collect::<HashSet<_>>();
             server.retain_registered_task_roots(&active_task_ids)?;
         }
+        let dirty_tasks = TaskDirtyTracker::default();
         let mut watchers: Vec<(String, RecommendedWatcher)> = Vec::new();
         for task in tasks {
             if let Err(error) = crate::core::transient::cleanup_lanbridge_transient_files(
@@ -195,13 +339,21 @@ impl AppState {
                         task.name,
                         task.local_path
                     );
-                    // Drain events in a background thread; P1 will connect them to scans.
-                    std::thread::spawn(move || while rx.recv().is_ok() {});
+                    spawn_dirty_watcher_thread(
+                        task.id,
+                        task.name.clone(),
+                        task.local_path.clone(),
+                        dirty_tasks.clone(),
+                        rx,
+                    );
                     watchers.push((task.id.to_string(), w));
                 }
                 Err(e) => {
                     tracing::warn!("failed to start watcher for task '{}': {}", task.name, e);
                 }
+            }
+            if task.enabled && task.local_role == DeviceRole::Primary {
+                dirty_tasks.mark_task_dirty(task.id);
             }
         }
 
@@ -214,7 +366,43 @@ impl AppState {
             _server: server,
             pending_outgoing_invites: Mutex::new(HashMap::new()),
             sync_runs: SyncRunCoordinator::default(),
+            dirty_tasks,
             _watchers: Mutex::new(watchers),
         })
     }
+}
+
+fn spawn_dirty_watcher_thread(
+    task_id: Uuid,
+    task_name: String,
+    local_path: String,
+    dirty_tasks: TaskDirtyTracker,
+    rx: std::sync::mpsc::Receiver<PlatformWatcherEvent>,
+) {
+    let local_path = PathBuf::from(local_path);
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            let paths = filter_external_watcher_paths(&local_path, event.paths);
+            if paths.is_empty() {
+                continue;
+            }
+            dirty_tasks.mark_dirty_paths(task_id, paths);
+            tracing::debug!(
+                task_id = %task_id,
+                task_name = %task_name,
+                local_path = %local_path.display(),
+                "marked task dirty from watcher event"
+            );
+        }
+    });
+}
+
+fn filter_external_watcher_paths(local_path: &Path, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            let relative = path.strip_prefix(local_path).unwrap_or(path);
+            !crate::core::transient::path_has_protocol_ignored_component(relative)
+        })
+        .collect()
 }

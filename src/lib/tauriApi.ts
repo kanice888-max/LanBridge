@@ -294,6 +294,10 @@ export async function toggleTaskEnabled(
   return invoke("toggle_task_enabled", { taskId, enabled });
 }
 
+export async function listReadyAutoSyncTasks(): Promise<string[]> {
+  return invoke("list_ready_auto_sync_tasks");
+}
+
 export async function scanTask(taskId: string): Promise<FileSnapshot[]> {
   return invoke("scan_task", { taskId });
 }
@@ -419,6 +423,7 @@ export async function deleteSyncTask(taskId: string): Promise<void> {
 }
 
 export interface TransferProgress {
+  transfer_id: string;
   task_id: string;
   relative_path: string;
   direction: string;
@@ -432,6 +437,11 @@ export interface SyncProgress {
   task_id: string;
   phase: string;
   detail?: string | null;
+  items_done?: number | null;
+  items_total?: number | null;
+  bytes_done?: number | null;
+  bytes_total?: number | null;
+  finished?: boolean | null;
 }
 
 export interface TaskPeerStatus {
@@ -446,26 +456,33 @@ export interface TaskPeerStatus {
 export interface DeferredTransfer {
   task_id: string;
   relative_path: string;
+  direction: string;
+  reason: string;
+  created_unix_ms: number;
 }
 
 export async function getTransferProgress(): Promise<TransferProgress[]> {
   return invoke("get_transfer_progress");
 }
 
+export async function hasActiveTransfers(): Promise<boolean> {
+  return invoke("has_active_transfers");
+}
+
 export async function getSyncProgress(): Promise<SyncProgress[]> {
   return invoke("get_sync_progress");
 }
 
-export async function cancelTransfer(taskId: string, relativePath: string): Promise<void> {
-  return invoke("cancel_transfer", { taskId, relativePath });
+export async function cancelTransfer(taskId: string, relativePath: string, direction?: string): Promise<void> {
+  return invoke("cancel_transfer", { taskId, relativePath, direction });
 }
 
 export async function listDeferredTransfers(): Promise<DeferredTransfer[]> {
   return invoke("list_deferred_transfers");
 }
 
-export async function resumeTransfer(taskId: string, relativePath: string): Promise<void> {
-  return invoke("resume_transfer", { taskId, relativePath });
+export async function resumeTransfer(taskId: string, relativePath: string, direction?: string): Promise<void> {
+  return invoke("resume_transfer", { taskId, relativePath, direction });
 }
 
 export async function getTaskPeerStatus(taskId: string): Promise<TaskPeerStatus> {

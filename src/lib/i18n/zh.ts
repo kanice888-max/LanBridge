@@ -187,7 +187,7 @@ export const zh = {
     title: "同步历史",
     back: "返回",
     allTasks: "全部任务",
-    cleanup: "清理旧条目",
+    cleanup: "清理历史文件",
     loading: "加载历史记录…",
     noEntries: "暂无历史条目",
     noEntriesDesc: "从主端删除或冲突解决时被覆盖的文件将显示在此处。",

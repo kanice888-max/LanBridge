@@ -1,7 +1,7 @@
 use lanbridge::core::model::*;
 use lanbridge::state::db;
 use lanbridge::state::repository::*;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -51,6 +51,31 @@ fn test_sync_task_crud() {
     repo.update_enabled(&task.id, false, now_ms()).unwrap();
     let updated = repo.get(&task.id).unwrap().unwrap();
     assert!(!updated.enabled);
+}
+
+#[test]
+fn test_sync_task_bad_uuid_returns_error_without_panic() {
+    let conn = setup_db();
+    conn.execute(
+        "INSERT INTO sync_tasks (id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            "not-a-uuid",
+            "Bad UUID",
+            "a",
+            "b",
+            "/tmp/a",
+            "/tmp/b",
+            "Primary",
+            1,
+            now_ms(),
+            now_ms(),
+        ],
+    )
+    .unwrap();
+
+    let result = SyncTaskRepository::new(&conn).list_all();
+    assert!(result.is_err());
 }
 
 #[test]
@@ -155,6 +180,55 @@ fn test_file_snapshot_replace_for_task_removes_stale_paths() {
 }
 
 #[test]
+fn test_file_snapshot_replace_for_task_rolls_back_on_failure() {
+    let conn = setup_db();
+    let task_repo = SyncTaskRepository::new(&conn);
+    let snap_repo = FileSnapshotRepository::new(&conn);
+
+    let task = SyncTask {
+        id: Uuid::new_v4(),
+        name: "Replace Snapshot Rollback Test".to_string(),
+        primary_device_id: "a".to_string(),
+        secondary_device_id: "b".to_string(),
+        local_path: "/tmp/a".to_string(),
+        remote_path: "/tmp/b".to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: now_ms(),
+        updated_unix_ms: now_ms(),
+    };
+    task_repo.insert(&task).unwrap();
+
+    let stale = FileSnapshot {
+        task_id: task.id,
+        relative_path: "keep.txt".to_string(),
+        kind: EntryKind::File,
+        size: 1,
+        modified_unix_ms: 1,
+        blake3_hash: Some("old".to_string()),
+        hash_status: HashStatus::Verified,
+        deleted: false,
+        is_symlink: false,
+    };
+    snap_repo.upsert(&stale).unwrap();
+
+    let invalid = FileSnapshot {
+        task_id: Uuid::new_v4(),
+        relative_path: "invalid.txt".to_string(),
+        kind: EntryKind::File,
+        size: 2,
+        modified_unix_ms: 2,
+        blake3_hash: Some("new".to_string()),
+        hash_status: HashStatus::Verified,
+        deleted: false,
+        is_symlink: false,
+    };
+
+    assert!(snap_repo.replace_for_task(&task.id, &[invalid]).is_err());
+    assert!(snap_repo.get(&task.id, "keep.txt").unwrap().is_some());
+}
+
+#[test]
 fn test_sync_baseline_list_by_task_includes_paths_without_snapshots() {
     let conn = setup_db();
     let task_repo = SyncTaskRepository::new(&conn);
@@ -181,6 +255,7 @@ fn test_sync_baseline_list_by_task_includes_paths_without_snapshots() {
             primary_hash: Some("hash".to_string()),
             primary_hash_status: HashStatus::Verified,
             primary_size: 10,
+            secondary_size: 10,
             primary_modified_unix_ms: 100,
             secondary_hash: Some("hash".to_string()),
             secondary_hash_status: HashStatus::Verified,
@@ -274,6 +349,65 @@ fn test_history_operations() {
 
     let total = history_repo.total_size_by_task(&task.id).unwrap();
     assert_eq!(total, 512);
+}
+
+#[test]
+fn test_deferred_transfer_operations() {
+    let conn = setup_db();
+    let task_repo = SyncTaskRepository::new(&conn);
+    let deferred_repo = DeferredTransferRepository::new(&conn);
+
+    let task = SyncTask {
+        id: Uuid::new_v4(),
+        name: "Deferred Test".to_string(),
+        primary_device_id: "a".to_string(),
+        secondary_device_id: "b".to_string(),
+        local_path: "/tmp/a".to_string(),
+        remote_path: "/tmp/b".to_string(),
+        local_role: DeviceRole::Primary,
+        enabled: true,
+        created_unix_ms: now_ms(),
+        updated_unix_ms: now_ms(),
+    };
+    task_repo.insert(&task).unwrap();
+
+    deferred_repo
+        .upsert(&DeferredTransferRecord {
+            task_id: task.id,
+            relative_path: "large.zip".to_string(),
+            direction: "upload".to_string(),
+            reason: "cancelled by user".to_string(),
+            created_unix_ms: 10,
+        })
+        .unwrap();
+    deferred_repo
+        .upsert(&DeferredTransferRecord {
+            task_id: task.id,
+            relative_path: "large.zip".to_string(),
+            direction: "download".to_string(),
+            reason: "cancelled by user".to_string(),
+            created_unix_ms: 20,
+        })
+        .unwrap();
+
+    assert!(deferred_repo
+        .exists(&task.id, "large.zip", Some("upload"))
+        .unwrap());
+    assert!(deferred_repo.exists(&task.id, "large.zip", None).unwrap());
+    assert_eq!(deferred_repo.list_all().unwrap().len(), 2);
+
+    deferred_repo
+        .remove(&task.id, "large.zip", Some("upload"))
+        .unwrap();
+    assert!(!deferred_repo
+        .exists(&task.id, "large.zip", Some("upload"))
+        .unwrap());
+    assert!(deferred_repo
+        .exists(&task.id, "large.zip", Some("download"))
+        .unwrap());
+
+    deferred_repo.remove(&task.id, "large.zip", None).unwrap();
+    assert!(deferred_repo.list_all().unwrap().is_empty());
 }
 
 #[test]

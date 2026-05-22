@@ -7,6 +7,7 @@ use crate::core::model::{EntryKind, HashStatus};
 pub(crate) const TRANSFER_V1_CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TRANSFER_V2_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub(crate) const TRANSFER_V1_ACK_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const TRANSFER_V2_ACK_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const TRANSFER_PROGRESS_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const NEGOTIATION_TIMEOUT_SECS: u64 = 1;
 
@@ -179,6 +180,18 @@ pub enum SyncMessage {
     FileDelete {
         task_id: String,
         relative_path: String,
+        #[serde(default)]
+        expected_kind: Option<EntryKind>,
+        #[serde(default)]
+        expected_hash: Option<String>,
+        #[serde(default)]
+        expected_hash_status: Option<HashStatus>,
+        #[serde(default)]
+        expected_size: Option<i64>,
+        #[serde(default)]
+        expected_modified_unix_ms: Option<i64>,
+        #[serde(default)]
+        delete_batch_id: Option<String>,
     },
 
     /// Acknowledge successful file write.
@@ -218,6 +231,8 @@ pub enum SyncMessage {
     TransferCancel {
         task_id: String,
         relative_path: String,
+        #[serde(default)]
+        direction: Option<String>,
     },
 
     // ── V2 protocol negotiation ──
@@ -542,7 +557,7 @@ mod tests {
             SyncMessage::TransferReady {
                 selected_version: 2,
                 max_chunk_size: 4 * 1024 * 1024,
-                ack_interval_bytes: 16 * 1024 * 1024,
+                ack_interval_bytes: TRANSFER_V2_ACK_INTERVAL_BYTES,
             },
             SyncMessage::FileStreamStartV2 {
                 task_id: "task".to_string(),
@@ -632,14 +647,32 @@ mod tests {
         let del = SyncMessage::FileDelete {
             task_id: "t".to_string(),
             relative_path: "old.txt".to_string(),
+            expected_kind: None,
+            expected_hash: None,
+            expected_hash_status: None,
+            expected_size: None,
+            expected_modified_unix_ms: None,
+            delete_batch_id: None,
         };
         match round_trip(&del) {
             SyncMessage::FileDelete {
                 task_id,
                 relative_path,
+                expected_kind,
+                expected_hash,
+                expected_hash_status,
+                expected_size,
+                expected_modified_unix_ms,
+                delete_batch_id,
             } => {
                 assert_eq!(task_id, "t");
                 assert_eq!(relative_path, "old.txt");
+                assert_eq!(expected_kind, None);
+                assert_eq!(expected_hash, None);
+                assert_eq!(expected_hash_status, None);
+                assert_eq!(expected_size, None);
+                assert_eq!(expected_modified_unix_ms, None);
+                assert_eq!(delete_batch_id, None);
             }
             other => panic!("unexpected: {:?}", other),
         }

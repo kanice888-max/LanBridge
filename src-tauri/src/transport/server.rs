@@ -5,23 +5,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use crate::core::model::{
     EntryKind, FileSnapshot, HashStatus, HistoryEntry, LogEntry, LogLevel, SyncBaseline,
 };
+use crate::core::path_safety::safe_join;
 use crate::history::store::HistoryStore;
 use crate::pairing::{DeviceIdentity, PublicIdentity};
 use crate::state::{db, repository};
 use crate::transport::connection::{self, auth_payload};
 use crate::transport::protocol::{
-    RemoteFileState, TRANSFER_PROGRESS_INTERVAL_BYTES, TRANSFER_V1_ACK_INTERVAL_BYTES,
-    TRANSFER_V1_CHUNK_SIZE, TRANSFER_V2_CHUNK_SIZE,
+    self, RemoteFileState, TRANSFER_PROGRESS_INTERVAL_BYTES, TRANSFER_V1_ACK_INTERVAL_BYTES,
+    TRANSFER_V1_CHUNK_SIZE, TRANSFER_V2_ACK_INTERVAL_BYTES, TRANSFER_V2_CHUNK_SIZE,
 };
 
 /// Maps negotiated sync task IDs to the local root that should receive files.
@@ -44,6 +45,7 @@ pub struct TaskRootRegistry {
 /// before the final rename to avoid Windows file-lock errors.
 #[derive(Debug)]
 struct IncomingTransfer {
+    transfer_id: String,
     partial_path: PathBuf,
     final_path: PathBuf,
     file_hash: String,
@@ -57,6 +59,28 @@ struct IncomingTransfer {
     ack_every_chunk: bool,
     protocol_version: &'static str,
     file: std::fs::File,
+    timing: V2ReceiveTiming,
+}
+
+#[derive(Debug, Default)]
+struct V2ReceiveTiming {
+    payload_read_ms: u64,
+    file_write_ms: u64,
+    hash_ms: u64,
+    flush_ms: u64,
+    rename_ms: u64,
+    ack_write_ms: u64,
+    chunk_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct V2ServeTiming {
+    read_ms: u64,
+    hash_ms: u64,
+    socket_write_ms: u64,
+    chunk_socket_write_ms: u64,
+    ack_wait_ms: u64,
+    chunk_count: u64,
 }
 
 enum IncomingChunkAck {
@@ -65,14 +89,126 @@ enum IncomingChunkAck {
     Checkpoint(u64),
 }
 
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn update_incoming_timing(
+    task_roots: &TaskRootRegistry,
+    task_id: &str,
+    relative_path: &str,
+    update: impl FnOnce(&mut V2ReceiveTiming),
+) {
+    if let Ok(mut incoming) = task_roots.incoming.lock() {
+        if let Some(transfer) = incoming.get_mut(&transfer_key(task_id, relative_path)) {
+            update(&mut transfer.timing);
+        }
+    }
+}
+
+fn log_v2_receive_timing_summary(
+    transfer_id: &str,
+    task_id: &str,
+    relative_path: &str,
+    total_bytes: u64,
+    elapsed_ms: u64,
+    timing: &V2ReceiveTiming,
+    success: bool,
+    error: Option<&str>,
+) {
+    tracing::info!(
+        transfer_timing_summary = true,
+        transfer_id = %transfer_id,
+        task_id = %task_id,
+        relative_path = %relative_path,
+        direction = "receive",
+        protocol = "v2_binary",
+        success = success,
+        error = error.unwrap_or(""),
+        bytes_total = total_bytes,
+        elapsed_ms = elapsed_ms,
+        ack_interval_bytes = TRANSFER_V2_ACK_INTERVAL_BYTES,
+        payload_read_ms = timing.payload_read_ms,
+        file_write_ms = timing.file_write_ms,
+        hash_ms = timing.hash_ms,
+        flush_ms = timing.flush_ms,
+        rename_ms = timing.rename_ms,
+        ack_write_ms = timing.ack_write_ms,
+        chunk_count = timing.chunk_count,
+    );
+}
+
+fn log_v2_serve_timing_summary(
+    transfer_id: &str,
+    task_id: &str,
+    relative_path: &str,
+    total_bytes: u64,
+    elapsed_ms: u64,
+    timing: &V2ServeTiming,
+    success: bool,
+    error: Option<&str>,
+) {
+    let avg_chunk_write_ms = if timing.chunk_count > 0 {
+        timing.chunk_socket_write_ms as f64 / timing.chunk_count as f64
+    } else {
+        0.0
+    };
+    tracing::info!(
+        transfer_timing_summary = true,
+        transfer_id = %transfer_id,
+        task_id = %task_id,
+        relative_path = %relative_path,
+        direction = "serve",
+        protocol = "v2_binary",
+        success = success,
+        error = error.unwrap_or(""),
+        bytes_total = total_bytes,
+        elapsed_ms = elapsed_ms,
+        ack_interval_bytes = TRANSFER_V2_ACK_INTERVAL_BYTES,
+        read_ms = timing.read_ms,
+        hash_ms = timing.hash_ms,
+        socket_write_ms = timing.socket_write_ms,
+        ack_wait_ms = timing.ack_wait_ms,
+        chunk_count = timing.chunk_count,
+        avg_chunk_write_ms = format_args!("{:.2}", avg_chunk_write_ms),
+    );
+}
+
+async fn write_v2_stream_ack(
+    writer: &mut (impl AsyncWrite + Unpin),
+    task_roots: &TaskRootRegistry,
+    ack: protocol::SyncMessage,
+) -> Result<()> {
+    let timing_key = match &ack {
+        protocol::SyncMessage::FileStreamAckV2 {
+            task_id,
+            relative_path,
+            ..
+        } => Some((task_id.clone(), relative_path.clone())),
+        _ => None,
+    };
+    let encoded = protocol::encode_message(&ack)?;
+    let ack_start = Instant::now();
+    writer.write_all(&encoded).await?;
+    let ack_ms = elapsed_ms(ack_start);
+    if let Some((task_id, relative_path)) = timing_key {
+        update_incoming_timing(task_roots, &task_id, &relative_path, |timing| {
+            timing.ack_write_ms += ack_ms;
+        });
+    }
+    Ok(())
+}
+
 fn record_server_transfer_start(
     task_id: &str,
     relative_path: &str,
     direction: &str,
     total_bytes: u64,
     protocol_version: &str,
-) {
+) -> String {
+    let transfer_id = connection::new_transfer_id();
     connection::record_transfer_progress(connection::TransferProgress {
+        transfer_id: transfer_id.clone(),
         task_id: task_id.to_string(),
         relative_path: relative_path.to_string(),
         direction: direction.to_string(),
@@ -82,17 +218,18 @@ fn record_server_transfer_start(
         mbps: 0.0,
         finished: false,
         protocol_version: protocol_version.to_string(),
+        finished_at_unix_ms: None,
     });
+    transfer_id
 }
 
 struct ServerTransferProgressGuard {
-    task_id: String,
-    relative_path: String,
+    transfer_id: String,
 }
 
 impl Drop for ServerTransferProgressGuard {
     fn drop(&mut self) {
-        connection::finish_transfer_progress(&self.task_id, &self.relative_path);
+        connection::finish_transfer_progress(&self.transfer_id);
     }
 }
 
@@ -103,17 +240,14 @@ fn server_transfer_progress_guard(
     total_bytes: u64,
     protocol_version: &str,
 ) -> ServerTransferProgressGuard {
-    record_server_transfer_start(
+    let transfer_id = record_server_transfer_start(
         task_id,
         relative_path,
         direction,
         total_bytes,
         protocol_version,
     );
-    ServerTransferProgressGuard {
-        task_id: task_id.to_string(),
-        relative_path: relative_path.to_string(),
-    }
+    ServerTransferProgressGuard { transfer_id }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -136,9 +270,7 @@ pub struct PendingTaskInvite {
 
 impl TaskRootRegistry {
     pub fn new() -> Self {
-        let registry = Self::default();
-        registry.set_auto_accept_task_invites(true);
-        registry
+        Self::default()
     }
 
     pub fn register(&self, task_id: impl Into<String>, root: impl AsRef<Path>) -> Result<()> {
@@ -188,10 +320,11 @@ impl TaskRootRegistry {
             incoming.remove(&key)
         };
         if let Some(transfer) = transfer {
+            let transfer_id = transfer.transfer_id.clone();
             drop(transfer.file);
             let _ = std::fs::remove_file(&transfer.partial_path);
+            connection::finish_transfer_progress(&transfer_id);
         }
-        connection::finish_transfer_progress(task_id, relative_path);
         Ok(())
     }
 
@@ -203,6 +336,21 @@ impl TaskRootRegistry {
     fn trusted_peer(&self, device_id: &str) -> Option<PublicIdentity> {
         let peers = self.trusted_peers.lock().unwrap();
         peers.get(device_id).cloned()
+    }
+
+    fn ensure_trusted_peer_key_matches(&self, device_id: &str, public_key: &[u8]) -> Result<()> {
+        if public_key.is_empty() {
+            return Ok(());
+        }
+        if let Some(existing) = self.trusted_peer(device_id) {
+            if existing.public_key != public_key {
+                anyhow::bail!(
+                    "trusted peer public key changed for device {}; reject and re-pair before accepting this invite",
+                    device_id
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn set_local_identity(&self, identity: PublicIdentity) {
@@ -244,15 +392,18 @@ impl TaskRootRegistry {
     ) -> Result<PendingTaskInvite> {
         let local_path = local_path.as_ref().to_path_buf();
         validate_invite_local_path(&local_path)?;
-        let task_id = {
+        let invite_snapshot = {
             let invites = self.task_invites.lock().unwrap();
             invites
                 .get(invite_id)
                 .ok_or_else(|| anyhow::anyhow!("task invite not found"))?
-                .task_id
                 .clone()
         };
-        self.register(&task_id, &local_path)?;
+        self.ensure_trusted_peer_key_matches(
+            &invite_snapshot.requester_device_id,
+            &invite_snapshot.requester_public_key,
+        )?;
+        self.register(&invite_snapshot.task_id, &local_path)?;
 
         let mut invites = self.task_invites.lock().unwrap();
         let invite = invites
@@ -297,6 +448,7 @@ impl TaskRootRegistry {
         requester_path: Option<String>,
         proposed_role: String,
     ) -> Result<PendingTaskInvite> {
+        self.ensure_trusted_peer_key_matches(&requester_device_id, &requester_public_key)?;
         let invite = PendingTaskInvite {
             invite_id: invite_id.clone(),
             task_id,
@@ -731,7 +883,11 @@ async fn handle_connection(
                         let response = protocol::SyncMessage::TransferReady {
                             selected_version: selected,
                             max_chunk_size: 4 * 1024 * 1024,
-                            ack_interval_bytes: 16 * 1024 * 1024,
+                            ack_interval_bytes: if selected == 2 {
+                                TRANSFER_V2_ACK_INTERVAL_BYTES
+                            } else {
+                                TRANSFER_V1_ACK_INTERVAL_BYTES
+                            },
                         };
                         writer
                             .write_all(&protocol::encode_message(&response)?)
@@ -744,11 +900,20 @@ async fn handle_connection(
                     protocol::SyncMessage::TransferCancel {
                         task_id,
                         relative_path,
+                        direction,
                     } => {
-                        connection::cancel_transfer(&task_id, &relative_path);
+                        connection::cancel_active_transfer(
+                            &task_id,
+                            &relative_path,
+                            direction.as_deref(),
+                        );
                         let ack =
                             match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                task_roots.cancel_incoming_transfer(&task_id, &relative_path)
+                                if direction.as_deref() == Some("serve") {
+                                    Ok(())
+                                } else {
+                                    task_roots.cancel_incoming_transfer(&task_id, &relative_path)
+                                }
                             }) {
                                 Ok(()) => protocol::SyncMessage::FileAck {
                                     task_id,
@@ -937,9 +1102,21 @@ async fn handle_connection(
                         bytes,
                         ack: wants_ack,
                     } => {
+                        let payload_start = Instant::now();
                         let payload =
                             match protocol::read_v2_payload(&mut reader, bytes as usize).await {
-                                Ok(p) => p,
+                                Ok(p) => {
+                                    let payload_ms = elapsed_ms(payload_start);
+                                    update_incoming_timing(
+                                        &task_roots,
+                                        &task_id,
+                                        &relative_path,
+                                        |timing| {
+                                            timing.payload_read_ms += payload_ms;
+                                        },
+                                    );
+                                    p
+                                }
                                 Err(e) => {
                                     let ack = protocol::SyncMessage::FileStreamAckV2 {
                                         task_id,
@@ -948,20 +1125,29 @@ async fn handle_connection(
                                         success: false,
                                         error: Some(e.to_string()),
                                     };
-                                    writer.write_all(&protocol::encode_message(&ack)?).await?;
+                                    write_v2_stream_ack(&mut writer, &task_roots, ack).await?;
                                     continue;
                                 }
                             };
-                        let ack_result =
-                            require_authenticated(&authenticated_device_id).and_then(|_| {
-                                append_incoming_chunk(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    offset,
-                                    &payload,
-                                )
-                            });
+                        let ack_result = match require_authenticated(&authenticated_device_id) {
+                            Ok(()) => {
+                                let task_roots_for_write = task_roots.clone();
+                                let task_id_for_write = task_id.clone();
+                                let relative_path_for_write = relative_path.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    append_incoming_chunk(
+                                        &task_roots_for_write,
+                                        &task_id_for_write,
+                                        &relative_path_for_write,
+                                        offset,
+                                        &payload,
+                                    )
+                                })
+                                .await
+                                .map_err(|e| anyhow::anyhow!("v2 receive worker failed: {}", e))?
+                            }
+                            Err(e) => Err(e),
+                        };
                         match ack_result {
                             Ok(received) if wants_ack => {
                                 let received_bytes = match received {
@@ -977,7 +1163,7 @@ async fn handle_connection(
                                     success: true,
                                     error: None,
                                 };
-                                writer.write_all(&protocol::encode_message(&ack)?).await?;
+                                write_v2_stream_ack(&mut writer, &task_roots, ack).await?;
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -988,7 +1174,7 @@ async fn handle_connection(
                                     success: false,
                                     error: Some(e.to_string()),
                                 };
-                                writer.write_all(&protocol::encode_message(&ack)?).await?;
+                                write_v2_stream_ack(&mut writer, &task_roots, ack).await?;
                             }
                         }
                     }
@@ -1021,7 +1207,7 @@ async fn handle_connection(
                                     error: Some(e.to_string()),
                                 },
                             };
-                        writer.write_all(&protocol::encode_message(&ack)?).await?;
+                        write_v2_stream_ack(&mut writer, &task_roots, ack).await?;
                     }
                     protocol::SyncMessage::FileDownloadRequestV2 {
                         task_id,
@@ -1144,6 +1330,12 @@ async fn handle_connection(
                     protocol::SyncMessage::FileDelete {
                         task_id,
                         relative_path,
+                        expected_kind,
+                        expected_hash,
+                        expected_hash_status,
+                        expected_size,
+                        expected_modified_unix_ms,
+                        delete_batch_id,
                     } => {
                         let ack =
                             match require_authenticated(&authenticated_device_id).and_then(|_| {
@@ -1151,6 +1343,12 @@ async fn handle_connection(
                                     &task_roots,
                                     &task_id,
                                     &relative_path,
+                                    expected_kind,
+                                    expected_hash.as_deref(),
+                                    expected_hash_status,
+                                    expected_size,
+                                    expected_modified_unix_ms,
+                                    delete_batch_id.as_deref(),
                                 )
                             }) {
                                 Ok(()) => protocol::SyncMessage::FileAck {
@@ -1396,7 +1594,7 @@ fn write_incoming_file(
     if data.len() as u64 != total_bytes {
         anyhow::bail!("file size mismatch");
     }
-    ensure_transfer_not_deferred(task_id, relative_path)?;
+    ensure_transfer_not_deferred(task_id, relative_path, "receive")?;
     let actual_hash = blake3::hash(data).to_hex().to_string();
     if actual_hash != file_hash {
         anyhow::bail!("file hash mismatch");
@@ -1421,8 +1619,8 @@ fn transfer_key(task_id: &str, relative_path: &str) -> String {
     format!("{}\n{}", task_id, relative_path)
 }
 
-fn ensure_transfer_not_deferred(task_id: &str, relative_path: &str) -> Result<()> {
-    if connection::is_transfer_deferred(task_id, relative_path) {
+fn ensure_transfer_not_deferred(task_id: &str, relative_path: &str, direction: &str) -> Result<()> {
+    if connection::is_transfer_deferred(task_id, relative_path, direction) {
         anyhow::bail!("transfer deferred by user");
     }
     Ok(())
@@ -1435,8 +1633,8 @@ fn start_incoming_chunked_file(
     file_hash: &str,
     total_bytes: u64,
 ) -> Result<()> {
-    ensure_transfer_not_deferred(task_id, relative_path)?;
-    connection::clear_transfer_cancel(task_id, relative_path);
+    ensure_transfer_not_deferred(task_id, relative_path, "receive")?;
+    connection::clear_transfer_cancel(task_id, relative_path, Some("receive"));
     let root = task_roots
         .root_for(task_id)
         .ok_or_else(|| anyhow::anyhow!("task root not registered"))?;
@@ -1454,9 +1652,11 @@ fn start_incoming_chunked_file(
         bytes_total = total_bytes,
         "incoming chunked file start"
     );
-    record_server_transfer_start(task_id, relative_path, "receive", total_bytes, "v1_json");
+    let transfer_id =
+        record_server_transfer_start(task_id, relative_path, "receive", total_bytes, "v1_json");
 
     let transfer = IncomingTransfer {
+        transfer_id,
         partial_path,
         final_path,
         file_hash: file_hash.to_string(),
@@ -1470,6 +1670,7 @@ fn start_incoming_chunked_file(
         ack_every_chunk: !file_hash.is_empty(),
         protocol_version: "v1_json",
         file,
+        timing: V2ReceiveTiming::default(),
     };
     let mut incoming = task_roots.incoming.lock().unwrap();
     incoming.insert(transfer_key(task_id, relative_path), transfer);
@@ -1486,27 +1687,45 @@ fn append_incoming_chunk(
     offset: u64,
     data: &[u8],
 ) -> Result<IncomingChunkAck> {
-    if connection::is_transfer_cancelled(task_id, relative_path) {
+    if connection::is_transfer_cancelled(task_id, relative_path, "receive") {
         let _ = task_roots.cancel_incoming_transfer(task_id, relative_path);
         anyhow::bail!("transfer cancelled");
     }
 
     let key = transfer_key(task_id, relative_path);
     let mut incoming = task_roots.incoming.lock().unwrap();
+    let mismatch_partial_path = {
+        let transfer = incoming
+            .get_mut(&key)
+            .ok_or_else(|| anyhow::anyhow!("chunked transfer not started"))?;
+        if transfer.written_bytes != offset {
+            Some(transfer.partial_path.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(partial_path) = mismatch_partial_path {
+        incoming.remove(&key);
+        drop(incoming);
+        let _ = std::fs::remove_file(partial_path);
+        anyhow::bail!("unexpected chunk offset");
+    }
     let transfer = incoming
         .get_mut(&key)
         .ok_or_else(|| anyhow::anyhow!("chunked transfer not started"))?;
-    if transfer.written_bytes != offset {
-        anyhow::bail!("unexpected chunk offset");
-    }
 
     if transfer.first_byte_time.is_none() {
         transfer.first_byte_time = Some(Instant::now());
     }
 
     use std::io::Write;
+    let write_start = Instant::now();
     transfer.file.write_all(data)?;
+    transfer.timing.file_write_ms += elapsed_ms(write_start);
+    let hash_start = Instant::now();
     transfer.hasher.update(data);
+    transfer.timing.hash_ms += elapsed_ms(hash_start);
+    transfer.timing.chunk_count += 1;
     transfer.written_bytes += data.len() as u64;
     if transfer.written_bytes > transfer.total_bytes {
         anyhow::bail!("chunked transfer exceeded expected size");
@@ -1519,7 +1738,11 @@ fn append_incoming_chunk(
     let should_ack = transfer.written_bytes >= transfer.next_ack_at
         || transfer.written_bytes >= transfer.total_bytes;
     if should_ack {
-        transfer.next_ack_at += TRANSFER_V1_ACK_INTERVAL_BYTES;
+        transfer.next_ack_at += if transfer.protocol_version == "v2_binary" {
+            TRANSFER_V2_ACK_INTERVAL_BYTES
+        } else {
+            TRANSFER_V1_ACK_INTERVAL_BYTES
+        };
     }
 
     if transfer.written_bytes >= transfer.next_progress_at {
@@ -1539,10 +1762,15 @@ fn append_incoming_chunk(
             elapsed_ms = elapsed_ms,
             mbps = format_args!("{:.1}", mbps),
             protocol_version = transfer.protocol_version,
-            ack_interval_bytes = TRANSFER_V1_ACK_INTERVAL_BYTES,
+            ack_interval_bytes = if transfer.protocol_version == "v2_binary" {
+                TRANSFER_V2_ACK_INTERVAL_BYTES
+            } else {
+                TRANSFER_V1_ACK_INTERVAL_BYTES
+            },
             "transfer progress"
         );
         connection::record_throttled(
+            &transfer.transfer_id,
             task_id,
             relative_path,
             "receive",
@@ -1577,7 +1805,7 @@ fn finish_incoming_chunked_file(
             .ok_or_else(|| anyhow::anyhow!("chunked transfer not started"))?
     };
     if transfer.written_bytes != transfer.total_bytes {
-        connection::finish_transfer_progress(task_id, relative_path);
+        connection::finish_transfer_progress(&transfer.transfer_id);
         anyhow::bail!("chunked transfer size mismatch");
     }
     let expected_hash = end_hash
@@ -1586,7 +1814,7 @@ fn finish_incoming_chunked_file(
     let actual_hash = transfer.hasher.finalize().to_hex().to_string();
     if actual_hash != expected_hash {
         let _ = std::fs::remove_file(&transfer.partial_path);
-        connection::finish_transfer_progress(task_id, relative_path);
+        connection::finish_transfer_progress(&transfer.transfer_id);
         anyhow::bail!("file hash mismatch");
     }
     transfer.file.flush()?;
@@ -1619,7 +1847,7 @@ fn finish_incoming_chunked_file(
         &transfer.final_path,
         &effective_hash,
     )?;
-    connection::finish_transfer_progress(task_id, relative_path);
+    connection::finish_transfer_progress(&transfer.transfer_id);
     Ok(())
 }
 
@@ -1629,8 +1857,8 @@ fn start_incoming_v2(
     relative_path: &str,
     total_bytes: u64,
 ) -> Result<()> {
-    ensure_transfer_not_deferred(task_id, relative_path)?;
-    connection::clear_transfer_cancel(task_id, relative_path);
+    ensure_transfer_not_deferred(task_id, relative_path, "receive")?;
+    connection::clear_transfer_cancel(task_id, relative_path, Some("receive"));
     let root = task_roots
         .root_for(task_id)
         .ok_or_else(|| anyhow::anyhow!("task root not registered"))?;
@@ -1649,9 +1877,11 @@ fn start_incoming_v2(
         protocol_version = "v2",
         "incoming v2 file stream start"
     );
-    record_server_transfer_start(task_id, relative_path, "receive", total_bytes, "v2_binary");
+    let transfer_id =
+        record_server_transfer_start(task_id, relative_path, "receive", total_bytes, "v2_binary");
 
     let transfer = IncomingTransfer {
+        transfer_id,
         partial_path,
         final_path,
         file_hash: String::new(),
@@ -1661,10 +1891,11 @@ fn start_incoming_v2(
         start_time: Instant::now(),
         first_byte_time: None,
         next_progress_at: TRANSFER_PROGRESS_INTERVAL_BYTES,
-        next_ack_at: TRANSFER_V1_ACK_INTERVAL_BYTES,
+        next_ack_at: TRANSFER_V2_ACK_INTERVAL_BYTES,
         ack_every_chunk: false,
         protocol_version: "v2_binary",
         file,
+        timing: V2ReceiveTiming::default(),
     };
     let mut incoming = task_roots.incoming.lock().unwrap();
     incoming.insert(transfer_key(task_id, relative_path), transfer);
@@ -1686,18 +1917,68 @@ fn finish_incoming_v2(
             .ok_or_else(|| anyhow::anyhow!("v2 stream not started"))?
     };
     if transfer.written_bytes != transfer.total_bytes {
-        connection::finish_transfer_progress(task_id, relative_path);
+        connection::finish_transfer_progress(&transfer.transfer_id);
+        log_v2_receive_timing_summary(
+            &transfer.transfer_id,
+            task_id,
+            relative_path,
+            transfer.total_bytes,
+            elapsed_ms(transfer.start_time),
+            &transfer.timing,
+            false,
+            Some("v2 stream size mismatch"),
+        );
         anyhow::bail!("v2 stream size mismatch");
     }
+    let hash_start = Instant::now();
     let actual_hash = transfer.hasher.finalize().to_hex().to_string();
+    transfer.timing.hash_ms += elapsed_ms(hash_start);
     if actual_hash != file_hash {
         let _ = std::fs::remove_file(&transfer.partial_path);
-        connection::finish_transfer_progress(task_id, relative_path);
+        connection::finish_transfer_progress(&transfer.transfer_id);
+        log_v2_receive_timing_summary(
+            &transfer.transfer_id,
+            task_id,
+            relative_path,
+            transfer.total_bytes,
+            elapsed_ms(transfer.start_time),
+            &transfer.timing,
+            false,
+            Some("v2 file hash mismatch"),
+        );
         anyhow::bail!("v2 file hash mismatch");
     }
-    transfer.file.flush()?;
+    let flush_start = Instant::now();
+    if let Err(e) = transfer.file.flush() {
+        log_v2_receive_timing_summary(
+            &transfer.transfer_id,
+            task_id,
+            relative_path,
+            transfer.total_bytes,
+            elapsed_ms(transfer.start_time),
+            &transfer.timing,
+            false,
+            Some("v2 flush failed"),
+        );
+        return Err(e.into());
+    }
+    transfer.timing.flush_ms += elapsed_ms(flush_start);
     drop(transfer.file);
-    std::fs::rename(&transfer.partial_path, &transfer.final_path)?;
+    let rename_start = Instant::now();
+    if let Err(e) = std::fs::rename(&transfer.partial_path, &transfer.final_path) {
+        log_v2_receive_timing_summary(
+            &transfer.transfer_id,
+            task_id,
+            relative_path,
+            transfer.total_bytes,
+            elapsed_ms(transfer.start_time),
+            &transfer.timing,
+            false,
+            Some("v2 rename failed"),
+        );
+        return Err(e.into());
+    }
+    transfer.timing.rename_ms += elapsed_ms(rename_start);
 
     let total_elapsed_ms = transfer.start_time.elapsed().as_millis() as u64;
     let total_mbps = if total_elapsed_ms > 0 {
@@ -1716,6 +1997,16 @@ fn finish_incoming_v2(
         protocol_version = transfer.protocol_version,
         "transfer complete"
     );
+    log_v2_receive_timing_summary(
+        &transfer.transfer_id,
+        task_id,
+        relative_path,
+        transfer.total_bytes,
+        total_elapsed_ms,
+        &transfer.timing,
+        true,
+        None,
+    );
 
     record_received_file(
         task_roots,
@@ -1724,7 +2015,7 @@ fn finish_incoming_v2(
         &transfer.final_path,
         file_hash,
     )?;
-    connection::finish_transfer_progress(task_id, relative_path);
+    connection::finish_transfer_progress(&transfer.transfer_id);
     Ok(())
 }
 
@@ -1735,8 +2026,8 @@ async fn send_file_download_v2(
     reader: &mut tokio::net::tcp::OwnedReadHalf,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<()> {
-    use crate::transport::protocol::{encode_message, write_v2_chunk, SyncMessage};
-
+    let transfer_start = Instant::now();
+    let mut timing = V2ServeTiming::default();
     let root = task_roots
         .root_for(task_id)
         .ok_or_else(|| anyhow::anyhow!("task root not registered"))?;
@@ -1744,14 +2035,55 @@ async fn send_file_download_v2(
     if !source.is_file() {
         anyhow::bail!("requested file not found");
     }
-    ensure_transfer_not_deferred(task_id, relative_path)?;
-    connection::clear_transfer_cancel(task_id, relative_path);
+    ensure_transfer_not_deferred(task_id, relative_path, "serve")?;
+    connection::clear_transfer_cancel(task_id, relative_path, Some("serve"));
 
     let before_hash = crate::transport::connection::source_file_state(&source)?;
     let total_bytes = before_hash.len;
     let _progress_guard =
         server_transfer_progress_guard(task_id, relative_path, "serve", total_bytes, "v2_binary");
+    let result = send_file_download_v2_inner(
+        task_id,
+        relative_path,
+        reader,
+        writer,
+        &source,
+        &before_hash,
+        total_bytes,
+        &_progress_guard.transfer_id,
+        &mut timing,
+        transfer_start,
+    )
+    .await;
+    let elapsed_ms = elapsed_ms(transfer_start);
+    let error = result.as_ref().err().map(|e| e.to_string());
+    log_v2_serve_timing_summary(
+        &_progress_guard.transfer_id,
+        task_id,
+        relative_path,
+        total_bytes,
+        elapsed_ms,
+        &timing,
+        result.is_ok(),
+        error.as_deref(),
+    );
+    result
+}
 
+async fn send_file_download_v2_inner(
+    task_id: &str,
+    relative_path: &str,
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    source: &Path,
+    before_hash: &crate::transport::connection::SourceFileState,
+    total_bytes: u64,
+    transfer_id: &str,
+    timing: &mut V2ServeTiming,
+    first_byte: Instant,
+) -> Result<()> {
+    use crate::transport::protocol::{encode_message, write_v2_chunk, SyncMessage};
+    let write_start = Instant::now();
     writer
         .write_all(&encode_message(&SyncMessage::FileStreamStartV2 {
             task_id: task_id.to_string(),
@@ -1759,22 +2091,26 @@ async fn send_file_download_v2(
             total_bytes,
         })?)
         .await?;
+    timing.socket_write_ms += elapsed_ms(write_start);
 
     let mut file = std::fs::File::open(&source)?;
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0u64;
-    let mut next_ack_at = TRANSFER_V1_ACK_INTERVAL_BYTES;
+    let mut next_ack_at = TRANSFER_V2_ACK_INTERVAL_BYTES;
     let mut next_progress_at = TRANSFER_PROGRESS_INTERVAL_BYTES;
-    let first_byte = Instant::now();
     let mut buf = vec![0u8; TRANSFER_V2_CHUNK_SIZE];
     loop {
-        connection::ensure_transfer_not_cancelled(task_id, relative_path)?;
+        connection::ensure_transfer_not_cancelled(task_id, relative_path, "serve")?;
+        let read_start = Instant::now();
         let read = file.read(&mut buf)?;
+        timing.read_ms += elapsed_ms(read_start);
         if read == 0 {
             break;
         }
         let chunk = &buf[..read];
+        let hash_start = Instant::now();
         hasher.update(chunk);
+        timing.hash_ms += elapsed_ms(hash_start);
         let need_ack = offset + read as u64 >= next_ack_at || offset + read as u64 >= total_bytes;
         let header = SyncMessage::FileChunkBinaryV2 {
             task_id: task_id.to_string(),
@@ -1783,7 +2119,12 @@ async fn send_file_download_v2(
             bytes: read as u32,
             ack: need_ack,
         };
+        let write_start = Instant::now();
         write_v2_chunk(writer, &header, chunk).await?;
+        let write_ms = elapsed_ms(write_start);
+        timing.socket_write_ms += write_ms;
+        timing.chunk_socket_write_ms += write_ms;
+        timing.chunk_count += 1;
         offset += read as u64;
         if offset >= next_progress_at {
             let elapsed_ms = first_byte.elapsed().as_millis() as u64;
@@ -1801,9 +2142,11 @@ async fn send_file_download_v2(
                 elapsed_ms = elapsed_ms,
                 mbps = format_args!("{:.1}", mbps),
                 protocol_version = "v2",
+                ack_interval_bytes = TRANSFER_V2_ACK_INTERVAL_BYTES,
                 "transfer progress"
             );
             connection::record_throttled(
+                transfer_id,
                 task_id,
                 relative_path,
                 "serve",
@@ -1816,6 +2159,7 @@ async fn send_file_download_v2(
             next_progress_at += TRANSFER_PROGRESS_INTERVAL_BYTES;
         }
         if need_ack {
+            let ack_start = Instant::now();
             match tokio::time::timeout(Duration::from_secs(10), read_server_message(reader)).await {
                 Ok(Ok(SyncMessage::FileStreamAckV2 { success: true, .. })) => {}
                 Ok(Ok(SyncMessage::FileStreamAckV2 {
@@ -1831,12 +2175,14 @@ async fn send_file_download_v2(
                 Ok(Err(e)) => anyhow::bail!("v2 download ack read failed: {}", e),
                 Err(_) => anyhow::bail!("v2 download ack timed out"),
             }
-            next_ack_at += TRANSFER_V1_ACK_INTERVAL_BYTES;
+            timing.ack_wait_ms += elapsed_ms(ack_start);
+            next_ack_at += TRANSFER_V2_ACK_INTERVAL_BYTES;
         }
     }
 
     crate::transport::connection::ensure_source_file_unchanged(&source, &before_hash)?;
     let file_hash = hasher.finalize().to_hex().to_string();
+    let write_start = Instant::now();
     writer
         .write_all(&encode_message(&SyncMessage::FileStreamEndV2 {
             task_id: task_id.to_string(),
@@ -1844,6 +2190,7 @@ async fn send_file_download_v2(
             file_hash,
         })?)
         .await?;
+    timing.socket_write_ms += elapsed_ms(write_start);
     Ok(())
 }
 
@@ -1863,8 +2210,8 @@ async fn send_file_download(
     if !source.is_file() {
         anyhow::bail!("requested file not found");
     }
-    ensure_transfer_not_deferred(task_id, relative_path)?;
-    connection::clear_transfer_cancel(task_id, relative_path);
+    ensure_transfer_not_deferred(task_id, relative_path, "serve")?;
+    connection::clear_transfer_cancel(task_id, relative_path, Some("serve"));
 
     let before_hash = crate::transport::connection::source_file_state(&source)?;
     let total_bytes = before_hash.len;
@@ -1889,7 +2236,7 @@ async fn send_file_download(
     let mut next_progress_at = TRANSFER_PROGRESS_INTERVAL_BYTES;
     let mut buf = vec![0u8; TRANSFER_V1_CHUNK_SIZE];
     loop {
-        connection::ensure_transfer_not_cancelled(task_id, relative_path)?;
+        connection::ensure_transfer_not_cancelled(task_id, relative_path, "serve")?;
         let read = file.read(&mut buf)?;
         if read == 0 {
             break;
@@ -1924,6 +2271,7 @@ async fn send_file_download(
                 "transfer progress"
             );
             connection::record_throttled(
+                &_progress_guard.transfer_id,
                 task_id,
                 relative_path,
                 "serve",
@@ -1971,6 +2319,7 @@ async fn send_file_download(
 }
 
 fn scan_task_root(task_roots: &TaskRootRegistry, task_id: &str) -> Result<Vec<RemoteFileState>> {
+    let scan_start = Instant::now();
     let root = task_roots
         .root_for(task_id)
         .ok_or_else(|| anyhow::anyhow!("task root not registered"))?;
@@ -1978,6 +2327,11 @@ fn scan_task_root(task_roots: &TaskRootRegistry, task_id: &str) -> Result<Vec<Re
     if !root.exists() {
         return Ok(files);
     }
+    let mut file_count = 0usize;
+    let mut dir_count = 0usize;
+    let mut hashed_files = 0usize;
+    let mut skipped_large_files = 0usize;
+    let mut large_cache_hits = 0usize;
 
     for entry in walkdir::WalkDir::new(&root)
         .into_iter()
@@ -2007,17 +2361,35 @@ fn scan_task_root(task_roots: &TaskRootRegistry, task_id: &str) -> Result<Vec<Re
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
         let (blake3_hash, hash_status) = if is_file {
-            remote_scan_hash_state(
+            let size = metadata.len() as i64;
+            let hash_state = remote_scan_hash_state(
                 task_roots,
                 task_id,
                 &relative_path,
                 path,
-                metadata.len() as i64,
+                size,
                 modified_unix_ms,
-            )?
+            )?;
+            match hash_state.1 {
+                HashStatus::Verified => {
+                    if size > crate::core::scanner::EAGER_HASH_LIMIT {
+                        large_cache_hits += 1;
+                    } else {
+                        hashed_files += 1;
+                    }
+                }
+                HashStatus::UnverifiedLargeFile => skipped_large_files += 1,
+                HashStatus::Unavailable => {}
+            }
+            hash_state
         } else {
             (None, HashStatus::Unavailable)
         };
+        if is_file {
+            file_count += 1;
+        } else {
+            dir_count += 1;
+        }
         files.push(RemoteFileState {
             relative_path,
             kind: if is_dir {
@@ -2031,6 +2403,17 @@ fn scan_task_root(task_roots: &TaskRootRegistry, task_id: &str) -> Result<Vec<Re
             modified_unix_ms,
         });
     }
+    tracing::info!(
+        remote_scan_summary = true,
+        task_id,
+        entries = files.len(),
+        files = file_count,
+        dirs = dir_count,
+        hashed_files,
+        skipped_large_files,
+        cache_hits = large_cache_hits,
+        elapsed_ms = scan_start.elapsed().as_millis() as u64,
+    );
     Ok(files)
 }
 
@@ -2064,6 +2447,7 @@ fn remote_scan_hash_state(
         {
             return Ok((Some(hash), HashStatus::Verified));
         }
+        return Ok((None, HashStatus::UnverifiedLargeFile));
     }
     Ok((
         Some(crate::core::scanner::hash_file(path)?),
@@ -2118,22 +2502,91 @@ fn move_incoming_delete_to_history(
     task_roots: &TaskRootRegistry,
     task_id: &str,
     relative_path: &str,
+    expected_kind: Option<EntryKind>,
+    expected_hash: Option<&str>,
+    expected_hash_status: Option<HashStatus>,
+    expected_size: Option<i64>,
+    expected_modified_unix_ms: Option<i64>,
+    delete_batch_id: Option<&str>,
 ) -> Result<()> {
     let root = task_roots
         .root_for(task_id)
         .ok_or_else(|| anyhow::anyhow!("task root not registered"))?;
     let target = safe_join(&root, relative_path)?;
     if !target.exists() {
+        record_received_delete_missing(task_roots, task_id, relative_path)?;
         return Ok(());
     }
+    validate_delete_expectation(
+        &target,
+        expected_kind,
+        expected_hash,
+        expected_hash_status,
+        expected_size,
+        expected_modified_unix_ms,
+    )?;
 
     let history = HistoryStore::new(&root);
     history.check_storage_blocked(now_ms())?;
 
-    let mut entry = history.move_to_trash(&target, relative_path, now_ms())?;
+    let now = now_ms();
+    let batch_id = delete_batch_id
+        .map(|batch| batch.to_string())
+        .unwrap_or_else(|| now.to_string());
+    let mut entry = history.move_to_trash_in_batch(&target, relative_path, now, &batch_id)?;
     entry.task_id = Uuid::parse_str(task_id)?;
     record_received_delete(task_roots, task_id, relative_path, &entry)?;
     Ok(())
+}
+
+fn validate_delete_expectation(
+    target: &Path,
+    expected_kind: Option<EntryKind>,
+    expected_hash: Option<&str>,
+    expected_hash_status: Option<HashStatus>,
+    expected_size: Option<i64>,
+    expected_modified_unix_ms: Option<i64>,
+) -> Result<()> {
+    let Some(expected_kind) = expected_kind else {
+        return Ok(());
+    };
+    let metadata = std::fs::metadata(target)?;
+    let current_kind = if metadata.is_dir() {
+        EntryKind::Directory
+    } else {
+        EntryKind::File
+    };
+    if current_kind != expected_kind {
+        anyhow::bail!("remote content no longer matches delete baseline");
+    }
+    if expected_kind == EntryKind::Directory {
+        return Ok(());
+    }
+
+    let hash_status = expected_hash_status.unwrap_or(HashStatus::Unavailable);
+    if hash_status == HashStatus::Verified {
+        let expected_hash = expected_hash
+            .filter(|hash| !hash.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("delete baseline missing expected hash"))?;
+        let actual_hash = crate::core::scanner::hash_file(target)?;
+        if actual_hash == expected_hash {
+            return Ok(());
+        }
+        anyhow::bail!("remote content no longer matches delete baseline");
+    }
+
+    let current_size = metadata.len() as i64;
+    let current_modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    if expected_size == Some(current_size) && expected_modified_unix_ms == Some(current_modified) {
+        Ok(())
+    } else {
+        anyhow::bail!("remote content no longer matches delete baseline")
+    }
 }
 
 #[cfg(test)]
@@ -2171,6 +2624,46 @@ mod tests {
         let paths: Vec<String> = files.into_iter().map(|file| file.relative_path).collect();
 
         assert_eq!(paths, vec!["ready.txt".to_string()]);
+    }
+
+    #[test]
+    fn remote_scan_large_file_without_cache_does_not_hash() {
+        let registry = TaskRootRegistry::new();
+        let missing_path = Path::new("/tmp/lanbridge-missing-large-file.bin");
+
+        let (hash, status) = remote_scan_hash_state(
+            &registry,
+            "task",
+            "large.bin",
+            missing_path,
+            crate::core::scanner::EAGER_HASH_LIMIT + 1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(hash, None);
+        assert_eq!(status, HashStatus::UnverifiedLargeFile);
+    }
+
+    #[test]
+    fn delete_expectation_rejects_changed_file_hash() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("changed.bin");
+        std::fs::write(&file, b"changed").unwrap();
+
+        let result = validate_delete_expectation(
+            &file,
+            Some(EntryKind::File),
+            Some(&blake3::hash(b"baseline").to_hex().to_string()),
+            Some(HashStatus::Verified),
+            Some(7),
+            Some(1),
+        );
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("remote content no longer matches delete baseline"));
     }
 }
 
@@ -2213,6 +2706,7 @@ fn record_received_file(
             primary_hash: Some(file_hash.to_string()),
             primary_hash_status: HashStatus::Verified,
             primary_size: metadata.len() as i64,
+            secondary_size: metadata.len() as i64,
             primary_modified_unix_ms: modified_unix_ms,
             secondary_hash: Some(file_hash.to_string()),
             secondary_hash_status: HashStatus::Verified,
@@ -2269,6 +2763,7 @@ fn record_received_directory(
             primary_hash: None,
             primary_hash_status: HashStatus::Unavailable,
             primary_size: 0,
+            secondary_size: 0,
             primary_modified_unix_ms: modified_unix_ms,
             secondary_hash: None,
             secondary_hash_status: HashStatus::Unavailable,
@@ -2301,8 +2796,8 @@ fn record_received_delete(
     let conn = db::open_db(&db_path)?;
     db::migrate(&conn)?;
     write_db_with_retry(|| {
-        repository::FileSnapshotRepository::new(&conn).mark_deleted(&task_id, relative_path)?;
-        repository::SyncBaselineRepository::new(&conn).remove(&task_id, relative_path)?;
+        repository::FileSnapshotRepository::new(&conn).remove_tree(&task_id, relative_path)?;
+        repository::SyncBaselineRepository::new(&conn).remove_tree(&task_id, relative_path)?;
         repository::HistoryRepository::new(&conn).insert(history_entry)?;
         repository::LogRepository::new(&conn).insert(&LogEntry {
             id: None,
@@ -2310,6 +2805,33 @@ fn record_received_delete(
             task_id: Some(task_id),
             relative_path: Some(relative_path.to_string()),
             message: "received delete from peer".to_string(),
+            created_unix_ms: now_ms(),
+        })?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn record_received_delete_missing(
+    task_roots: &TaskRootRegistry,
+    task_id: &str,
+    relative_path: &str,
+) -> Result<()> {
+    let Some(db_path) = task_roots.state_db_path() else {
+        return Ok(());
+    };
+    let task_id = Uuid::parse_str(task_id)?;
+    let conn = db::open_db(&db_path)?;
+    db::migrate(&conn)?;
+    write_db_with_retry(|| {
+        repository::FileSnapshotRepository::new(&conn).remove_tree(&task_id, relative_path)?;
+        repository::SyncBaselineRepository::new(&conn).remove_tree(&task_id, relative_path)?;
+        repository::LogRepository::new(&conn).insert(&LogEntry {
+            id: None,
+            level: LogLevel::Info,
+            task_id: Some(task_id),
+            relative_path: Some(relative_path.to_string()),
+            message: "received idempotent delete from peer".to_string(),
             created_unix_ms: now_ms(),
         })?;
         Ok(())
@@ -2353,74 +2875,6 @@ fn requester_address(peer_addr: SocketAddr, requester_port: u16) -> Option<Strin
     } else {
         Some(format!("{}:{}", peer_addr.ip(), requester_port))
     }
-}
-
-fn safe_join(root: &Path, relative_path: &str) -> Result<PathBuf> {
-    let path = Path::new(relative_path);
-    let mut dest = root.to_path_buf();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => {
-                validate_safe_component(part)?;
-                dest.push(part)
-            }
-            Component::CurDir => {}
-            _ => anyhow::bail!("invalid relative path"),
-        }
-    }
-    if dest == root {
-        anyhow::bail!("empty relative path");
-    }
-    Ok(dest)
-}
-
-fn validate_safe_component(part: &std::ffi::OsStr) -> Result<()> {
-    let name = part
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid non-utf8 relative path"))?;
-    if name.is_empty() {
-        anyhow::bail!("empty path component");
-    }
-    if name.ends_with('.') || name.ends_with(' ') {
-        anyhow::bail!("invalid trailing dot or space in path component");
-    }
-    if name
-        .chars()
-        .any(|ch| ch == '\0' || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-    {
-        anyhow::bail!("invalid character in relative path");
-    }
-
-    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
-    if matches!(
-        stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    ) {
-        anyhow::bail!("reserved device name in relative path: {}", name);
-    }
-
-    Ok(())
 }
 
 fn validate_invite_local_path(path: &Path) -> Result<()> {

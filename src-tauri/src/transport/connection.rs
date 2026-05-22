@@ -2,16 +2,17 @@ use crate::pairing::{DeviceIdentity, PublicIdentity};
 use crate::transport::protocol::{
     decode_message, encode_message, RemoteFileState, SyncMessage, NEGOTIATION_TIMEOUT_SECS,
     TRANSFER_PROGRESS_INTERVAL_BYTES, TRANSFER_V1_ACK_INTERVAL_BYTES, TRANSFER_V1_CHUNK_SIZE,
-    TRANSFER_V2_CHUNK_SIZE,
+    TRANSFER_V2_ACK_INTERVAL_BYTES, TRANSFER_V2_CHUNK_SIZE,
 };
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 /// Global speed limit in bytes/sec. 0 = unlimited.
 static GLOBAL_RATE_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Set the global transfer speed limit. Pass 0 to disable.
@@ -26,6 +27,7 @@ pub fn get_transfer_speed_limit() -> u64 {
 /// Progress of an active file transfer.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TransferProgress {
+    pub transfer_id: String,
     pub task_id: String,
     pub relative_path: String,
     pub direction: String, // "upload" or "download"
@@ -37,6 +39,15 @@ pub struct TransferProgress {
     pub finished: bool,
     /// Protocol version in use: "v2_binary" or "v1_json".
     pub protocol_version: String,
+    #[serde(skip_serializing)]
+    pub finished_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileTransferOutcome {
+    pub blake3_hash: String,
+    pub protocol: &'static str,
+    pub elapsed_ms: u64,
 }
 static GLOBAL_TRANSFER_PROGRESS: std::sync::LazyLock<Mutex<HashMap<String, TransferProgress>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -45,92 +56,195 @@ static CANCELLED_TRANSFERS: std::sync::LazyLock<Mutex<HashSet<String>>> =
 static DEFERRED_TRANSFERS: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
-fn transfer_key(task_id: &str, relative_path: &str) -> String {
-    format!("{}:{}", task_id, relative_path)
+const TRANSFER_DIRECTIONS: [&str; 4] = ["upload", "download", "receive", "serve"];
+
+pub fn new_transfer_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn transfer_key(task_id: &str, relative_path: &str, direction: &str) -> String {
+    format!("{}\n{}\n{}", task_id, relative_path, direction)
+}
+
+fn transfer_matches(
+    progress: &TransferProgress,
+    task_id: &str,
+    relative_path: &str,
+    direction: Option<&str>,
+) -> bool {
+    progress.task_id == task_id
+        && progress.relative_path == relative_path
+        && direction.map_or(true, |direction| progress.direction == direction)
+}
+
+struct TransferProgressGuard {
+    transfer_id: String,
+}
+
+impl TransferProgressGuard {
+    fn new(transfer_id: impl Into<String>) -> Self {
+        Self {
+            transfer_id: transfer_id.into(),
+        }
+    }
+}
+
+impl Drop for TransferProgressGuard {
+    fn drop(&mut self) {
+        finish_transfer_progress(&self.transfer_id);
+    }
 }
 
 /// Record a transfer progress update.
 pub fn record_transfer_progress(progress: TransferProgress) {
     if let Ok(mut map) = GLOBAL_TRANSFER_PROGRESS.lock() {
-        let key = transfer_key(&progress.task_id, &progress.relative_path);
-        map.insert(key, progress);
+        map.insert(progress.transfer_id.clone(), progress);
     }
 }
 /// Mark a transfer as finished (removes it from active tracking).
-pub fn finish_transfer_progress(task_id: &str, relative_path: &str) {
+pub fn finish_transfer_progress(transfer_id: &str) {
     if let Ok(mut map) = GLOBAL_TRANSFER_PROGRESS.lock() {
-        let key = transfer_key(task_id, relative_path);
-        map.remove(&key);
+        if let Some(progress) = map.get_mut(transfer_id) {
+            progress.finished = true;
+            progress.bytes_done = progress.bytes_total;
+            progress.finished_at_unix_ms = Some(now_ms_i64());
+        }
+    }
+}
+
+pub fn finish_transfer_progress_for_path(
+    task_id: &str,
+    relative_path: &str,
+    direction: Option<&str>,
+) {
+    if let Ok(mut map) = GLOBAL_TRANSFER_PROGRESS.lock() {
+        map.retain(|_, progress| !transfer_matches(progress, task_id, relative_path, direction));
     }
 }
 /// Get all active transfer progress entries.
 pub fn get_transfer_progress() -> Vec<TransferProgress> {
+    let now = now_ms_i64();
     GLOBAL_TRANSFER_PROGRESS
         .lock()
-        .map(|map| map.values().cloned().collect())
+        .map(|mut map| {
+            map.retain(|_, progress| {
+                progress
+                    .finished_at_unix_ms
+                    .map_or(true, |finished_at| now - finished_at <= 2_000)
+            });
+            map.values().cloned().collect()
+        })
         .unwrap_or_default()
 }
 
-pub fn cancel_transfer(task_id: &str, relative_path: &str) {
+pub fn has_active_transfers() -> bool {
+    GLOBAL_TRANSFER_PROGRESS
+        .lock()
+        .map(|map| map.values().any(|progress| !progress.finished))
+        .unwrap_or(false)
+}
+
+pub fn cancel_transfer(task_id: &str, relative_path: &str, direction: &str) {
+    cancel_active_transfer(task_id, relative_path, Some(direction));
+    defer_transfer(task_id, relative_path, direction);
+}
+
+pub fn cancel_active_transfer(task_id: &str, relative_path: &str, direction: Option<&str>) {
     if let Ok(mut cancelled) = CANCELLED_TRANSFERS.lock() {
-        cancelled.insert(transfer_key(task_id, relative_path));
+        if let Some(direction) = direction {
+            cancelled.insert(transfer_key(task_id, relative_path, direction));
+        } else {
+            for direction in TRANSFER_DIRECTIONS {
+                cancelled.insert(transfer_key(task_id, relative_path, direction));
+            }
+        }
     }
-    if let Ok(mut deferred) = DEFERRED_TRANSFERS.lock() {
-        deferred.insert(transfer_key(task_id, relative_path));
-    }
-    finish_transfer_progress(task_id, relative_path);
+    finish_transfer_progress_for_path(task_id, relative_path, direction);
 }
 
-pub fn resume_deferred_transfer(task_id: &str, relative_path: &str) {
+pub fn defer_transfer(task_id: &str, relative_path: &str, direction: &str) {
     if let Ok(mut deferred) = DEFERRED_TRANSFERS.lock() {
-        deferred.remove(&transfer_key(task_id, relative_path));
+        deferred.insert(transfer_key(task_id, relative_path, direction));
     }
-    clear_transfer_cancel(task_id, relative_path);
 }
 
-pub fn list_deferred_transfers() -> Vec<(String, String)> {
+pub fn resume_deferred_transfer(task_id: &str, relative_path: &str, direction: Option<&str>) {
+    if let Ok(mut deferred) = DEFERRED_TRANSFERS.lock() {
+        if let Some(direction) = direction {
+            deferred.remove(&transfer_key(task_id, relative_path, direction));
+        } else {
+            for direction in TRANSFER_DIRECTIONS {
+                deferred.remove(&transfer_key(task_id, relative_path, direction));
+            }
+        }
+    }
+    clear_transfer_cancel(task_id, relative_path, direction);
+}
+
+pub fn list_deferred_transfers() -> Vec<(String, String, String)> {
     DEFERRED_TRANSFERS
         .lock()
         .map(|deferred| {
             deferred
                 .iter()
                 .filter_map(|key| {
-                    let (task_id, relative_path) = key.split_once(':')?;
-                    Some((task_id.to_string(), relative_path.to_string()))
+                    let mut parts = key.splitn(3, '\n');
+                    Some((
+                        parts.next()?.to_string(),
+                        parts.next()?.to_string(),
+                        parts.next()?.to_string(),
+                    ))
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-pub(crate) fn clear_transfer_cancel(task_id: &str, relative_path: &str) {
+pub(crate) fn clear_transfer_cancel(task_id: &str, relative_path: &str, direction: Option<&str>) {
     if let Ok(mut cancelled) = CANCELLED_TRANSFERS.lock() {
-        cancelled.remove(&transfer_key(task_id, relative_path));
+        if let Some(direction) = direction {
+            cancelled.remove(&transfer_key(task_id, relative_path, direction));
+        } else {
+            for direction in TRANSFER_DIRECTIONS {
+                cancelled.remove(&transfer_key(task_id, relative_path, direction));
+            }
+        }
     }
 }
 
-pub(crate) fn is_transfer_cancelled(task_id: &str, relative_path: &str) -> bool {
+pub(crate) fn is_transfer_cancelled(task_id: &str, relative_path: &str, direction: &str) -> bool {
     CANCELLED_TRANSFERS
         .lock()
-        .map(|cancelled| cancelled.contains(&transfer_key(task_id, relative_path)))
+        .map(|cancelled| cancelled.contains(&transfer_key(task_id, relative_path, direction)))
         .unwrap_or(false)
 }
 
-pub(crate) fn ensure_transfer_not_cancelled(task_id: &str, relative_path: &str) -> Result<()> {
-    if is_transfer_cancelled(task_id, relative_path) {
+pub(crate) fn ensure_transfer_not_cancelled(
+    task_id: &str,
+    relative_path: &str,
+    direction: &str,
+) -> Result<()> {
+    if is_transfer_cancelled(task_id, relative_path, direction) {
         anyhow::bail!("transfer cancelled");
     }
-    if is_transfer_deferred(task_id, relative_path) {
+    if is_transfer_deferred(task_id, relative_path, direction) {
         anyhow::bail!("transfer deferred by user");
     }
     Ok(())
 }
 
-pub(crate) fn is_transfer_deferred(task_id: &str, relative_path: &str) -> bool {
+pub(crate) fn is_transfer_deferred(task_id: &str, relative_path: &str, direction: &str) -> bool {
     DEFERRED_TRANSFERS
         .lock()
-        .map(|deferred| deferred.contains(&transfer_key(task_id, relative_path)))
+        .map(|deferred| deferred.contains(&transfer_key(task_id, relative_path, direction)))
         .unwrap_or(false)
+}
+
+fn now_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 /// Cache of negotiated protocol versions per peer device_id.
 /// Maps device_id -> protocol_version (2 or 1). Cleared on errors.
@@ -164,6 +278,7 @@ pub fn force_v2_enabled() -> bool {
 /// Record a transfer progress update with 500ms throttle per file.
 /// Avoids overwhelming the global state from high-frequency chunk loops.
 pub(crate) fn record_throttled(
+    transfer_id: &str,
     task_id: &str,
     relative_path: &str,
     direction: &str,
@@ -177,7 +292,7 @@ pub(crate) fn record_throttled(
     use std::time::Instant;
     static LAST_UI: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
     let last_ui = LAST_UI.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = format!("{}:{}", task_id, relative_path);
+    let key = transfer_id.to_string();
     if let Ok(mut last) = last_ui.lock() {
         if let Some(t) = last.get(&key) {
             if t.elapsed() < Duration::from_millis(500) {
@@ -187,6 +302,7 @@ pub(crate) fn record_throttled(
         last.insert(key.clone(), Instant::now());
     }
     record_transfer_progress(TransferProgress {
+        transfer_id: transfer_id.to_string(),
         task_id: task_id.to_string(),
         relative_path: relative_path.to_string(),
         direction: direction.to_string(),
@@ -196,6 +312,7 @@ pub(crate) fn record_throttled(
         mbps,
         finished: false,
         protocol_version: protocol_version.to_string(),
+        finished_at_unix_ms: None,
     });
 }
 /// Sleep if needed to respect the global speed limit for `bytes` just sent.
@@ -209,6 +326,119 @@ async fn throttle(bytes: u64) {
         tokio::time::sleep(delay).await;
     }
 }
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Default)]
+struct V2TransferTiming {
+    read_ms: u64,
+    hash_ms: u64,
+    socket_write_ms: u64,
+    chunk_socket_write_ms: u64,
+    ack_wait_ms: u64,
+    throttle_ms: u64,
+    chunk_count: u64,
+}
+
+impl V2TransferTiming {
+    fn log_summary(
+        &self,
+        transfer_id: &str,
+        task_id: &str,
+        relative_path: &str,
+        direction: &str,
+        bytes_total: u64,
+        elapsed_ms: u64,
+        ack_interval_bytes: u64,
+        success: bool,
+        error: Option<&str>,
+    ) {
+        let avg_chunk_write_ms = if self.chunk_count > 0 {
+            self.chunk_socket_write_ms as f64 / self.chunk_count as f64
+        } else {
+            0.0
+        };
+        tracing::info!(
+            transfer_timing_summary = true,
+            transfer_id = %transfer_id,
+            task_id = %task_id,
+            relative_path = %relative_path,
+            direction = direction,
+            protocol = "v2_binary",
+            success = success,
+            error = error.unwrap_or(""),
+            bytes_total = bytes_total,
+            elapsed_ms = elapsed_ms,
+            ack_interval_bytes = ack_interval_bytes,
+            read_ms = self.read_ms,
+            hash_ms = self.hash_ms,
+            socket_write_ms = self.socket_write_ms,
+            ack_wait_ms = self.ack_wait_ms,
+            throttle_ms = self.throttle_ms,
+            chunk_count = self.chunk_count,
+            avg_chunk_write_ms = format_args!("{:.2}", avg_chunk_write_ms),
+        );
+    }
+}
+
+struct V2ReadChunk {
+    offset: u64,
+    data: Vec<u8>,
+    read_ms: u64,
+}
+
+type V2ReadChunkResult = std::result::Result<V2ReadChunk, String>;
+
+fn spawn_v2_file_reader(
+    task_id: String,
+    relative_path: String,
+    direction: String,
+    file_path: PathBuf,
+) -> mpsc::Receiver<V2ReadChunkResult> {
+    let (tx, rx) = mpsc::channel(3);
+    tokio::task::spawn_blocking(move || {
+        let mut file = match std::fs::File::open(&file_path) {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(e.to_string()));
+                return;
+            }
+        };
+        let mut offset = 0u64;
+        let mut buf = vec![0u8; TRANSFER_V2_CHUNK_SIZE];
+        loop {
+            if is_transfer_cancelled(&task_id, &relative_path, &direction) {
+                let _ = tx.blocking_send(Err("transfer cancelled".to_string()));
+                return;
+            }
+            let read_start = Instant::now();
+            let read = match file.read(&mut buf) {
+                Ok(read) => read,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e.to_string()));
+                    return;
+                }
+            };
+            let read_ms = elapsed_ms(read_start);
+            if read == 0 {
+                return;
+            }
+            let chunk = V2ReadChunk {
+                offset,
+                data: buf[..read].to_vec(),
+                read_ms,
+            };
+            offset += read as u64;
+            if tx.blocking_send(Ok(chunk)).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceFileState {
     pub(crate) len: u64,
@@ -413,12 +643,58 @@ async fn try_negotiate_v2(stream: &mut TcpStream) -> Result<bool> {
 /// Send a file using V2 binary protocol.
 async fn send_file_v2(
     stream: &mut TcpStream,
+    transfer_id: &str,
     task_id: &str,
     relative_path: &str,
     file_path: &Path,
     total_bytes: u64,
     before_hash: &SourceFileState,
-) -> Result<()> {
+) -> Result<FileTransferOutcome> {
+    let transfer_start = Instant::now();
+    let mut timing = V2TransferTiming::default();
+    let result = send_file_v2_inner(
+        stream,
+        transfer_id,
+        task_id,
+        relative_path,
+        file_path,
+        total_bytes,
+        before_hash,
+        &mut timing,
+        transfer_start,
+    )
+    .await;
+    let elapsed_ms = match &result {
+        Ok(outcome) => outcome.elapsed_ms,
+        Err(_) => elapsed_ms(transfer_start),
+    };
+    let error = result.as_ref().err().map(|e| e.to_string());
+    timing.log_summary(
+        transfer_id,
+        task_id,
+        relative_path,
+        "upload",
+        total_bytes,
+        elapsed_ms,
+        TRANSFER_V2_ACK_INTERVAL_BYTES,
+        result.is_ok(),
+        error.as_deref(),
+    );
+    result
+}
+
+async fn send_file_v2_inner(
+    stream: &mut TcpStream,
+    transfer_id: &str,
+    task_id: &str,
+    relative_path: &str,
+    file_path: &Path,
+    total_bytes: u64,
+    before_hash: &SourceFileState,
+    timing: &mut V2TransferTiming,
+    first_byte: Instant,
+) -> Result<FileTransferOutcome> {
+    let write_start = Instant::now();
     stream
         .write_all(&encode_message(&SyncMessage::FileStreamStartV2 {
             task_id: task_id.to_string(),
@@ -426,29 +702,37 @@ async fn send_file_v2(
             total_bytes,
         })?)
         .await?;
-    let first_byte = Instant::now();
-    let mut file = std::fs::File::open(file_path)?;
+    timing.socket_write_ms += elapsed_ms(write_start);
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0u64;
-    let mut next_ack_at = TRANSFER_V1_ACK_INTERVAL_BYTES;
+    let mut next_ack_at = TRANSFER_V2_ACK_INTERVAL_BYTES;
     let mut next_progress_at = TRANSFER_PROGRESS_INTERVAL_BYTES;
-    let mut buf = vec![0u8; TRANSFER_V2_CHUNK_SIZE];
-    loop {
-        if is_transfer_cancelled(task_id, relative_path) {
+    let mut reader = spawn_v2_file_reader(
+        task_id.to_string(),
+        relative_path.to_string(),
+        "upload".to_string(),
+        file_path.to_path_buf(),
+    );
+    while let Some(read_result) = reader.recv().await {
+        if is_transfer_cancelled(task_id, relative_path, "upload") {
             let _ = stream
                 .write_all(&encode_message(&SyncMessage::TransferCancel {
                     task_id: task_id.to_string(),
                     relative_path: relative_path.to_string(),
+                    direction: Some("receive".to_string()),
                 })?)
                 .await;
             anyhow::bail!("transfer cancelled");
         }
-        let read = file.read(&mut buf)?;
-        if read == 0 {
-            break;
+        let read_chunk = read_result.map_err(anyhow::Error::msg)?;
+        if read_chunk.offset != offset {
+            anyhow::bail!("unexpected v2 read offset");
         }
-        let chunk = &buf[..read];
-        hasher.update(chunk);
+        timing.read_ms += read_chunk.read_ms;
+        let read = read_chunk.data.len();
+        let hash_start = Instant::now();
+        hasher.update(&read_chunk.data);
+        timing.hash_ms += elapsed_ms(hash_start);
         let need_ack = offset + read as u64 >= next_ack_at || offset + read as u64 >= total_bytes;
         let header = SyncMessage::FileChunkBinaryV2 {
             task_id: task_id.to_string(),
@@ -457,12 +741,28 @@ async fn send_file_v2(
             bytes: read as u32,
             ack: need_ack,
         };
-        crate::transport::protocol::write_v2_chunk(stream, &header, chunk).await?;
+        let write_start = Instant::now();
+        crate::transport::protocol::write_v2_chunk(stream, &header, &read_chunk.data).await?;
+        let write_ms = elapsed_ms(write_start);
+        timing.socket_write_ms += write_ms;
+        timing.chunk_socket_write_ms += write_ms;
+        timing.chunk_count += 1;
         offset += read as u64;
+        let throttle_start = Instant::now();
         throttle(read as u64).await;
+        timing.throttle_ms += elapsed_ms(throttle_start);
         if need_ack {
+            let ack_start = Instant::now();
             match read_message(stream).await? {
-                SyncMessage::FileStreamAckV2 { success: true, .. } => {}
+                SyncMessage::FileStreamAckV2 {
+                    success: true,
+                    received_bytes,
+                    ..
+                } => {
+                    if received_bytes < offset {
+                        anyhow::bail!("v2 checkpoint ack behind stream offset");
+                    }
+                }
                 SyncMessage::FileStreamAckV2 {
                     success: false,
                     error,
@@ -472,7 +772,8 @@ async fn send_file_v2(
                 }
                 other => anyhow::bail!("unexpected v2 ack response: {:?}", other),
             }
-            next_ack_at += TRANSFER_V1_ACK_INTERVAL_BYTES;
+            timing.ack_wait_ms += elapsed_ms(ack_start);
+            next_ack_at += TRANSFER_V2_ACK_INTERVAL_BYTES;
         }
         if offset >= next_progress_at {
             let elapsed_ms = first_byte.elapsed().as_millis() as u64;
@@ -490,9 +791,11 @@ async fn send_file_v2(
                 elapsed_ms = elapsed_ms,
                 mbps = format_args!("{:.1}", mbps),
                 protocol_version = "v2",
+                ack_interval_bytes = TRANSFER_V2_ACK_INTERVAL_BYTES,
                 "transfer progress"
             );
             record_throttled(
+                transfer_id,
                 &task_id,
                 &relative_path,
                 "upload",
@@ -506,16 +809,30 @@ async fn send_file_v2(
         }
     }
     ensure_source_file_unchanged(file_path, before_hash)?;
+    if offset != total_bytes {
+        anyhow::bail!("v2 stream size mismatch before end");
+    }
     let file_hash = hasher.finalize().to_hex().to_string();
+    let write_start = Instant::now();
     stream
         .write_all(&encode_message(&SyncMessage::FileStreamEndV2 {
             task_id: task_id.to_string(),
             relative_path: relative_path.to_string(),
-            file_hash,
+            file_hash: file_hash.clone(),
         })?)
         .await?;
+    timing.socket_write_ms += elapsed_ms(write_start);
+    let total_elapsed_ms = first_byte.elapsed().as_millis() as u64;
+    let ack_start = Instant::now();
     match read_message(stream).await? {
-        SyncMessage::FileStreamAckV2 { success: true, .. } => Ok(()),
+        SyncMessage::FileStreamAckV2 { success: true, .. } => {
+            timing.ack_wait_ms += elapsed_ms(ack_start);
+            Ok(FileTransferOutcome {
+                blake3_hash: file_hash,
+                protocol: "v2_binary",
+                elapsed_ms: total_elapsed_ms,
+            })
+        }
         SyncMessage::FileStreamAckV2 {
             success: false,
             error,
@@ -531,13 +848,28 @@ pub async fn send_authenticated_file_to_peer(
     task_id: impl Into<String>,
     relative_path: impl Into<String>,
     file_path: &Path,
-) -> Result<()> {
+) -> Result<FileTransferOutcome> {
     let task_id = task_id.into();
     let relative_path = relative_path.into();
-    clear_transfer_cancel(&task_id, &relative_path);
+    clear_transfer_cancel(&task_id, &relative_path, Some("upload"));
     let total_start = Instant::now();
     let before_hash = source_file_state(file_path)?;
     let total_bytes = before_hash.len;
+    let transfer_id = new_transfer_id();
+    let _progress_guard = TransferProgressGuard::new(transfer_id.clone());
+    record_transfer_progress(TransferProgress {
+        transfer_id: transfer_id.clone(),
+        task_id: task_id.clone(),
+        relative_path: relative_path.clone(),
+        direction: "upload".to_string(),
+        bytes_done: 0,
+        bytes_total: total_bytes,
+        mbps: 0.0,
+        wire_bytes: 0,
+        protocol_version: String::new(),
+        finished: false,
+        finished_at_unix_ms: None,
+    });
     let stream_start = Instant::now();
     let mut stream = open_authenticated_stream(manager, local_identity, device_id).await?;
     let stream_elapsed_ms = stream_start.elapsed().as_millis() as u64;
@@ -599,6 +931,7 @@ pub async fn send_authenticated_file_to_peer(
         tracing::info!(selected_protocol = "v2_binary", "using V2");
         let result = send_file_v2(
             &mut stream,
+            &transfer_id,
             &task_id,
             &relative_path,
             file_path,
@@ -616,7 +949,7 @@ pub async fn send_authenticated_file_to_peer(
             0.0
         };
         match &result {
-            Ok(()) => {
+            Ok(outcome) => {
                 tracing::info!(
                     task_id = %task_id,
                     relative_path = %relative_path,
@@ -635,6 +968,14 @@ pub async fn send_authenticated_file_to_peer(
                     direction = "upload",
                     elapsed_ms = total_elapsed_ms,
                     avg_mbps = format_args!("{:.1}", total_mbps),
+                );
+                tracing::debug!(
+                    task_id = %task_id,
+                    relative_path = %relative_path,
+                    transfer_hash = %outcome.blake3_hash,
+                    protocol = outcome.protocol,
+                    elapsed_ms = outcome.elapsed_ms,
+                    "transfer outcome hash ready"
                 );
             }
             Err(e) => tracing::warn!(
@@ -690,11 +1031,12 @@ pub async fn send_authenticated_file_to_peer(
     let mut next_progress_at = TRANSFER_PROGRESS_INTERVAL_BYTES;
     let mut buf = vec![0u8; TRANSFER_V1_CHUNK_SIZE];
     loop {
-        if is_transfer_cancelled(&task_id, &relative_path) {
+        if is_transfer_cancelled(&task_id, &relative_path, "upload") {
             let _ = stream
                 .write_all(&encode_message(&SyncMessage::TransferCancel {
                     task_id: task_id.clone(),
                     relative_path: relative_path.clone(),
+                    direction: Some("receive".to_string()),
                 })?)
                 .await;
             anyhow::bail!("transfer cancelled");
@@ -768,6 +1110,7 @@ pub async fn send_authenticated_file_to_peer(
                 "transfer progress"
             );
             record_throttled(
+                &transfer_id,
                 &task_id,
                 &relative_path,
                 "upload",
@@ -793,7 +1136,7 @@ pub async fn send_authenticated_file_to_peer(
             task_id: task_id.clone(),
             relative_path: relative_path.clone(),
             file_hash: if use_v1_checkpoint_acks {
-                Some(streamed_hash)
+                Some(streamed_hash.clone())
             } else {
                 None
             },
@@ -826,7 +1169,11 @@ pub async fn send_authenticated_file_to_peer(
         elapsed_ms = total_elapsed_ms,
         avg_mbps = format_args!("{:.1}", total_mbps),
     );
-    Ok(())
+    Ok(FileTransferOutcome {
+        blake3_hash: streamed_hash,
+        protocol: "v1_json",
+        elapsed_ms: total_elapsed_ms,
+    })
 }
 pub(crate) fn source_file_state(file_path: &Path) -> Result<SourceFileState> {
     let metadata = std::fs::metadata(file_path)?;
@@ -902,10 +1249,10 @@ pub async fn request_authenticated_file_from_peer(
     task_id: impl Into<String>,
     relative_path: impl Into<String>,
     target_path: &Path,
-) -> Result<()> {
+) -> Result<FileTransferOutcome> {
     let task_id = task_id.into();
     let relative_path = relative_path.into();
-    clear_transfer_cancel(&task_id, &relative_path);
+    clear_transfer_cancel(&task_id, &relative_path, Some("download"));
     let total_start = Instant::now();
     let stream_start = Instant::now();
     let mut stream = open_authenticated_stream(manager, local_identity, device_id).await?;
@@ -1003,6 +1350,21 @@ pub async fn request_authenticated_file_from_peer(
         }
         other => anyhow::bail!("unexpected download response: {:?}", other),
     };
+    let transfer_id = new_transfer_id();
+    let _progress_guard = TransferProgressGuard::new(transfer_id.clone());
+    record_transfer_progress(TransferProgress {
+        transfer_id: transfer_id.clone(),
+        task_id: task_id.clone(),
+        relative_path: relative_path.clone(),
+        direction: "download".to_string(),
+        bytes_done: 0,
+        bytes_total: total_bytes,
+        mbps: 0.0,
+        wire_bytes: 0,
+        protocol_version: String::new(),
+        finished: false,
+        finished_at_unix_ms: None,
+    });
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1019,12 +1381,13 @@ pub async fn request_authenticated_file_from_peer(
                 offset,
                 data,
             } if chunk_task == task_id && chunk_path == relative_path => {
-                if is_transfer_cancelled(&task_id, &relative_path) {
+                if is_transfer_cancelled(&task_id, &relative_path, "download") {
                     let _ = std::fs::remove_file(&partial_path);
                     let _ = stream
                         .write_all(&encode_message(&SyncMessage::TransferCancel {
                             task_id: task_id.clone(),
                             relative_path: relative_path.clone(),
+                            direction: Some("serve".to_string()),
                         })?)
                         .await;
                     anyhow::bail!("transfer cancelled");
@@ -1059,6 +1422,7 @@ pub async fn request_authenticated_file_from_peer(
                         "transfer progress"
                     );
                     record_throttled(
+                        &transfer_id,
                         &task_id,
                         &relative_path,
                         "download",
@@ -1131,7 +1495,11 @@ pub async fn request_authenticated_file_from_peer(
         elapsed_ms = total_elapsed_ms,
         avg_mbps = format_args!("{:.1}", total_mbps),
     );
-    Ok(())
+    Ok(FileTransferOutcome {
+        blake3_hash: actual_hash,
+        protocol: "v1_json",
+        elapsed_ms: total_elapsed_ms,
+    })
 }
 async fn request_file_v2(
     stream: &mut TcpStream,
@@ -1139,7 +1507,7 @@ async fn request_file_v2(
     relative_path: &str,
     target_path: &Path,
     total_start: Instant,
-) -> Result<()> {
+) -> Result<FileTransferOutcome> {
     stream
         .write_all(&encode_message(&SyncMessage::FileDownloadRequestV2 {
             task_id: task_id.to_string(),
@@ -1158,6 +1526,21 @@ async fn request_file_v2(
         }
         other => anyhow::bail!("unexpected v2 download response: {:?}", other),
     };
+    let transfer_id = new_transfer_id();
+    let _progress_guard = TransferProgressGuard::new(transfer_id.clone());
+    record_transfer_progress(TransferProgress {
+        transfer_id: transfer_id.clone(),
+        task_id: task_id.to_string(),
+        relative_path: relative_path.to_string(),
+        direction: "download".to_string(),
+        bytes_done: 0,
+        bytes_total: total_bytes,
+        mbps: 0.0,
+        wire_bytes: 0,
+        protocol_version: "v2_binary".to_string(),
+        finished: false,
+        finished_at_unix_ms: None,
+    });
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1175,12 +1558,13 @@ async fn request_file_v2(
                 bytes,
                 ack,
             } if chunk_task == task_id && chunk_path == relative_path => {
-                if is_transfer_cancelled(task_id, relative_path) {
+                if is_transfer_cancelled(task_id, relative_path, "download") {
                     let _ = std::fs::remove_file(&partial_path);
                     let _ = stream
                         .write_all(&encode_message(&SyncMessage::TransferCancel {
                             task_id: task_id.to_string(),
                             relative_path: relative_path.to_string(),
+                            direction: Some("serve".to_string()),
                         })?)
                         .await;
                     anyhow::bail!("transfer cancelled");
@@ -1236,9 +1620,11 @@ async fn request_file_v2(
                         elapsed_ms = elapsed_ms,
                         mbps = format_args!("{:.1}", mbps),
                         protocol_version = "v2",
+                        ack_interval_bytes = TRANSFER_V2_ACK_INTERVAL_BYTES,
                         "transfer progress"
                     );
                     record_throttled(
+                        &transfer_id,
                         &task_id,
                         &relative_path,
                         "download",
@@ -1323,7 +1709,11 @@ async fn request_file_v2(
         elapsed_ms = total_elapsed_ms,
         avg_mbps = format_args!("{:.1}", total_mbps),
     );
-    Ok(())
+    Ok(FileTransferOutcome {
+        blake3_hash: actual_hash,
+        protocol: "v2_binary",
+        elapsed_ms: total_elapsed_ms,
+    })
 }
 async fn send_v2_download_ack(
     stream: &mut TcpStream,
@@ -1475,6 +1865,89 @@ mod tests {
         let before = source_file_state(&path).unwrap();
         std::fs::write(&path, "first plus more").unwrap();
         assert!(ensure_source_file_unchanged(&path, &before).is_err());
+    }
+
+    #[test]
+    fn progress_entries_include_direction_in_key() {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let relative_path = "same.zip";
+        finish_transfer_progress_for_path(&task_id, relative_path, None);
+        assert!(!has_active_transfers());
+        let upload_id = new_transfer_id();
+        let download_id = new_transfer_id();
+
+        record_transfer_progress(TransferProgress {
+            transfer_id: upload_id.clone(),
+            task_id: task_id.clone(),
+            relative_path: relative_path.to_string(),
+            direction: "upload".to_string(),
+            bytes_done: 10,
+            bytes_total: 100,
+            wire_bytes: 10,
+            mbps: 1.0,
+            finished: false,
+            protocol_version: "v2_binary".to_string(),
+            finished_at_unix_ms: None,
+        });
+        record_transfer_progress(TransferProgress {
+            transfer_id: download_id.clone(),
+            task_id: task_id.clone(),
+            relative_path: relative_path.to_string(),
+            direction: "download".to_string(),
+            bytes_done: 20,
+            bytes_total: 100,
+            wire_bytes: 20,
+            mbps: 2.0,
+            finished: false,
+            protocol_version: "v2_binary".to_string(),
+            finished_at_unix_ms: None,
+        });
+
+        let entries = get_transfer_progress()
+            .into_iter()
+            .filter(|entry| entry.task_id == task_id && entry.relative_path == relative_path)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.direction == "upload"));
+        assert!(entries.iter().any(|entry| entry.direction == "download"));
+        assert!(has_active_transfers());
+
+        finish_transfer_progress(&upload_id);
+        let entries = get_transfer_progress()
+            .into_iter()
+            .filter(|entry| entry.task_id == task_id && entry.relative_path == relative_path)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.transfer_id == upload_id && entry.finished));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.transfer_id == download_id && !entry.finished));
+
+        finish_transfer_progress_for_path(&task_id, relative_path, None);
+        assert!(!has_active_transfers());
+    }
+
+    #[test]
+    fn deferred_and_cancelled_transfers_are_direction_specific() {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let relative_path = "same.zip";
+        resume_deferred_transfer(&task_id, relative_path, None);
+        clear_transfer_cancel(&task_id, relative_path, None);
+
+        defer_transfer(&task_id, relative_path, "upload");
+        assert!(is_transfer_deferred(&task_id, relative_path, "upload"));
+        assert!(!is_transfer_deferred(&task_id, relative_path, "download"));
+
+        cancel_active_transfer(&task_id, relative_path, Some("receive"));
+        assert!(is_transfer_cancelled(&task_id, relative_path, "receive"));
+        assert!(!is_transfer_cancelled(&task_id, relative_path, "upload"));
+
+        resume_deferred_transfer(&task_id, relative_path, Some("upload"));
+        clear_transfer_cancel(&task_id, relative_path, Some("receive"));
+        assert!(!is_transfer_deferred(&task_id, relative_path, "upload"));
+        assert!(!is_transfer_cancelled(&task_id, relative_path, "receive"));
     }
 }
 pub fn pin_connected_peer(

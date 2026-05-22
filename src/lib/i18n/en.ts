@@ -195,7 +195,7 @@ export const en: Translations = {
     title: "Sync History",
     back: "Back",
     allTasks: "All Tasks",
-    cleanup: "Cleanup Old Entries",
+    cleanup: "Clean History Files",
     loading: "Loading history...",
     noEntries: "No history entries",
     noEntriesDesc:

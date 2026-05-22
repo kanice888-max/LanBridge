@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import {
   getIdentity,
   getTaskPeerStatus,
+  hasActiveTransfers,
+  listReadyAutoSyncTasks,
   listSyncTasks,
   syncNow,
   type IdentityInfo,
@@ -47,6 +49,17 @@ function AppContent() {
 
   useEffect(() => {
     const autoSyncPrimaryTasks = async () => {
+      try {
+        if (await hasActiveTransfers()) return;
+      } catch {
+        return;
+      }
+      let readyTaskIds = new Set<string>();
+      try {
+        readyTaskIds = new Set(await listReadyAutoSyncTasks());
+      } catch {
+        readyTaskIds = new Set();
+      }
       const primaryTasks = tasks.filter(
         (task) => task.enabled && task.local_role === "Primary"
       );
@@ -62,6 +75,7 @@ function AppContent() {
             await syncNow(task.id);
             continue;
           }
+          if (!readyTaskIds.has(task.id)) continue;
           await syncNow(task.id);
         } catch {
           lastPeerConnected.current.set(task.id, false);

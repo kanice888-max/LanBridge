@@ -756,6 +756,7 @@ async fn test_unregister_task_root_rejects_later_file_transfer() {
 #[tokio::test]
 async fn test_task_invite_allocates_peer_inbox_without_sender_remote_path() {
     let server = SyncServer::start_in_background(0).unwrap();
+    server.set_auto_accept_task_invites(true);
     let local_identity = DeviceIdentity::generate();
     server.register_trusted_peer(local_identity.public());
     let inbox_dir = TempDir::new().unwrap();
@@ -822,9 +823,63 @@ async fn test_task_invite_allocates_peer_inbox_without_sender_remote_path() {
 }
 
 #[tokio::test]
+async fn test_task_invite_defaults_to_pending_and_does_not_register_root() {
+    let server = SyncServer::start_in_background(0).unwrap();
+    let local_identity = DeviceIdentity::generate();
+    server.register_trusted_peer(local_identity.public());
+    let source_dir = TempDir::new().unwrap();
+    let source_path = source_dir.path().join("pending-file.txt");
+    std::fs::write(&source_path, "should wait").unwrap();
+
+    let manager = ConnectionManager::new();
+    manager.register_connection(lanbridge::transport::PeerConnection {
+        device_id: "default-pending-peer".to_string(),
+        address: format!("127.0.0.1:{}", server.port()),
+        connected: true,
+        last_seen_unix_ms: 0,
+    });
+
+    let invite_response = lanbridge::transport::connection::send_authenticated_message_to_peer(
+        &manager,
+        &local_identity,
+        "default-pending-peer",
+        SyncMessage::TaskInvite {
+            invite_id: "invite-default-pending-001".to_string(),
+            task_id: "task-default-pending-001".to_string(),
+            task_name: "Default Pending".to_string(),
+            requester_port: 0,
+            requester_path: Some(source_dir.path().to_string_lossy().to_string()),
+            proposed_role: "Secondary".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    match invite_response {
+        SyncMessage::TaskInvitePending { invite_id, task_id } => {
+            assert_eq!(invite_id, "invite-default-pending-001");
+            assert_eq!(task_id, "task-default-pending-001");
+        }
+        other => panic!("expected pending invite, got {:?}", other),
+    }
+
+    let transfer = lanbridge::transport::connection::send_authenticated_file_to_peer(
+        &manager,
+        &local_identity,
+        "default-pending-peer",
+        "task-default-pending-001",
+        "pending-file.txt",
+        &source_path,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(transfer.contains("task root not registered"));
+}
+
+#[tokio::test]
 async fn test_task_invite_can_wait_for_peer_acceptance() {
     let server = SyncServer::start_in_background(0).unwrap();
-    server.set_auto_accept_task_invites(false);
     let local_identity = DeviceIdentity::generate();
     server.register_trusted_peer(local_identity.public());
     let remote_dir = TempDir::new().unwrap();
@@ -986,6 +1041,97 @@ async fn test_untrusted_task_invite_becomes_trusted_only_after_peer_accepts() {
         std::fs::read_to_string(remote_dir.path().join("first-contact.txt")).unwrap(),
         "first contact transfer"
     );
+}
+
+#[tokio::test]
+async fn test_task_invite_proposal_rejects_changed_public_key_for_trusted_device() {
+    let server = SyncServer::start_in_background(0).unwrap();
+    let trusted_identity = DeviceIdentity::generate();
+    let trusted_public = trusted_identity.public();
+    let replacement_identity = DeviceIdentity::generate();
+    server.register_trusted_peer(trusted_public.clone());
+
+    let manager = ConnectionManager::new();
+    manager.register_connection(lanbridge::transport::PeerConnection {
+        device_id: "changed-key-peer".to_string(),
+        address: format!("127.0.0.1:{}", server.port()),
+        connected: true,
+        last_seen_unix_ms: 0,
+    });
+
+    let response = lanbridge::transport::connection::send_message_to_peer(
+        &manager,
+        "changed-key-peer",
+        SyncMessage::TaskInviteProposal {
+            invite_id: "invite-changed-key-001".to_string(),
+            task_id: "task-changed-key-001".to_string(),
+            task_name: "Changed Key".to_string(),
+            requester_device_id: trusted_public.device_id,
+            requester_public_key: replacement_identity.public().public_key,
+            requester_port: 0,
+            requester_path: None,
+            proposed_role: "Secondary".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    match response {
+        SyncMessage::TaskInviteAck {
+            success: false,
+            error: Some(error),
+            ..
+        } => assert!(error.contains("public key changed")),
+        other => panic!("expected failed invite ack, got {:?}", other),
+    }
+    assert!(server.list_task_invites().is_empty());
+}
+
+#[test]
+fn test_accept_task_invite_rejects_changed_public_key_before_registering_root() {
+    let server = SyncServer::start_in_background(0).unwrap();
+    let original = DeviceIdentity::generate().public();
+    let replacement = DeviceIdentity::generate().public();
+    let remote_dir = TempDir::new().unwrap();
+
+    let manager = ConnectionManager::new();
+    manager.register_connection(lanbridge::transport::PeerConnection {
+        device_id: "accept-changed-key-peer".to_string(),
+        address: format!("127.0.0.1:{}", server.port()),
+        connected: true,
+        last_seen_unix_ms: 0,
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        lanbridge::transport::connection::send_message_to_peer(
+            &manager,
+            "accept-changed-key-peer",
+            SyncMessage::TaskInviteProposal {
+                invite_id: "invite-accept-changed-key-001".to_string(),
+                task_id: "task-accept-changed-key-001".to_string(),
+                task_name: "Accept Changed Key".to_string(),
+                requester_device_id: original.device_id.clone(),
+                requester_public_key: original.public_key.clone(),
+                requester_port: 0,
+                requester_path: None,
+                proposed_role: "Secondary".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    });
+
+    server.register_trusted_peer(PublicIdentity {
+        device_id: original.device_id.clone(),
+        public_key: replacement.public_key,
+    });
+    let error = server
+        .accept_task_invite("invite-accept-changed-key-001", remote_dir.path())
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("public key changed"));
+    assert!(remote_dir.path().read_dir().unwrap().next().is_none());
 }
 
 #[tokio::test]
@@ -1228,6 +1374,164 @@ async fn test_authenticated_v2_upload_negotiates_and_transfers_file() {
     assert_eq!(
         lanbridge::transport::connection::get_cached_protocol(peer_id),
         Some(2)
+    );
+}
+
+#[tokio::test]
+async fn test_v2_upload_rejects_bad_offset_and_cleans_partial() {
+    let server = SyncServer::start_in_background(0).unwrap();
+    let local_identity = DeviceIdentity::generate();
+    server.register_trusted_peer(local_identity.public());
+    let remote_dir = TempDir::new().unwrap();
+    let task_id = "task-v2-bad-offset";
+    let relative_path = "bad-offset.bin";
+    server
+        .register_task_root(task_id, remote_dir.path())
+        .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
+        .await
+        .unwrap();
+    authenticate_test_stream(&mut stream, &local_identity).await;
+    write_message(
+        &mut stream,
+        SyncMessage::FileStreamStartV2 {
+            task_id: task_id.to_string(),
+            relative_path: relative_path.to_string(),
+            total_bytes: 4,
+        },
+    )
+    .await;
+    write_v2_chunk_for_test(
+        &mut stream,
+        SyncMessage::FileChunkBinaryV2 {
+            task_id: task_id.to_string(),
+            relative_path: relative_path.to_string(),
+            offset: 1,
+            bytes: 4,
+            ack: true,
+        },
+        b"nope",
+    )
+    .await;
+
+    match read_one_message(&mut stream).await {
+        SyncMessage::FileStreamAckV2 { success, error, .. } => {
+            assert!(!success, "bad offset should be rejected");
+            assert!(
+                error.unwrap().contains("unexpected chunk offset"),
+                "error should explain offset failure"
+            );
+        }
+        other => panic!("expected FileStreamAckV2, got {:?}", other),
+    }
+
+    assert!(!remote_dir.path().join(relative_path).exists());
+    assert!(!remote_dir
+        .path()
+        .join(format!("{relative_path}.lanbridge-partial"))
+        .exists());
+}
+
+#[tokio::test]
+async fn test_v2_upload_returns_error_when_checkpoint_ack_fails() {
+    let local_identity = DeviceIdentity::generate();
+    let trusted = local_identity.public();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer_id = "v2-ack-failure-peer";
+    let task_id = "task-v2-ack-failure";
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        authenticate_legacy_server_stream(&mut stream, &trusted).await;
+        match read_one_message(&mut stream).await {
+            SyncMessage::TransferHello { .. } => {
+                write_message(
+                    &mut stream,
+                    SyncMessage::TransferReady {
+                        selected_version: 2,
+                        max_chunk_size: 4 * 1024 * 1024,
+                        ack_interval_bytes: 16 * 1024 * 1024,
+                    },
+                )
+                .await;
+            }
+            other => panic!("expected TransferHello, got {:?}", other),
+        }
+        let (stream_task, stream_path) = match read_one_message(&mut stream).await {
+            SyncMessage::FileStreamStartV2 {
+                task_id,
+                relative_path,
+                total_bytes,
+            } => {
+                assert_eq!(total_bytes, 17 * 1024 * 1024);
+                (task_id, relative_path)
+            }
+            other => panic!("expected FileStreamStartV2, got {:?}", other),
+        };
+        loop {
+            match read_one_message(&mut stream).await {
+                SyncMessage::FileChunkBinaryV2 {
+                    task_id,
+                    relative_path,
+                    bytes,
+                    ack,
+                    ..
+                } => {
+                    let mut payload = vec![0u8; bytes as usize];
+                    stream.read_exact(&mut payload).await.unwrap();
+                    if ack {
+                        write_message(
+                            &mut stream,
+                            SyncMessage::FileStreamAckV2 {
+                                task_id,
+                                relative_path,
+                                received_bytes: 0,
+                                success: false,
+                                error: Some("checkpoint rejected by test".to_string()),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                }
+                other => panic!("expected FileChunkBinaryV2, got {:?}", other),
+            }
+        }
+        assert_eq!(stream_task, task_id);
+        assert_eq!(stream_path, "ack-failure.bin");
+    });
+
+    let source_dir = TempDir::new().unwrap();
+    let source_path = source_dir.path().join("ack-failure.bin");
+    std::fs::write(&source_path, vec![5u8; 17 * 1024 * 1024]).unwrap();
+    let manager = ConnectionManager::new();
+    manager.register_connection(lanbridge::transport::PeerConnection {
+        device_id: peer_id.to_string(),
+        address: format!("127.0.0.1:{port}"),
+        connected: true,
+        last_seen_unix_ms: 0,
+    });
+    lanbridge::transport::connection::clear_cached_protocol(peer_id);
+
+    let err = lanbridge::transport::connection::send_authenticated_file_to_peer(
+        &manager,
+        &local_identity,
+        peer_id,
+        task_id,
+        "ack-failure.bin",
+        &source_path,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        err.contains("checkpoint rejected by test"),
+        "unexpected error: {err}"
     );
 }
 
@@ -1800,6 +2104,7 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
             primary_hash: snapshots[0].blake3_hash.clone(),
             primary_hash_status: snapshots[0].hash_status,
             primary_size: snapshots[0].size,
+            secondary_size: snapshots[0].size,
             primary_modified_unix_ms: snapshots[0].modified_unix_ms,
             secondary_hash: remote_report.blake3_hash.clone(),
             secondary_hash_status: HashStatus::Verified,
@@ -1820,6 +2125,12 @@ fn test_transfer_protocol_roundtrip() {
     let msg = SyncMessage::FileDelete {
         task_id: "task-456".to_string(),
         relative_path: "old.txt".to_string(),
+        expected_kind: None,
+        expected_hash: None,
+        expected_hash_status: None,
+        expected_size: None,
+        expected_modified_unix_ms: None,
+        delete_batch_id: None,
     };
 
     let encoded = encode_message(&msg).unwrap();
@@ -1829,9 +2140,21 @@ fn test_transfer_protocol_roundtrip() {
         SyncMessage::FileDelete {
             task_id,
             relative_path,
+            expected_kind,
+            expected_hash,
+            expected_hash_status,
+            expected_size,
+            expected_modified_unix_ms,
+            delete_batch_id,
         } => {
             assert_eq!(task_id, "task-456");
             assert_eq!(relative_path, "old.txt");
+            assert_eq!(expected_kind, None);
+            assert_eq!(expected_hash, None);
+            assert_eq!(expected_hash_status, None);
+            assert_eq!(expected_size, None);
+            assert_eq!(expected_modified_unix_ms, None);
+            assert_eq!(delete_batch_id, None);
         }
         _ => panic!("wrong message type"),
     }
@@ -1851,6 +2174,20 @@ async fn write_message(stream: &mut tokio::net::TcpStream, message: SyncMessage)
         .write_all(&encode_message(&message).unwrap())
         .await
         .unwrap();
+}
+
+async fn write_v2_chunk_for_test(
+    stream: &mut tokio::net::TcpStream,
+    header: SyncMessage,
+    payload: &[u8],
+) {
+    let json = serde_json::to_vec(&header).unwrap();
+    stream
+        .write_all(&(json.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&json).await.unwrap();
+    stream.write_all(payload).await.unwrap();
 }
 
 async fn authenticate_test_stream(stream: &mut tokio::net::TcpStream, identity: &DeviceIdentity) {

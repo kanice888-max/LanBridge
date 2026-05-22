@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 /// Current schema version. Increment when adding new migrations.
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 5;
 
 /// Run all pending migrations.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -21,6 +21,14 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     if version < 3 {
         migrate_v3(conn)?;
+    }
+
+    if version < 4 {
+        migrate_v4(conn)?;
+    }
+
+    if version < 5 {
+        migrate_v5(conn)?;
     }
 
     conn.pragma_update(None, "user_version", CURRENT_VERSION)?;
@@ -160,6 +168,39 @@ fn migrate_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add secondary_size to sync_baselines.
+fn migrate_v4(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "sync_baselines", "secondary_size")? {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE sync_baselines ADD COLUMN secondary_size INTEGER NOT NULL DEFAULT 0;
+            "#,
+        )?;
+    }
+    Ok(())
+}
+
+/// Persist transfers that the user explicitly deferred.
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS deferred_transfers (
+            task_id         TEXT NOT NULL,
+            relative_path   TEXT NOT NULL,
+            direction       TEXT NOT NULL DEFAULT 'upload',
+            reason          TEXT NOT NULL DEFAULT 'transfer deferred by user',
+            created_unix_ms INTEGER NOT NULL,
+            PRIMARY KEY (task_id, relative_path, direction),
+            FOREIGN KEY (task_id) REFERENCES sync_tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_deferred_transfers_task
+            ON deferred_transfers(task_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let mut rows = stmt.query([])?;
@@ -197,8 +238,10 @@ mod tests {
             CURRENT_VERSION
         );
         assert!(column_exists(&conn, "sync_baselines", "primary_size").unwrap());
+        assert!(column_exists(&conn, "sync_baselines", "secondary_size").unwrap());
         assert!(column_exists(&conn, "paired_devices", "last_address").unwrap());
         assert!(table_exists(&conn, "pending_outgoing_task_invites").unwrap());
+        assert!(table_exists(&conn, "deferred_transfers").unwrap());
     }
 
     fn table_exists(conn: &Connection, table: &str) -> Result<bool> {

@@ -97,7 +97,7 @@ fn plan_and_execute_primary(
 
 fn get_all_baselines_for_task(conn: &Connection, task_id: &Uuid) -> Vec<SyncBaseline> {
     let mut stmt = conn
-        .prepare("SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms FROM sync_baselines WHERE task_id = ?1")
+        .prepare("SELECT task_id, relative_path, primary_hash, primary_hash_status, primary_size, secondary_size, primary_modified_unix_ms, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, last_synced_unix_ms FROM sync_baselines WHERE task_id = ?1")
         .unwrap();
     let rows = stmt
         .query_map(rusqlite::params![task_id.to_string()], |row| {
@@ -112,11 +112,12 @@ fn get_all_baselines_for_task(conn: &Connection, task_id: &Uuid) -> Vec<SyncBase
                 primary_hash: row.get(2)?,
                 primary_hash_status: parse_hs(row.get(3)?),
                 primary_size: row.get(4)?,
-                primary_modified_unix_ms: row.get(5)?,
-                secondary_hash: row.get(6)?,
-                secondary_hash_status: parse_hs(row.get(7)?),
-                secondary_modified_unix_ms: row.get(8)?,
-                last_synced_unix_ms: row.get(9)?,
+                secondary_size: row.get(5)?,
+                primary_modified_unix_ms: row.get(6)?,
+                secondary_hash: row.get(7)?,
+                secondary_hash_status: parse_hs(row.get(8)?),
+                secondary_modified_unix_ms: row.get(9)?,
+                last_synced_unix_ms: row.get(10)?,
             })
         })
         .unwrap();
@@ -321,6 +322,7 @@ fn test_secondary_delete_does_not_affect_primary() {
         primary_hash: Some("hash1".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -376,6 +378,7 @@ fn test_return_sync_conflict_blocks_overwrite() {
             primary_hash: Some("original_hash".to_string()),
             primary_hash_status: HashStatus::Verified,
             primary_size: 100,
+            secondary_size: 100,
             primary_modified_unix_ms: 1000,
             secondary_hash: Some("original_hash".to_string()),
             secondary_hash_status: HashStatus::Verified,
@@ -599,6 +602,7 @@ fn test_same_hash_not_a_conflict() {
         primary_hash: Some("same_hash".to_string()), // same hash as current
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("old_hash".to_string()),
         secondary_hash_status: HashStatus::Verified,

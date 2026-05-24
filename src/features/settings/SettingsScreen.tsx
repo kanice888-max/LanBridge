@@ -1,75 +1,69 @@
 import { useEffect, useState } from "react";
 import { getSettings, type AppSettings } from "../../lib/tauriApi";
 import { useTranslation, type Lang } from "../../lib/i18n/context";
+import { isBrowserPreviewBridgeError } from "../../lib/runtime";
+import { ChevronDownIcon } from "../../components/icons/animate-icons";
 
-interface SettingsScreenProps {
-  onClose: () => void;
-}
-
-export function SettingsScreen({ onClose }: SettingsScreenProps) {
+export function SettingsScreen() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { lang, setLang, t } = useTranslation();
 
   useEffect(() => {
-    getSettings().then(setSettings).catch((e) => setError(String(e)));
+    getSettings().then(setSettings).catch((e) => {
+      if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+    });
   }, []);
 
   return (
-    <div className="settings-overlay" onClick={onClose}>
-      <div className="settings-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="settings-panel-header">
-          <h2>{t.settings.title}</h2>
-          <button className="btn btn-ghost btn-small" onClick={onClose}>
-            <svg viewBox="0 0 24 24" style={{width:14,height:14,stroke:"currentColor",fill:"none",strokeWidth:2,strokeLinecap:"round"}}>
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
-          </button>
+    <section className="settings-screen stage-list-page">
+      <div className="stage-page-header">
+        <h1>{t.settings.title}</h1>
+      </div>
+
+      {error && <div className="top-inline-error">{error}</div>}
+
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.fileStatus}</div>
+        <label className="stage-row settings-stage-row">
+          <span>{t.settings.language}</span>
+          <span className="settings-select-wrap">
+            <select
+              className="settings-select"
+              value={lang}
+              onChange={(e) => setLang(e.target.value as Lang)}
+            >
+              <option value="zh">{t.settings.langZh}</option>
+              <option value="en">{t.settings.langEn}</option>
+            </select>
+            <ChevronDownIcon size={15} isAnimated={false} />
+          </span>
+        </label>
+      </div>
+
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.historyRetention}</div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.retentionPeriod}</span>
+          <strong>{settings ? `${settings.history_retention_days}${t.settings.days}` : "-"}</strong>
         </div>
-
-        <div className="settings-panel-body">
-          {error && <div className="error-message">{error}</div>}
-
-          <div className="settings-block">
-            <h3>{t.settings.language}</h3>
-            <div className="settings-row">
-              <span className="settings-label">{t.settings.language}</span>
-              <select className="settings-select" value={lang} onChange={(e) => setLang(e.target.value as Lang)}>
-                <option value="zh">{t.settings.langZh}</option>
-                <option value="en">{t.settings.langEn}</option>
-              </select>
-            </div>
-          </div>
-
-          {settings && (
-            <div className="settings-block">
-              <h3>{t.settings.historyRetention}</h3>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.retentionPeriod}</span>
-                <span className="settings-value">{settings.history_retention_days} {t.settings.days}</span>
-              </div>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.sizeLimit}</span>
-                <span className="settings-value">{settings.history_size_limit_mb} {t.settings.mb}</span>
-              </div>
-
-              <h3 style={{ marginTop: "var(--space-5)", paddingTop: "var(--space-5)", borderTop: "1px solid var(--border-light)" }}>{t.settings.about}</h3>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.version}</span>
-                <span className="settings-value">0.1.0</span>
-              </div>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.syncModel}</span>
-                <span className="settings-value">{t.settings.syncModelDesc}</span>
-              </div>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.hashAlgorithm}</span>
-                <span className="settings-value">BLAKE3</span>
-              </div>
-            </div>
-          )}
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.sizeLimit}</span>
+          <strong>{settings ? `${settings.history_size_limit_mb}${t.settings.mb}` : "-"}</strong>
         </div>
       </div>
-    </div>
+
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.about}</div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.version}</span>
+          <strong>0.1.0</strong>
+        </div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.hashAlgorithm}</span>
+          <strong>BLAKE3</strong>
+        </div>
+      </div>
+    </section>
   );
 }

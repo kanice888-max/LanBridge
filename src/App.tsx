@@ -12,38 +12,60 @@ import {
 import { LanguageProvider, useTranslation } from "./lib/i18n/context";
 import { TabBar, type Tab } from "./components/TabBar";
 import { ProgressBar } from "./components/ProgressBar";
-import { Dashboard } from "./features/dashboard/Dashboard";
-import { TaskDetail } from "./features/sync-task/TaskDetail";
+import { ShadowLayer, ShadowLayerProvider } from "./components/ShadowLayer";
+import { TopMessageList } from "./components/TopMessageList";
+import {
+  FolderTransitionProvider,
+  useStartFolderTransition,
+} from "./components/FolderPageTransition";
+import { SyncStage } from "./features/sync-task/SyncStage";
 import { PairingScreen } from "./features/pairing/PairingScreen";
-import { HistoryScreen } from "./features/history/HistoryScreen";
 import { LogsScreen } from "./features/logs/LogsScreen";
 import { SettingsScreen } from "./features/settings/SettingsScreen";
+import { isBrowserPreviewBridgeError } from "./lib/runtime";
 import "./styles.css";
 
 function AppContent() {
-  const [tab, setTab] = useState<Tab>("sync");
+  const [tab, setTab] = useState<Tab>("discover");
+  const [pageTransitionPhase, setPageTransitionPhase] = useState<"idle" | "exit" | "enter">("idle");
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
   const [tasks, setTasks] = useState<SyncTask[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const initialized = useRef(false);
   const autoSyncInFlight = useRef<Set<string>>(new Set());
   const lastPeerConnected = useRef<Map<string, boolean>>(new Map());
+  const pageTransitionTimer = useRef<number | null>(null);
   const { t } = useTranslation();
+  const startFolderTransition = useStartFolderTransition();
 
   const refreshTasks = useCallback(async () => {
     try {
-      const t = await listSyncTasks();
-      setTasks(t);
+      const nextTasks = await listSyncTasks();
+      setTasks(nextTasks);
+      if (!initialized.current) {
+        initialized.current = true;
+        const latest = [...nextTasks].sort(
+          (a, b) => b.updated_unix_ms - a.updated_unix_ms
+        )[0];
+        if (latest) {
+          setSelectedTaskId(latest.id);
+          setTab("sync");
+        } else {
+          setTab("discover");
+        }
+      }
     } catch (e) {
-      setError(String(e));
+      if (!isBrowserPreviewBridgeError(e)) setError(String(e));
     }
   }, []);
 
   useEffect(() => {
     getIdentity()
       .then(setIdentity)
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+      });
     refreshTasks();
   }, [refreshTasks]);
 
@@ -93,12 +115,18 @@ function AppContent() {
     };
   }, [tasks]);
 
+  useEffect(() => () => {
+    if (pageTransitionTimer.current !== null) {
+      window.clearTimeout(pageTransitionTimer.current);
+    }
+  }, []);
+
   const handleSelectTask = (taskId: string) => {
     setSelectedTaskId(taskId);
   };
 
   const handleCreateTask = () => {
-    setTab("devices");
+    setTab("discover");
   };
 
   const handlePairingComplete = () => {
@@ -106,45 +134,50 @@ function AppContent() {
     setTab("sync");
   };
 
+  const handleTabChange = (newTab: Tab) => {
+    if (newTab === tab) return;
+    if (pageTransitionTimer.current !== null) {
+      window.clearTimeout(pageTransitionTimer.current);
+      pageTransitionTimer.current = null;
+    }
+
+    const canFlyFolder =
+      (tab === "sync" && newTab === "discover") ||
+      (tab === "discover" && newTab === "sync");
+
+    if (canFlyFolder) startFolderTransition?.(tab, newTab);
+    setPageTransitionPhase("exit");
+    pageTransitionTimer.current = window.setTimeout(() => {
+      setTab(newTab);
+      setPageTransitionPhase("enter");
+      pageTransitionTimer.current = window.setTimeout(() => {
+        setPageTransitionPhase("idle");
+        pageTransitionTimer.current = null;
+      }, 300);
+    }, 90);
+  };
+
   const renderTabContent = () => {
     switch (tab) {
       case "sync":
         return (
-          <div className="sync-workspace">
-            <Dashboard
-              identity={identity}
-              tasks={tasks}
-              selectedTaskId={selectedTaskId}
-              onSelectTask={handleSelectTask}
-              onCreateTask={handleCreateTask}
-              onRefresh={refreshTasks}
-            />
-            {selectedTaskId ? (
-              <TaskDetail
-                taskId={selectedTaskId}
-                onClose={() => setSelectedTaskId(null)}
-              />
-            ) : (
-              <div className="task-detail-panel">
-                <div className="task-detail-empty">
-                  <svg viewBox="0 0 24 24">
-                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  </svg>
-                  <p>{t.app.selectTaskHint}</p>
-                </div>
-              </div>
-            )}
-          </div>
+          <SyncStage
+            tasks={tasks}
+            selectedTaskId={selectedTaskId}
+            onSelectTask={handleSelectTask}
+            onCreateTask={handleCreateTask}
+            onRefresh={refreshTasks}
+          />
         );
 
-      case "devices":
+      case "discover":
         return <PairingScreen onComplete={handlePairingComplete} />;
-
-      case "history":
-        return <HistoryScreen taskId={selectedTaskId} />;
 
       case "logs":
         return <LogsScreen />;
+
+      case "settings":
+        return <SettingsScreen />;
 
       default:
         return null;
@@ -153,23 +186,25 @@ function AppContent() {
 
   return (
     <div className="app-layout">
+      <div className="stage-dot-pattern" aria-hidden="true" />
+      <ShadowLayer />
+
       <TabBar
         currentTab={tab}
-        onTabChange={(newTab) => {
-          setTab(newTab);
-          if (newTab !== "sync") setSelectedTaskId(null);
-        }}
-        onSettings={() => setSettingsOpen(true)}
+        onTabChange={handleTabChange}
       />
 
-      {error && (
-        <div className="error-banner">
-          <span>{error}</span>
-          <button onClick={() => setError(null)}>{t.app.dismiss}</button>
-        </div>
-      )}
+      <TopMessageList
+        messages={error ? [{
+          id: "app-error",
+          tone: "danger",
+          icon: "!",
+          title: error,
+          action: <button className="top-message-action" type="button" onClick={() => setError(null)}>{t.app.dismiss}</button>,
+        }] : []}
+      />
 
-      {tab === "sync" && identity && (
+      {identity && (
         <div className="device-bar">
           <span className="device-bar-dot" />
           <span className="device-bar-name">{identity.display_name}</span>
@@ -179,11 +214,10 @@ function AppContent() {
 
       <ProgressBar />
 
-      <main className="main-content">{renderTabContent()}</main>
+      <main className={`main-content page-transition-${pageTransitionPhase}`}>
+        {renderTabContent()}
+      </main>
 
-      {settingsOpen && (
-        <SettingsScreen onClose={() => setSettingsOpen(false)} />
-      )}
     </div>
   );
 }
@@ -191,7 +225,11 @@ function AppContent() {
 export default function App() {
   return (
     <LanguageProvider>
-      <AppContent />
+      <ShadowLayerProvider>
+        <FolderTransitionProvider>
+          <AppContent />
+        </FolderTransitionProvider>
+      </ShadowLayerProvider>
     </LanguageProvider>
   );
 }

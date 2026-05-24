@@ -20,6 +20,7 @@ import {
 import { ReturnSyncScreen } from "../return-sync/ReturnSyncScreen";
 import { HistoryScreen } from "../history/HistoryScreen";
 import { useTranslation } from "../../lib/i18n/context";
+import { XIcon } from "../../components/icons/animate-icons";
 
 interface TaskDetailProps {
   taskId: string;
@@ -208,9 +209,7 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
           </span>
         </div>
         <button className="btn btn-ghost btn-small" onClick={onClose}>
-          <svg viewBox="0 0 24 24" style={{width:14,height:14,stroke:"currentColor",fill:"none",strokeWidth:2,strokeLinecap:"round"}}>
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
+          <XIcon size={14} />
           {t.task.close}
         </button>
       </div>

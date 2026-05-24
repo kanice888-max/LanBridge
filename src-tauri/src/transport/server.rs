@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -38,6 +38,13 @@ pub struct TaskRootRegistry {
     auto_accept_task_invites: Arc<Mutex<bool>>,
     task_invites: Arc<Mutex<HashMap<String, PendingTaskInvite>>>,
     state_db_path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+fn recover_lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(lock = name, "recovering poisoned server lock");
+        poisoned.into_inner()
+    })
 }
 
 /// Tracks an in-progress file reception. Not `Clone` — `file: std::fs::File` is not cloneable.
@@ -279,7 +286,7 @@ impl TaskRootRegistry {
             std::fs::create_dir_all(root)?;
         }
 
-        let mut roots = self.roots.lock().unwrap();
+        let mut roots = recover_lock(&self.roots, "task_roots.roots");
         roots.insert(task_id.into(), root.to_path_buf());
         drop(roots);
         self.save_roots()?;
@@ -287,12 +294,12 @@ impl TaskRootRegistry {
     }
 
     pub fn unregister(&self, task_id: &str) -> Result<()> {
-        let mut roots = self.roots.lock().unwrap();
+        let mut roots = recover_lock(&self.roots, "task_roots.roots");
         roots.remove(task_id);
         drop(roots);
 
         let prefix = format!("{}\n", task_id);
-        let mut incoming = self.incoming.lock().unwrap();
+        let mut incoming = recover_lock(&self.incoming, "task_roots.incoming");
         incoming.retain(|key, _| !key.starts_with(&prefix));
         drop(incoming);
 
@@ -301,7 +308,7 @@ impl TaskRootRegistry {
     }
 
     pub fn retain_registered_roots(&self, task_ids: &HashSet<String>) -> Result<()> {
-        let mut roots = self.roots.lock().unwrap();
+        let mut roots = recover_lock(&self.roots, "task_roots.roots");
         roots.retain(|task_id, _| task_ids.contains(task_id));
         drop(roots);
         self.save_roots()?;
@@ -309,14 +316,14 @@ impl TaskRootRegistry {
     }
 
     fn root_for(&self, task_id: &str) -> Option<PathBuf> {
-        let roots = self.roots.lock().unwrap();
+        let roots = recover_lock(&self.roots, "task_roots.roots");
         roots.get(task_id).cloned()
     }
 
     pub fn cancel_incoming_transfer(&self, task_id: &str, relative_path: &str) -> Result<()> {
         let key = transfer_key(task_id, relative_path);
         let transfer = {
-            let mut incoming = self.incoming.lock().unwrap();
+            let mut incoming = recover_lock(&self.incoming, "task_roots.incoming");
             incoming.remove(&key)
         };
         if let Some(transfer) = transfer {
@@ -329,12 +336,12 @@ impl TaskRootRegistry {
     }
 
     pub fn register_trusted_peer(&self, identity: PublicIdentity) {
-        let mut peers = self.trusted_peers.lock().unwrap();
+        let mut peers = recover_lock(&self.trusted_peers, "task_roots.trusted_peers");
         peers.insert(identity.device_id.clone(), identity);
     }
 
     fn trusted_peer(&self, device_id: &str) -> Option<PublicIdentity> {
-        let peers = self.trusted_peers.lock().unwrap();
+        let peers = recover_lock(&self.trusted_peers, "task_roots.trusted_peers");
         peers.get(device_id).cloned()
     }
 
@@ -354,34 +361,43 @@ impl TaskRootRegistry {
     }
 
     pub fn set_local_identity(&self, identity: PublicIdentity) {
-        let mut local_identity = self.local_identity.lock().unwrap();
+        let mut local_identity = recover_lock(&self.local_identity, "task_roots.local_identity");
         *local_identity = Some(identity);
     }
 
     fn local_identity(&self) -> Option<PublicIdentity> {
-        let local_identity = self.local_identity.lock().unwrap();
+        let local_identity = recover_lock(&self.local_identity, "task_roots.local_identity");
         local_identity.clone()
     }
 
     pub fn set_task_invite_inbox_root(&self, root: impl AsRef<Path>) -> Result<()> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        let mut task_invite_inbox_root = self.task_invite_inbox_root.lock().unwrap();
+        let mut task_invite_inbox_root = recover_lock(
+            &self.task_invite_inbox_root,
+            "task_roots.task_invite_inbox_root",
+        );
         *task_invite_inbox_root = Some(root);
         Ok(())
     }
 
     pub fn set_auto_accept_task_invites(&self, auto_accept: bool) {
-        let mut current = self.auto_accept_task_invites.lock().unwrap();
+        let mut current = recover_lock(
+            &self.auto_accept_task_invites,
+            "task_roots.auto_accept_task_invites",
+        );
         *current = auto_accept;
     }
 
     fn auto_accept_task_invites(&self) -> bool {
-        *self.auto_accept_task_invites.lock().unwrap()
+        *recover_lock(
+            &self.auto_accept_task_invites,
+            "task_roots.auto_accept_task_invites",
+        )
     }
 
     pub fn list_task_invites(&self) -> Vec<PendingTaskInvite> {
-        let invites = self.task_invites.lock().unwrap();
+        let invites = recover_lock(&self.task_invites, "task_roots.task_invites");
         invites.values().cloned().collect()
     }
 
@@ -393,7 +409,7 @@ impl TaskRootRegistry {
         let local_path = local_path.as_ref().to_path_buf();
         validate_invite_local_path(&local_path)?;
         let invite_snapshot = {
-            let invites = self.task_invites.lock().unwrap();
+            let invites = recover_lock(&self.task_invites, "task_roots.task_invites");
             invites
                 .get(invite_id)
                 .ok_or_else(|| anyhow::anyhow!("task invite not found"))?
@@ -405,7 +421,7 @@ impl TaskRootRegistry {
         )?;
         self.register(&invite_snapshot.task_id, &local_path)?;
 
-        let mut invites = self.task_invites.lock().unwrap();
+        let mut invites = recover_lock(&self.task_invites, "task_roots.task_invites");
         let invite = invites
             .get_mut(invite_id)
             .ok_or_else(|| anyhow::anyhow!("task invite not found"))?;
@@ -425,7 +441,7 @@ impl TaskRootRegistry {
     }
 
     pub fn reject_task_invite(&self, invite_id: &str, reason: &str) -> Result<PendingTaskInvite> {
-        let mut invites = self.task_invites.lock().unwrap();
+        let mut invites = recover_lock(&self.task_invites, "task_roots.task_invites");
         let invite = invites
             .get_mut(invite_id)
             .ok_or_else(|| anyhow::anyhow!("task invite not found"))?;
@@ -463,7 +479,7 @@ impl TaskRootRegistry {
             error: None,
             created_unix_ms: now_ms(),
         };
-        let mut invites = self.task_invites.lock().unwrap();
+        let mut invites = recover_lock(&self.task_invites, "task_roots.task_invites");
         invites.insert(invite_id, invite.clone());
         drop(invites);
         self.save_task_invites()?;
@@ -471,13 +487,16 @@ impl TaskRootRegistry {
     }
 
     fn task_invite_status(&self, invite_id: &str) -> Option<PendingTaskInvite> {
-        let invites = self.task_invites.lock().unwrap();
+        let invites = recover_lock(&self.task_invites, "task_roots.task_invites");
         invites.get(invite_id).cloned()
     }
 
     fn invite_root(&self, task_id: &str, task_name: &str) -> Result<PathBuf> {
         let base = {
-            let task_invite_inbox_root = self.task_invite_inbox_root.lock().unwrap();
+            let task_invite_inbox_root = recover_lock(
+                &self.task_invite_inbox_root,
+                "task_roots.task_invite_inbox_root",
+            );
             task_invite_inbox_root.clone()
         }
         .ok_or_else(|| anyhow::anyhow!("task invite inbox is not configured"))?;
@@ -496,13 +515,14 @@ impl TaskRootRegistry {
         if path.exists() {
             let bytes = std::fs::read(&path)?;
             let persisted: HashMap<String, String> = serde_json::from_slice(&bytes)?;
-            let mut roots = self.roots.lock().unwrap();
+            let mut roots = recover_lock(&self.roots, "task_roots.roots");
             for (task_id, root) in persisted {
                 roots.insert(task_id, PathBuf::from(root));
             }
         }
 
-        let mut persistence_path = self.persistence_path.lock().unwrap();
+        let mut persistence_path =
+            recover_lock(&self.persistence_path, "task_roots.persistence_path");
         *persistence_path = Some(path);
         drop(persistence_path);
         self.save_roots()
@@ -513,13 +533,13 @@ impl TaskRootRegistry {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut state_db_path = self.state_db_path.lock().unwrap();
+        let mut state_db_path = recover_lock(&self.state_db_path, "task_roots.state_db_path");
         *state_db_path = Some(path);
         Ok(())
     }
 
     fn state_db_path(&self) -> Option<PathBuf> {
-        self.state_db_path.lock().unwrap().clone()
+        recover_lock(&self.state_db_path, "task_roots.state_db_path").clone()
     }
 
     pub fn set_task_invites_persistence_path(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -531,13 +551,16 @@ impl TaskRootRegistry {
         if path.exists() {
             let bytes = std::fs::read(&path)?;
             let persisted: HashMap<String, PendingTaskInvite> = serde_json::from_slice(&bytes)?;
-            let mut invites = self.task_invites.lock().unwrap();
+            let mut invites = recover_lock(&self.task_invites, "task_roots.task_invites");
             for (invite_id, invite) in persisted {
                 invites.insert(invite_id, invite);
             }
         }
 
-        let mut persistence_path = self.task_invite_persistence_path.lock().unwrap();
+        let mut persistence_path = recover_lock(
+            &self.task_invite_persistence_path,
+            "task_roots.task_invite_persistence_path",
+        );
         *persistence_path = Some(path);
         drop(persistence_path);
         self.save_task_invites()
@@ -545,14 +568,17 @@ impl TaskRootRegistry {
 
     fn save_task_invites(&self) -> Result<()> {
         let path = {
-            let persistence_path = self.task_invite_persistence_path.lock().unwrap();
+            let persistence_path = recover_lock(
+                &self.task_invite_persistence_path,
+                "task_roots.task_invite_persistence_path",
+            );
             persistence_path.clone()
         };
         let Some(path) = path else {
             return Ok(());
         };
 
-        let invites = self.task_invites.lock().unwrap();
+        let invites = recover_lock(&self.task_invites, "task_roots.task_invites");
         let bytes = serde_json::to_vec_pretty(&*invites)?;
         std::fs::write(path, bytes)?;
         Ok(())
@@ -560,14 +586,15 @@ impl TaskRootRegistry {
 
     fn save_roots(&self) -> Result<()> {
         let path = {
-            let persistence_path = self.persistence_path.lock().unwrap();
+            let persistence_path =
+                recover_lock(&self.persistence_path, "task_roots.persistence_path");
             persistence_path.clone()
         };
         let Some(path) = path else {
             return Ok(());
         };
 
-        let roots = self.roots.lock().unwrap();
+        let roots = recover_lock(&self.roots, "task_roots.roots");
         let persisted = roots
             .iter()
             .map(|(task_id, root)| (task_id.clone(), root.to_string_lossy().to_string()))
@@ -1672,7 +1699,7 @@ fn start_incoming_chunked_file(
         file,
         timing: V2ReceiveTiming::default(),
     };
-    let mut incoming = task_roots.incoming.lock().unwrap();
+    let mut incoming = recover_lock(&task_roots.incoming, "task_roots.incoming");
     incoming.insert(transfer_key(task_id, relative_path), transfer);
     Ok(())
 }
@@ -1693,7 +1720,7 @@ fn append_incoming_chunk(
     }
 
     let key = transfer_key(task_id, relative_path);
-    let mut incoming = task_roots.incoming.lock().unwrap();
+    let mut incoming = recover_lock(&task_roots.incoming, "task_roots.incoming");
     let mismatch_partial_path = {
         let transfer = incoming
             .get_mut(&key)
@@ -1799,7 +1826,7 @@ fn finish_incoming_chunked_file(
     use std::io::Write;
     let key = transfer_key(task_id, relative_path);
     let mut transfer = {
-        let mut incoming = task_roots.incoming.lock().unwrap();
+        let mut incoming = recover_lock(&task_roots.incoming, "task_roots.incoming");
         incoming
             .remove(&key)
             .ok_or_else(|| anyhow::anyhow!("chunked transfer not started"))?
@@ -1897,7 +1924,7 @@ fn start_incoming_v2(
         file,
         timing: V2ReceiveTiming::default(),
     };
-    let mut incoming = task_roots.incoming.lock().unwrap();
+    let mut incoming = recover_lock(&task_roots.incoming, "task_roots.incoming");
     incoming.insert(transfer_key(task_id, relative_path), transfer);
     Ok(())
 }
@@ -1911,7 +1938,7 @@ fn finish_incoming_v2(
     use std::io::Write;
     let key = transfer_key(task_id, relative_path);
     let mut transfer = {
-        let mut incoming = task_roots.incoming.lock().unwrap();
+        let mut incoming = recover_lock(&task_roots.incoming, "task_roots.incoming");
         incoming
             .remove(&key)
             .ok_or_else(|| anyhow::anyhow!("v2 stream not started"))?
@@ -2441,7 +2468,7 @@ fn remote_scan_hash_state(
     size: i64,
     modified_unix_ms: i64,
 ) -> Result<(Option<String>, HashStatus)> {
-    if size > crate::core::scanner::EAGER_HASH_LIMIT {
+    if !crate::core::scanner::should_hash_file_during_scan(size) {
         if let Some(hash) =
             cached_verified_hash(task_roots, task_id, relative_path, size, modified_unix_ms)
         {

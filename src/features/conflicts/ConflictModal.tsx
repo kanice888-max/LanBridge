@@ -1,5 +1,4 @@
 import { type ConflictInfo } from "../../lib/tauriApi";
-import { useTranslation } from "../../lib/i18n/context";
 
 interface ConflictModalProps {
   conflict: ConflictInfo;
@@ -14,47 +13,54 @@ export function ConflictModal({
   onKeepBoth,
   onCancel,
 }: ConflictModalProps) {
-  const { t } = useTranslation();
-  const formatTime = (unixMs: number) => new Date(unixMs).toLocaleString();
+  const formatTime = (unixMs: number) =>
+    new Date(unixMs).toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
 
   return (
     <div className="modal-overlay" onClick={onCancel}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>{t.conflict.title}</h2>
-        <p className="conflict-description">
-          <strong>{conflict.relative_path}</strong>
-          <br />
-          {t.conflict.description}
-        </p>
+      <div className="modal conflict-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="conflict-modal-head">
+          <span>!</span>
+          <div>
+            <h2>发现冲突</h2>
+            <p>{conflict.relative_path}</p>
+          </div>
+        </div>
 
         {conflict.hash_unverified && (
-          <div className="hash-warning">{t.conflict.hashWarning}</div>
+          <div className="hash-warning">文件校验未完成，请谨慎选择。</div>
         )}
 
         <div className="conflict-details">
           <div className="conflict-side">
-            <h3>{t.conflict.primarySide}</h3>
-            <p>{t.conflict.modified} {formatTime(conflict.primary_modified_unix_ms)}</p>
+            <h3>主机</h3>
+            <p>{formatTime(conflict.primary_modified_unix_ms)}</p>
           </div>
           <div className="conflict-side">
-            <h3>{t.conflict.secondarySide}</h3>
-            <p>{t.conflict.modified} {formatTime(conflict.secondary_modified_unix_ms)}</p>
+            <h3>副机</h3>
+            <p>{formatTime(conflict.secondary_modified_unix_ms)}</p>
           </div>
         </div>
 
         <div className="safety-notice">
-          <span><strong>{t.conflict.note}</strong> {t.conflict.noteDesc}</span>
+          <span>覆盖主机前会先备份。</span>
         </div>
 
         <div className="modal-actions">
           <button className="btn btn-secondary" onClick={onCancel}>
-            {t.conflict.cancel}
+            取消
           </button>
           <button className="btn btn-secondary" onClick={onKeepBoth}>
-            {t.conflict.keepBoth}
+            保留两份
           </button>
           <button className="btn btn-danger" onClick={onOverwrite}>
-            {t.conflict.overwrite}
+            覆盖主机
           </button>
         </div>
       </div>

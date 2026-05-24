@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -57,6 +57,13 @@ static DEFERRED_TRANSFERS: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const TRANSFER_DIRECTIONS: [&str; 4] = ["upload", "download", "receive", "serve"];
+
+fn recover_lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(lock = name, "recovering poisoned transfer lock");
+        poisoned.into_inner()
+    })
+}
 
 pub fn new_transfer_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -470,49 +477,49 @@ impl ConnectionManager {
     }
     /// Pin a peer identity after successful pairing.
     pub fn pin_peer(&self, identity: PublicIdentity) {
-        let mut pins = self.pinned_identities.lock().unwrap();
+        let mut pins = recover_lock(&self.pinned_identities, "pinned_identities");
         pins.insert(identity.device_id.clone(), identity);
     }
     /// Check if a device ID is pinned.
     pub fn is_pinned(&self, device_id: &str) -> bool {
-        let pins = self.pinned_identities.lock().unwrap();
+        let pins = recover_lock(&self.pinned_identities, "pinned_identities");
         pins.contains_key(device_id)
     }
     /// Get a pinned peer identity.
     pub fn get_pinned(&self, device_id: &str) -> Option<PublicIdentity> {
-        let pins = self.pinned_identities.lock().unwrap();
+        let pins = recover_lock(&self.pinned_identities, "pinned_identities");
         pins.get(device_id).cloned()
     }
     /// Register a connected peer.
     pub fn register_connection(&self, conn: PeerConnection) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = recover_lock(&self.peers, "peers");
         peers.insert(conn.device_id.clone(), conn);
     }
     /// Mark a peer as disconnected.
     pub fn disconnect(&self, device_id: &str) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = recover_lock(&self.peers, "peers");
         if let Some(peer) = peers.get_mut(device_id) {
             peer.connected = false;
         }
     }
     /// Check if a peer is currently connected.
     pub fn is_connected(&self, device_id: &str) -> bool {
-        let peers = self.peers.lock().unwrap();
+        let peers = recover_lock(&self.peers, "peers");
         peers.get(device_id).map_or(false, |p| p.connected)
     }
     /// List all known peer connections.
     pub fn list_peers(&self) -> Vec<PeerConnection> {
-        let peers = self.peers.lock().unwrap();
+        let peers = recover_lock(&self.peers, "peers");
         peers.values().cloned().collect()
     }
     /// Get a known peer connection by device ID.
     pub fn get_peer(&self, device_id: &str) -> Option<PeerConnection> {
-        let peers = self.peers.lock().unwrap();
+        let peers = recover_lock(&self.peers, "peers");
         peers.get(device_id).cloned()
     }
 
     pub fn mark_connected(&self, device_id: &str) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = recover_lock(&self.peers, "peers");
         if let Some(peer) = peers.get_mut(device_id) {
             peer.connected = true;
             peer.last_seen_unix_ms = now_ms();

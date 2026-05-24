@@ -14,14 +14,39 @@ mod transport;
 
 use anyhow::{Context, Result};
 use platform::traits::Platform;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Copy)]
+struct LanBridgeLogWriter;
+
+impl<'a> MakeWriter<'a> for LanBridgeLogWriter {
+    type Writer = Box<dyn Write + Send>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let path = lanbridge_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => Box::new(file),
+            Err(_) => Box::new(io::sink()),
+        }
+    }
+}
 
 fn main() {
     install_crash_hook();
     if let Err(error) = run_app() {
-        write_startup_crash(&format!("{error:?}"));
+        let message = format!("{error:?}");
+        write_startup_crash(&message);
+        write_lanbridge_log(&message);
         eprintln!("LanBridge failed to start: {error:?}");
         std::process::exit(1);
     }
@@ -33,7 +58,13 @@ fn run_app() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(LanBridgeLogWriter)
         .init();
+    write_lanbridge_log(&format!(
+        "LanBridge start; log_path={}",
+        lanbridge_log_path().display()
+    ));
+    tracing::info!(log_path = %lanbridge_log_path().display(), "LanBridge logging initialized");
 
     // Load identity BEFORE Tauri so discovery can use the real device_id
     let platform: Box<dyn Platform> = Box::new(
@@ -96,6 +127,7 @@ fn run_app() -> Result<()> {
             commands::get_sync_task,
             commands::toggle_task_enabled,
             commands::list_ready_auto_sync_tasks,
+            commands::get_task_file_list_refresh_hint,
             commands::scan_task,
             commands::sync_now,
             commands::list_pending_returns,
@@ -131,7 +163,9 @@ fn run_app() -> Result<()> {
 
 fn install_crash_hook() {
     std::panic::set_hook(Box::new(|panic_info| {
-        write_startup_crash(&format!("panic: {panic_info}"));
+        let message = format!("panic: {panic_info}");
+        write_startup_crash(&message);
+        write_lanbridge_log(&message);
     }));
 }
 
@@ -150,6 +184,14 @@ fn write_startup_crash(message: &str) {
 }
 
 fn startup_crash_log_path() -> PathBuf {
+    app_data_dir().join("startup-crash.log")
+}
+
+fn lanbridge_log_path() -> PathBuf {
+    app_data_dir().join("lanbridge.log")
+}
+
+fn app_data_dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| {
@@ -159,7 +201,20 @@ fn startup_crash_log_path() -> PathBuf {
         })
         .unwrap_or_else(std::env::temp_dir)
         .join("LanBridge")
-        .join("startup-crash.log")
+}
+
+fn write_lanbridge_log(message: &str) {
+    let path = lanbridge_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "[{}] {}", now_ms(), message);
+    }
 }
 
 fn now_ms() -> u128 {

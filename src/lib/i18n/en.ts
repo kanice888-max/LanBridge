@@ -4,7 +4,7 @@ export const en: Translations = {
   // Tab Bar
   tabBar: {
     sync: "Sync",
-    devices: "Devices",
+    devices: "Discover",
     history: "History",
     logs: "Logs",
   },
@@ -144,7 +144,7 @@ export const en: Translations = {
     noSafeReturnItems: "No files are safe to return yet. Resolve conflicts or reconnect the primary first.",
     viewHistory: "View History →",
     lastResults: "Last Sync Results",
-    files: "Files",
+    files: "File Status",
     subTabs: {
       info: "Info",
       returnSync: "Return Sync",
@@ -226,6 +226,7 @@ export const en: Translations = {
   settings: {
     title: "Settings",
     back: "Back",
+    fileStatus: "File Status",
     language: "Language",
     langZh: "中文",
     langEn: "English",

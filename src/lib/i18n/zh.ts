@@ -2,7 +2,7 @@ export const zh = {
   // Tab Bar
   tabBar: {
     sync: "同步",
-    devices: "设备",
+    devices: "发现",
     history: "历史",
     logs: "日志",
   },
@@ -139,7 +139,7 @@ export const zh = {
     noSafeReturnItems: "没有可安全回传的文件，请先处理冲突或等待主机连接后再试。",
     viewHistory: "查看历史 →",
     lastResults: "上次同步结果",
-    files: "文件",
+    files: "文件状态",
     subTabs: {
       info: "信息",
       returnSync: "待回传",
@@ -217,10 +217,11 @@ export const zh = {
   settings: {
     title: "设置",
     back: "返回",
+    fileStatus: "文件状态",
     language: "语言",
     langZh: "中文",
     langEn: "English",
-    historyRetention: "历史保留",
+    historyRetention: "历史记录",
     retentionPeriod: "保留周期",
     days: "天",
     sizeLimit: "大小限制",

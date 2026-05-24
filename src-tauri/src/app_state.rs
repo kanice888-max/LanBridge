@@ -75,6 +75,7 @@ pub struct AppState {
     pub pending_outgoing_invites: Mutex<HashMap<String, PendingOutgoingTaskInvite>>,
     pub sync_runs: SyncRunCoordinator,
     pub dirty_tasks: TaskDirtyTracker,
+    pub file_list_refresh: FileListRefreshTracker,
     /// File watchers kept alive for the lifetime of the app.
     /// Each watcher monitors one task's sync root.
     /// Event receivers are consumed by background dirty-marker threads.
@@ -82,6 +83,85 @@ pub struct AppState {
 }
 
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(2_500);
+
+#[derive(Debug, Clone)]
+pub struct FileListRefreshTracker {
+    tasks: Arc<Mutex<HashMap<Uuid, FileListRefreshState>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileListRefreshSnapshot {
+    pub revision: u64,
+    pub last_changed_at: Option<Instant>,
+    pub reason: &'static str,
+}
+
+#[derive(Debug)]
+struct FileListRefreshState {
+    revision: u64,
+    last_changed_at: Option<Instant>,
+    reason: &'static str,
+    last_metadata_check_at: Option<Instant>,
+}
+
+impl Default for FileListRefreshTracker {
+    fn default() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl FileListRefreshTracker {
+    pub fn mark(&self, task_id: Uuid, reason: &'static str) {
+        let mut tasks = self.tasks.lock().unwrap();
+        let state = tasks.entry(task_id).or_insert_with(|| FileListRefreshState {
+            revision: 0,
+            last_changed_at: None,
+            reason: "none",
+            last_metadata_check_at: None,
+        });
+        state.revision = state.revision.saturating_add(1);
+        state.last_changed_at = Some(Instant::now());
+        state.reason = reason;
+    }
+
+    pub fn snapshot(&self, task_id: Uuid) -> FileListRefreshSnapshot {
+        let tasks = self.tasks.lock().unwrap();
+        if let Some(state) = tasks.get(&task_id) {
+            FileListRefreshSnapshot {
+                revision: state.revision,
+                last_changed_at: state.last_changed_at,
+                reason: state.reason,
+            }
+        } else {
+            FileListRefreshSnapshot {
+                revision: 0,
+                last_changed_at: None,
+                reason: "none",
+            }
+        }
+    }
+
+    pub fn should_check_metadata(&self, task_id: Uuid, interval: Duration) -> bool {
+        let now = Instant::now();
+        let mut tasks = self.tasks.lock().unwrap();
+        let state = tasks.entry(task_id).or_insert_with(|| FileListRefreshState {
+            revision: 0,
+            last_changed_at: None,
+            reason: "none",
+            last_metadata_check_at: None,
+        });
+        if state
+            .last_metadata_check_at
+            .is_some_and(|last| now.duration_since(last) < interval)
+        {
+            return false;
+        }
+        state.last_metadata_check_at = Some(now);
+        true
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskDirtyTracker {
@@ -232,6 +312,22 @@ mod tests {
         )
         .is_empty());
     }
+
+    #[test]
+    fn file_list_refresh_tracker_keeps_ui_revision_separate_from_dirty_tracker() {
+        let refresh = FileListRefreshTracker::default();
+        let dirty = TaskDirtyTracker::default();
+        let task_id = Uuid::new_v4();
+
+        dirty.mark_task_dirty(task_id);
+        refresh.mark(task_id, "watcher_dirty");
+        dirty.clear(task_id);
+
+        let snapshot = refresh.snapshot(task_id);
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.reason, "watcher_dirty");
+        assert!(snapshot.last_changed_at.is_some());
+    }
 }
 
 impl AppState {
@@ -249,6 +345,7 @@ impl AppState {
             task.name.clone(),
             task.local_path.clone(),
             self.dirty_tasks.clone(),
+            self.file_list_refresh.clone(),
             rx,
         );
         self._watchers.lock().unwrap().push((task_id, watcher));
@@ -316,6 +413,7 @@ impl AppState {
             server.retain_registered_task_roots(&active_task_ids)?;
         }
         let dirty_tasks = TaskDirtyTracker::default();
+        let file_list_refresh = FileListRefreshTracker::default();
         let mut watchers: Vec<(String, RecommendedWatcher)> = Vec::new();
         for task in tasks {
             if let Err(error) = crate::core::transient::cleanup_lanbridge_transient_files(
@@ -344,6 +442,7 @@ impl AppState {
                         task.name.clone(),
                         task.local_path.clone(),
                         dirty_tasks.clone(),
+                        file_list_refresh.clone(),
                         rx,
                     );
                     watchers.push((task.id.to_string(), w));
@@ -367,6 +466,7 @@ impl AppState {
             pending_outgoing_invites: Mutex::new(HashMap::new()),
             sync_runs: SyncRunCoordinator::default(),
             dirty_tasks,
+            file_list_refresh,
             _watchers: Mutex::new(watchers),
         })
     }
@@ -377,6 +477,7 @@ fn spawn_dirty_watcher_thread(
     task_name: String,
     local_path: String,
     dirty_tasks: TaskDirtyTracker,
+    file_list_refresh: FileListRefreshTracker,
     rx: std::sync::mpsc::Receiver<PlatformWatcherEvent>,
 ) {
     let local_path = PathBuf::from(local_path);
@@ -387,6 +488,7 @@ fn spawn_dirty_watcher_thread(
                 continue;
             }
             dirty_tasks.mark_dirty_paths(task_id, paths);
+            file_list_refresh.mark(task_id, "watcher_dirty");
             tracing::debug!(
                 task_id = %task_id,
                 task_name = %task_name,

@@ -571,10 +571,7 @@ async fn test_secondary_sync_now_returns_new_file_to_primary() {
     let return_results = lanbridge::commands::run_execute_return_sync(
         &secondary.state,
         task_id.to_string(),
-        vec![
-            "from-secondary".to_string(),
-            "from-secondary/note.txt".to_string(),
-        ],
+        vec!["from-secondary".to_string()],
     )
     .await
     .unwrap();
@@ -594,6 +591,149 @@ async fn test_secondary_sync_now_returns_new_file_to_primary() {
         .unwrap(),
         0
     );
+}
+
+#[tokio::test]
+async fn test_secondary_return_folder_delete_expands_pending_children() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    insert_paired_command_task(
+        &primary,
+        &secondary,
+        task_id,
+        "Folder Delete Return",
+        &primary.sync_dir,
+        &secondary.sync_dir,
+    );
+
+    std::fs::create_dir_all(primary.sync_dir.join("folder").join("nested")).unwrap();
+    std::fs::write(
+        primary.sync_dir.join("folder").join("nested").join("a.txt"),
+        "a",
+    )
+    .unwrap();
+    std::fs::write(primary.sync_dir.join("folder").join("b.txt"), "b").unwrap();
+
+    let primary_results = lanbridge::commands::run_sync_now(&primary.state, task_id.to_string())
+        .await
+        .unwrap();
+    assert!(primary_results
+        .iter()
+        .any(|result| { result.relative_path == "folder/nested/a.txt" && result.success }));
+    assert!(secondary
+        .sync_dir
+        .join("folder")
+        .join("nested")
+        .join("a.txt")
+        .exists());
+
+    std::fs::remove_dir_all(secondary.sync_dir.join("folder")).unwrap();
+    let secondary_results =
+        lanbridge::commands::run_sync_now(&secondary.state, task_id.to_string())
+            .await
+            .unwrap();
+    assert!(secondary_results
+        .iter()
+        .any(|result| { result.relative_path == "folder" && result.success }));
+    assert!(
+        PendingReturnRepository::new(&secondary.state.db.lock().unwrap())
+            .count_by_task(&task_id)
+            .unwrap()
+            >= 3
+    );
+
+    let return_results = lanbridge::commands::run_execute_return_sync(
+        &secondary.state,
+        task_id.to_string(),
+        vec!["folder".to_string()],
+    )
+    .await
+    .unwrap();
+
+    assert!(return_results
+        .iter()
+        .any(|result| { result.relative_path == "folder/nested/a.txt" && result.success }));
+    assert!(!primary.sync_dir.join("folder").exists());
+    assert!(primary.sync_dir.join(".lanbridge-history").exists());
+    assert_eq!(
+        PendingReturnRepository::new(&secondary.state.db.lock().unwrap())
+            .count_by_task(&task_id)
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_secondary_return_folder_keeps_conflicting_child_pending() {
+    let primary = CommandTestNode::new();
+    let secondary = CommandTestNode::new();
+    primary.trust_and_connect(&secondary);
+    secondary.trust_and_connect(&primary);
+
+    let task_id = Uuid::new_v4();
+    insert_paired_command_task(
+        &primary,
+        &secondary,
+        task_id,
+        "Folder Return Conflict",
+        &primary.sync_dir,
+        &secondary.sync_dir,
+    );
+
+    std::fs::create_dir_all(primary.sync_dir.join("folder")).unwrap();
+    std::fs::write(
+        primary.sync_dir.join("folder").join("conflict.txt"),
+        "primary",
+    )
+    .unwrap();
+    std::fs::create_dir_all(secondary.sync_dir.join("folder")).unwrap();
+    std::fs::write(secondary.sync_dir.join("folder").join("safe.txt"), "safe").unwrap();
+    std::fs::write(
+        secondary.sync_dir.join("folder").join("conflict.txt"),
+        "secondary",
+    )
+    .unwrap();
+
+    let pending_results = lanbridge::commands::run_sync_now(&secondary.state, task_id.to_string())
+        .await
+        .unwrap();
+    assert!(pending_results
+        .iter()
+        .any(|result| result.relative_path == "folder/safe.txt" && result.success));
+
+    let return_results = lanbridge::commands::run_execute_return_sync(
+        &secondary.state,
+        task_id.to_string(),
+        vec!["folder".to_string()],
+    )
+    .await
+    .unwrap();
+
+    assert!(return_results
+        .iter()
+        .any(|result| result.relative_path == "folder/safe.txt" && result.success));
+    assert!(return_results.iter().any(|result| {
+        result.relative_path == "folder/conflict.txt"
+            && !result.success
+            && result.error.as_deref() == Some("primary file already exists")
+    }));
+    assert_eq!(
+        std::fs::read_to_string(primary.sync_dir.join("folder").join("safe.txt")).unwrap(),
+        "safe"
+    );
+    assert_eq!(
+        std::fs::read_to_string(primary.sync_dir.join("folder").join("conflict.txt")).unwrap(),
+        "primary"
+    );
+    let pending = PendingReturnRepository::new(&secondary.state.db.lock().unwrap())
+        .list_by_task(&task_id)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].relative_path, "folder/conflict.txt");
 }
 
 #[test]

@@ -1,14 +1,20 @@
 import { useEffect, useState, useRef } from "react";
 import {
+  AnimatePresence,
+  motion,
+  type Transition,
+  useReducedMotion,
+} from "motion/react";
+import {
   cancelTransfer,
-  getSyncProgress,
   getTransferProgress,
   listDeferredTransfers,
   resumeTransfer,
   syncNow,
   type DeferredTransfer,
-  type SyncProgress,
 } from "../lib/tauriApi";
+import { AppOverlayLayer } from "./OverlayPortal";
+import { XIcon } from "./icons/animate-icons";
 
 interface DisplayItem {
   key: string;
@@ -25,6 +31,32 @@ interface DisplayItem {
   indeterminate: boolean;
 }
 
+interface TransferStackProps {
+  items: DisplayItem[];
+  expanded: boolean;
+  onToggle: () => void;
+  onCancel: (item: DisplayItem) => void;
+}
+
+const notificationStackTransition: Transition = {
+  type: "spring",
+  stiffness: 300,
+  damping: 26,
+};
+
+function getTransferCardVariants(index: number) {
+  return {
+    collapsed: {
+      marginTop: index === 0 ? 0 : -44,
+      scaleX: 1 - Math.min(index, 4) * 0.05,
+    },
+    expanded: {
+      marginTop: index === 0 ? 0 : 4,
+      scaleX: 1,
+    },
+  };
+}
+
 function directionLabel(direction: string) {
   switch (direction) {
     case "upload":
@@ -38,29 +70,112 @@ function directionLabel(direction: string) {
   }
 }
 
-function syncPercent(progress: SyncProgress) {
-  if (progress.items_total && progress.items_total > 0) {
-    return Math.round(((progress.items_done ?? 0) / progress.items_total) * 100);
-  }
-  if (progress.bytes_total && progress.bytes_total > 0) {
-    return Math.round(((progress.bytes_done ?? 0) / progress.bytes_total) * 100);
-  }
-  return progress.finished ? 100 : 0;
+function TransferCard({
+  item,
+  clickable,
+  onToggle,
+  onCancel,
+}: {
+  item: DisplayItem;
+  clickable: boolean;
+  onToggle: () => void;
+  onCancel: (item: DisplayItem) => void;
+}) {
+  return (
+    <div
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      className={`transfer-card ${clickable ? "clickable" : ""} ${item.fading ? "is-fading" : ""}`}
+      onClick={clickable ? onToggle : undefined}
+      aria-disabled={!clickable}
+      onKeyDown={(event) => {
+        if (!clickable || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        onToggle();
+      }}
+    >
+      <span className="transfer-title">传输{item.path}</span>
+      <span className="transfer-speed">
+        {item.mbps > 0 ? `${item.mbps.toFixed(1)} MB/s` : ""}
+        {item.fading ? " ✓" : ""}
+      </span>
+      {item.cancellable && (
+        <span
+          className="transfer-cancel"
+          role="button"
+          tabIndex={0}
+          title="中断传输"
+          onClick={(event) => {
+            event.stopPropagation();
+            onCancel(item);
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            event.stopPropagation();
+            onCancel(item);
+          }}
+        >
+          <XIcon size={17} />
+        </span>
+      )}
+      <span className="transfer-track">
+        <span
+          className={`transfer-fill ${item.indeterminate ? "progress-fill-indeterminate" : ""}`}
+          style={item.indeterminate ? undefined : { width: `${item.percent}%` }}
+        />
+      </span>
+    </div>
+  );
+}
+
+function TransferStack({ items, expanded, onToggle, onCancel }: TransferStackProps) {
+  const reduceMotion = useReducedMotion();
+  const hasMultiple = items.length > 1;
+  const visibleItems = expanded ? items : items.slice(0, hasMultiple ? 2 : 1);
+
+  if (items.length === 0) return null;
+
+  return (
+    <div className={`transfer-overlay ${hasMultiple ? "multi" : "single"} ${expanded ? "expanded" : "collapsed"}`}>
+      <div className="transfer-stack-viewport">
+        <AnimatePresence initial={false}>
+          {visibleItems.map((item, index) => (
+            <motion.div
+              key={item.key}
+              className="transfer-card-frame"
+              initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8, scale: 0.985 }}
+              animate={{
+                opacity: 1,
+                y: 0,
+                scale: 1,
+                ...(hasMultiple ? getTransferCardVariants(index)[expanded ? "expanded" : "collapsed"] : { marginTop: 0, scaleX: 1 }),
+              }}
+              exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8, scale: 0.985 }}
+              transition={reduceMotion ? { duration: 0 } : notificationStackTransition}
+              style={{ zIndex: visibleItems.length - index }}
+            >
+              <TransferCard item={item} clickable={hasMultiple} onToggle={onToggle} onCancel={onCancel} />
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
+    </div>
+  );
 }
 
 export function ProgressBar() {
   const [items, setItems] = useState<DisplayItem[]>([]);
   const [deferred, setDeferred] = useState<DeferredTransfer[]>([]);
+  const [expanded, setExpanded] = useState(false);
   const completedRef = useRef<Map<string, number>>(new Map());
   const percentRef = useRef<Map<string, number>>(new Map());
-  const totalRef = useRef(0);
 
   useEffect(() => {
     const poll = async () => {
       try {
-        const [transfers, syncProgress, deferredTransfers] = await Promise.all([
+        const [transfers, deferredTransfers] = await Promise.all([
           getTransferProgress(),
-          getSyncProgress(),
           listDeferredTransfers(),
         ]);
         const now = Date.now();
@@ -95,33 +210,7 @@ export function ProgressBar() {
             return left.localeCompare(right);
           });
 
-        const syncItems = syncProgress.map((p) => {
-          const key = `sync:${p.task_id}`;
-          const rawPercent = syncPercent(p);
-          const previousPercent = percentRef.current.get(key);
-          const percent = previousPercent == null ? rawPercent : Math.max(previousPercent, rawPercent);
-          percentRef.current.set(key, percent);
-          const done = p.items_done ?? 0;
-          const total = p.items_total ?? 0;
-          return {
-            key,
-            taskId: p.task_id,
-            relativePath: "",
-            path: total > 0 ? `${done}/${total} 项` : (p.detail || p.phase),
-            direction: p.phase,
-            rawDirection: "sync",
-            percent,
-            mbps: 0,
-            visible: true,
-            fading: Boolean(p.finished),
-            cancellable: false,
-            indeterminate: total === 0 && !(p.bytes_total && p.bytes_total > 0),
-          };
-        });
-
-        totalRef.current = active.length + syncItems.length;
-
-        const prevKeys = new Set([...active.map((a) => a.key), ...syncItems.map((a) => a.key)]);
+        const prevKeys = new Set(active.map((a) => a.key));
         completedRef.current.forEach((_, key) => {
           if (!prevKeys.has(key)) completedRef.current.delete(key);
         });
@@ -156,7 +245,7 @@ export function ProgressBar() {
           if (now - ts > 2000) completedRef.current.delete(key);
         });
 
-        setItems([...syncItems, ...active, ...transferred.sort((a, b) => a.key.localeCompare(b.key))]);
+        setItems([...active, ...transferred.sort((a, b) => a.key.localeCompare(b.key))]);
       } catch {
         setItems([]);
       }
@@ -188,54 +277,48 @@ export function ProgressBar() {
     }
   };
 
+  const hasMultiple = items.length > 1;
+  const toggleExpanded = () => {
+    if (hasMultiple) setExpanded((value) => !value);
+  };
+
+  useEffect(() => {
+    if (items.length <= 1 && expanded) {
+      setExpanded(false);
+    }
+  }, [expanded, items.length]);
+
   if (items.length === 0 && deferredItems.length === 0) return null;
 
   return (
-    <div className="global-progress">
-      {deferredItems.map((prompt) => (
-        <div key={deferredKey(prompt)} className="deferred-transfer-prompt">
-          <div className="deferred-transfer-copy">
-            <strong>待处理传输</strong>
-            <span>{directionLabel(prompt.direction)} {prompt.relative_path.split("/").pop() || prompt.relative_path}</span>
-          </div>
-          <div className="deferred-transfer-actions">
-            <button className="btn btn-primary btn-small" type="button" onClick={() => handleResume(prompt)}>
-              重新同步
-            </button>
-          </div>
+    <AppOverlayLayer className="transfer-overlay-layer">
+      <TransferStack
+        items={items}
+        expanded={expanded}
+        onToggle={toggleExpanded}
+        onCancel={handleCancel}
+      />
+      {deferredItems.length > 0 && (
+        <div className="deferred-transfer-list">
+          {deferredItems.map((prompt) => (
+            <div key={deferredKey(prompt)} className="deferred-transfer-prompt">
+              <div className="deferred-transfer-copy">
+                <strong>待处理</strong>
+                <span>{directionLabel(prompt.direction)} {prompt.relative_path.split("/").pop() || prompt.relative_path}</span>
+              </div>
+              <div className="deferred-transfer-actions">
+                <button
+                  className="btn btn-primary btn-small"
+                  type="button"
+                  onClick={() => handleResume(prompt)}
+                >
+                  重新同步
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
-      ))}
-      {items.map((item) => (
-        <div key={item.key} className={`progress-row ${item.fading ? "progress-fade" : ""}`}>
-          <div className="progress-row-header">
-            <span className="progress-pct">{item.percent}%</span>
-            <span className="progress-filename">{item.direction} {item.path}</span>
-            <span className="progress-speed">
-              {item.mbps > 0 ? `${item.mbps.toFixed(1)} MB/s` : ""}
-              {item.fading ? " ✓" : ""}
-            </span>
-            {item.cancellable && (
-              <button
-                className="progress-cancel"
-                type="button"
-                title="中断传输"
-                onClick={() => handleCancel(item)}
-              >
-                ×
-              </button>
-            )}
-          </div>
-          <div className="progress-track">
-            <div
-              className={`progress-fill ${item.indeterminate ? "progress-fill-indeterminate" : ""}`}
-              style={item.indeterminate ? undefined : { width: `${item.percent}%` }}
-            />
-          </div>
-          {totalRef.current > 1 && (
-            <span className="progress-queue">{totalRef.current} 个文件等待中</span>
-          )}
-        </div>
-      ))}
-    </div>
+      )}
+    </AppOverlayLayer>
   );
 }

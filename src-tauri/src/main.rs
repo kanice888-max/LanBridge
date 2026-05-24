@@ -95,6 +95,7 @@ fn run_app() -> Result<()> {
             commands::get_sync_task,
             commands::toggle_task_enabled,
             commands::list_ready_auto_sync_tasks,
+            commands::get_task_file_list_refresh_hint,
             commands::scan_task,
             commands::sync_now,
             commands::list_pending_returns,

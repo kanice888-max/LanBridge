@@ -7,9 +7,10 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
 use uuid::Uuid;
 
@@ -26,6 +27,8 @@ use crate::transport::protocol::RemoteFileState;
 use crate::transport::{connection, SyncMessage};
 
 const MAX_NETWORK_ATTEMPTS: usize = 3;
+const FILE_LIST_REFRESH_QUIET_MS: u64 = 800;
+const FILE_LIST_METADATA_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 struct NetworkActionResult {
@@ -1244,6 +1247,64 @@ pub fn list_ready_auto_sync_tasks(state: State<'_, AppState>) -> Result<Vec<Stri
         .collect())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskFileListRefreshHint {
+    pub revision: u64,
+    pub should_refresh: bool,
+    pub quiet_ms: u64,
+    pub reason: String,
+}
+
+#[tauri::command]
+pub fn get_task_file_list_refresh_hint(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<TaskFileListRefreshHint, String> {
+    let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+
+    if state
+        .file_list_refresh
+        .should_check_metadata(id, FILE_LIST_METADATA_CHECK_INTERVAL)
+    {
+        let (task, cached_snapshots) = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            let task = repository::SyncTaskRepository::new(&db)
+                .get(&id)
+                .map_err(|e| e.to_string())?
+                .ok_or("task not found")?;
+            let cached_snapshots = repository::FileSnapshotRepository::new(&db)
+                .list_by_task(&id)
+                .map_err(|e| e.to_string())?;
+            (task, cached_snapshots)
+        };
+
+        if task.enabled {
+            let current_metadata =
+                scanner::scan_root_metadata(Path::new(&task.local_path), &*state.platform)
+                    .map_err(|e| e.to_string())?;
+            if metadata_delta(&cached_snapshots, &current_metadata) {
+                state.file_list_refresh.mark(id, "metadata_delta");
+                if task.local_role == DeviceRole::Primary {
+                    state.dirty_tasks.mark_task_dirty(id);
+                }
+            }
+        }
+    }
+
+    let snapshot = state.file_list_refresh.snapshot(id);
+    let quiet_ms = snapshot
+        .last_changed_at
+        .map(|last| Instant::now().duration_since(last).as_millis() as u64)
+        .unwrap_or(0);
+    let should_refresh = snapshot.revision > 0 && quiet_ms >= FILE_LIST_REFRESH_QUIET_MS;
+    Ok(TaskFileListRefreshHint {
+        revision: snapshot.revision,
+        should_refresh,
+        quiet_ms,
+        reason: snapshot.reason.to_string(),
+    })
+}
+
 #[cfg(test)]
 fn primary_task_has_missing_baseline(
     task: &SyncTask,
@@ -1339,8 +1400,8 @@ pub fn scan_task(state: State<'_, AppState>, task_id: String) -> Result<Vec<File
     let sync_root = std::path::Path::new(&task.local_path);
     let cached_snapshot_list = cached_snapshots;
     let cache = snapshot_cache_by_path(cached_snapshot_list.clone());
-    let results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
-        .map_err(|e| e.to_string())?;
+    let results =
+        guarded_scan_root_with_cache(id, sync_root, &*state.platform, &cache, "scan_task")?;
 
     let mut snapshots = Vec::new();
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1366,8 +1427,13 @@ fn refresh_task_snapshots(state: &AppState, task: &SyncTask) -> Result<Vec<FileS
             .map_err(|e| e.to_string())?
     };
     let cache = snapshot_cache_by_path(cached_snapshots);
-    let results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
-        .map_err(|e| e.to_string())?;
+    let results = guarded_scan_root_with_cache(
+        task.id,
+        sync_root,
+        &*state.platform,
+        &cache,
+        "refresh_task_snapshots",
+    )?;
 
     let snapshots = results
         .into_iter()
@@ -1391,6 +1457,61 @@ fn snapshot_cache_by_path(snapshots: Vec<FileSnapshot>) -> HashMap<String, FileS
         .into_iter()
         .map(|snapshot| (snapshot.relative_path.clone(), snapshot))
         .collect()
+}
+
+fn guarded_scan_root_with_cache(
+    task_id: Uuid,
+    sync_root: &Path,
+    platform: &dyn crate::platform::traits::Platform,
+    cache: &HashMap<String, FileSnapshot>,
+    reason: &str,
+) -> Result<Vec<scanner::ScanResult>, String> {
+    tracing::info!(
+        task_id = %task_id,
+        root = %sync_root.display(),
+        reason,
+        cached = cache.len(),
+        "local scan command start"
+    );
+    let started = Instant::now();
+    let scanned = catch_unwind(AssertUnwindSafe(|| {
+        scanner::scan_root_with_cache(sync_root, platform, cache)
+    }));
+
+    match scanned {
+        Ok(Ok(results)) => {
+            tracing::info!(
+                task_id = %task_id,
+                root = %sync_root.display(),
+                reason,
+                entries = results.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "local scan command complete"
+            );
+            Ok(results)
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                task_id = %task_id,
+                root = %sync_root.display(),
+                reason,
+                error = %error,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "local scan command failed"
+            );
+            Err(error.to_string())
+        }
+        Err(_) => {
+            tracing::error!(
+                task_id = %task_id,
+                root = %sync_root.display(),
+                reason,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "local scan command panicked"
+            );
+            Err("本地扫描异常，请查看 LanBridge 日志".to_string())
+        }
+    }
 }
 
 // ─── Sync ───
@@ -1552,6 +1673,7 @@ pub async fn run_sync_now(
             break;
         }
     }
+    state.file_list_refresh.mark(id, "sync_completed");
     finish_sync_progress(id);
     Ok(all_results)
 }
@@ -1588,8 +1710,8 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
     let local_scan_start = Instant::now();
     let cached_snapshot_list = cached_snapshots;
     let cache = snapshot_cache_by_path(cached_snapshot_list.clone());
-    let scan_results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
-        .map_err(|e| e.to_string())?;
+    let scan_results =
+        guarded_scan_root_with_cache(id, sync_root, &*state.platform, &cache, "sync_now")?;
     let local_scan_ms = local_scan_start.elapsed().as_millis() as u64;
     let snapshots = scan_results
         .into_iter()
@@ -1969,6 +2091,10 @@ fn mark_dirty_if_directory_tree_changed_after_sync(
 fn is_descendant_path(path: &str, parent: &str) -> bool {
     path.strip_prefix(parent)
         .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn return_path_depth(path: &str) -> usize {
+    path.split('/').filter(|part| !part.is_empty()).count()
 }
 
 /// Priority for scheduling transfer actions. Lower value = higher priority.
@@ -2389,6 +2515,13 @@ async fn send_delete_to_peer(
     let delete_batch_id = expectation
         .as_ref()
         .map(|_| format!("{}-{}", now_ms(), Uuid::new_v4()));
+    tracing::info!(
+        task_id = %task_id,
+        relative_path = %relative_path,
+        peer_device_id = %peer_device_id,
+        has_expectation = expectation.is_some(),
+        "send delete to peer"
+    );
     let msg = SyncMessage::FileDelete {
         task_id: task_id.to_string(),
         relative_path: relative_path.to_string(),
@@ -2405,14 +2538,23 @@ async fn send_delete_to_peer(
             .map(|expected| expected.expected_modified_unix_ms),
         delete_batch_id,
     };
-    expect_file_ack(
+    let result = expect_file_ack(
         peer_device_id,
         relative_path,
         connections,
         local_identity,
         msg,
     )
-    .await
+    .await;
+    tracing::info!(
+        task_id = %task_id,
+        relative_path = %relative_path,
+        peer_device_id = %peer_device_id,
+        success = result.success,
+        error = result.error.as_deref().unwrap_or(""),
+        "delete peer response"
+    );
+    result
 }
 
 fn delete_expectation_from_action(action: &planner::PlannedAction) -> Option<DeleteExpectation> {
@@ -2942,8 +3084,13 @@ pub fn run_refresh_pending_returns(
 
     let sync_root = Path::new(&task.local_path);
     let cache = snapshot_cache_by_path(cached_snapshots);
-    let scan_results = scanner::scan_root_with_cache(sync_root, &*state.platform, &cache)
-        .map_err(|e| e.to_string())?;
+    let scan_results = guarded_scan_root_with_cache(
+        id,
+        sync_root,
+        &*state.platform,
+        &cache,
+        "refresh_pending_returns",
+    )?;
     let snapshots = scan_results
         .into_iter()
         .map(|result| {
@@ -2996,6 +3143,11 @@ pub async fn run_execute_return_sync(
     selected_paths: Vec<String>,
 ) -> Result<Vec<ReturnSyncResult>, String> {
     let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    tracing::info!(
+        task_id = %task_id,
+        selected_count = selected_paths.len(),
+        "execute_return_sync start"
+    );
     let task = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let task_repo = repository::SyncTaskRepository::new(&db);
@@ -3023,6 +3175,7 @@ pub async fn run_execute_return_sync(
             .into_iter()
             .map(|change| (change.relative_path.clone(), change))
             .collect();
+        let selected_paths = expand_selected_return_paths(&selected_paths, &pending_map);
         let connections = state.connections.clone();
         let sync_root = Path::new(&task.local_path);
         let remote_files = request_scan_with_retry(
@@ -3078,6 +3231,17 @@ pub async fn run_execute_return_sync(
         )
     };
 
+    tracing::info!(
+        task_id = %task_id,
+        success_count = results.iter().filter(|result| result.success).count(),
+        failure_count = results.iter().filter(|result| !result.success).count(),
+        "execute_return_sync complete"
+    );
+
+    if results.iter().any(|result| result.success) {
+        state.file_list_refresh.mark(id, "sync_completed");
+    }
+
     Ok(results
         .into_iter()
         .map(|r| ReturnSyncResult {
@@ -3086,6 +3250,71 @@ pub async fn run_execute_return_sync(
             error: r.error,
         })
         .collect())
+}
+
+fn expand_selected_return_paths(
+    selected_paths: &[String],
+    pending: &HashMap<String, PendingReturnChange>,
+) -> Vec<String> {
+    let mut expanded = HashSet::new();
+
+    for selected in selected_paths {
+        if pending.contains_key(selected) {
+            expanded.insert(selected.clone());
+        }
+        if pending
+            .keys()
+            .any(|path| is_descendant_path(path, selected))
+        {
+            expanded.insert(selected.clone());
+        }
+        for path in pending.keys() {
+            if is_descendant_path(path, selected) {
+                expanded.insert(path.clone());
+            }
+        }
+    }
+
+    let mut paths = expanded.into_iter().collect::<Vec<_>>();
+    sort_return_paths_for_execution(&mut paths, pending);
+    paths
+}
+
+fn sort_return_paths_for_execution(
+    paths: &mut [String],
+    pending: &HashMap<String, PendingReturnChange>,
+) {
+    paths.sort_by(|left, right| {
+        let left_deleted = return_path_is_deleted_group(left, pending);
+        let right_deleted = return_path_is_deleted_group(right, pending);
+        let left_depth = return_path_depth(left);
+        let right_depth = return_path_depth(right);
+
+        match (left_deleted, right_deleted) {
+            (true, true) => right_depth.cmp(&left_depth).then_with(|| left.cmp(right)),
+            (false, false) => left_depth.cmp(&right_depth).then_with(|| left.cmp(right)),
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+        }
+    });
+}
+
+fn return_path_is_deleted_group(
+    path: &str,
+    pending: &HashMap<String, PendingReturnChange>,
+) -> bool {
+    if let Some(change) = pending.get(path) {
+        return change.change_kind == ChangeKind::Deleted;
+    }
+    let descendants = pending
+        .iter()
+        .filter(|(candidate, _)| is_descendant_path(candidate, path))
+        .map(|(_, change)| change)
+        .collect::<Vec<_>>();
+    !descendants.is_empty()
+        && descendants
+            .iter()
+            .all(|change| change.change_kind == ChangeKind::Deleted)
 }
 
 async fn execute_secondary_return_over_network_checked(
@@ -3111,21 +3340,17 @@ async fn execute_secondary_return_over_network_checked(
     let mut results = Vec::new();
     for path in selected_paths {
         let Some(change) = pending.get(path) else {
-            results.push(network_error(
-                path,
-                "pending change not found in database",
-                false,
-            ));
-            continue;
-        };
-        if let Some(error) = secondary_return_conflict(path, change, &remote_map, &baseline_map) {
-            results.push(network_error(path, &error, false));
-            continue;
-        }
-
-        if change.change_kind == ChangeKind::Deleted {
-            results.push(
-                send_delete_to_peer(
+            let descendant_changes = pending
+                .iter()
+                .filter(|(candidate, _)| is_descendant_path(candidate, path))
+                .map(|(_, change)| change)
+                .collect::<Vec<_>>();
+            if !descendant_changes.is_empty()
+                && descendant_changes
+                    .iter()
+                    .all(|change| change.change_kind == ChangeKind::Deleted)
+            {
+                let result = send_delete_to_peer(
                     &task.primary_device_id,
                     task.id,
                     path,
@@ -3133,12 +3358,85 @@ async fn execute_secondary_return_over_network_checked(
                     connections,
                     local_identity,
                 )
-                .await,
+                .await;
+                results.push(result);
+                continue;
+            }
+            if !descendant_changes.is_empty() {
+                let planned = planner::PlannedAction {
+                    relative_path: path.clone(),
+                    decision: SyncDecision::ApplyToSecondary,
+                    snapshot: None,
+                    baseline: None,
+                };
+                results.push(
+                    send_directory_action(
+                        &planned,
+                        &task.primary_device_id,
+                        task.id,
+                        connections,
+                        local_identity,
+                    )
+                    .await,
+                );
+                continue;
+            }
+            tracing::warn!(
+                task_id = %task.id,
+                relative_path = %path,
+                "return-sync selected path missing from pending map"
             );
+            results.push(network_error(
+                path,
+                "pending change not found in database",
+                false,
+            ));
+            continue;
+        };
+        tracing::info!(
+            task_id = %task.id,
+            relative_path = %path,
+            change_kind = ?change.change_kind,
+            "secondary return item start"
+        );
+        if let Some(error) = secondary_return_conflict(path, change, &remote_map, &baseline_map) {
+            tracing::warn!(
+                task_id = %task.id,
+                relative_path = %path,
+                error = %error,
+                "secondary return item blocked by conflict"
+            );
+            results.push(network_error(path, &error, false));
+            continue;
+        }
+
+        if change.change_kind == ChangeKind::Deleted {
+            let result = send_delete_to_peer(
+                &task.primary_device_id,
+                task.id,
+                path,
+                None,
+                connections,
+                local_identity,
+            )
+            .await;
+            tracing::info!(
+                task_id = %task.id,
+                relative_path = %path,
+                success = result.success,
+                error = result.error.as_deref().unwrap_or(""),
+                "secondary return delete ack"
+            );
+            results.push(result);
             continue;
         }
 
         if is_path_deferred(deferred_transfers, path, "upload") {
+            tracing::warn!(
+                task_id = %task.id,
+                relative_path = %path,
+                "secondary return upload deferred"
+            );
             results.push(network_error(path, "transfer deferred by user", false));
             continue;
         }
@@ -3202,6 +3500,21 @@ fn secondary_return_conflict(
     let current_primary = remote_map
         .get(path)
         .map(|remote| remote_file_state_to_snapshot(change.task_id, remote));
+    if change.change_kind == ChangeKind::Deleted
+        && current_primary
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.kind == EntryKind::Directory)
+    {
+        return None;
+    }
+    if current_primary
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.kind == EntryKind::Directory)
+        && change.secondary_hash.is_none()
+        && change.secondary_hash_status == HashStatus::Unavailable
+    {
+        return None;
+    }
     let baseline = baseline_map.get(path).copied();
 
     match conflict::detect_conflict(change, current_primary.as_ref(), baseline) {
@@ -3258,27 +3571,61 @@ fn persist_return_successes(
             continue;
         }
         let Some(change) = pending.get(&result.relative_path) else {
+            tracing::warn!(
+                task_id = %task.id,
+                relative_path = %result.relative_path,
+                "return persist skipped because pending change is missing"
+            );
             continue;
         };
         if change.change_kind == ChangeKind::Deleted {
+            tracing::info!(
+                task_id = %task.id,
+                relative_path = %result.relative_path,
+                "persist return-delete success start"
+            );
             if let Err(e) = repository::FileSnapshotRepository::new(db)
                 .mark_deleted(&task.id, &result.relative_path)
             {
+                tracing::error!(
+                    task_id = %task.id,
+                    relative_path = %result.relative_path,
+                    error = %e,
+                    "return-delete snapshot update failed"
+                );
                 result.success = false;
                 result.error = Some(format!("return-delete snapshot update failed: {}", e));
                 result.retryable = true;
                 continue;
             }
             if let Err(e) = baseline_repo.remove(&task.id, &result.relative_path) {
+                tracing::error!(
+                    task_id = %task.id,
+                    relative_path = %result.relative_path,
+                    error = %e,
+                    "return-delete baseline remove failed"
+                );
                 result.success = false;
                 result.error = Some(format!("return-delete baseline remove failed: {}", e));
                 result.retryable = true;
                 continue;
             }
             if let Err(e) = pending_repo.remove(&task.id, &result.relative_path) {
+                tracing::error!(
+                    task_id = %task.id,
+                    relative_path = %result.relative_path,
+                    error = %e,
+                    "return-delete pending remove failed"
+                );
                 result.success = false;
                 result.error = Some(format!("remove pending delete failed: {}", e));
                 result.retryable = true;
+            } else {
+                tracing::info!(
+                    task_id = %task.id,
+                    relative_path = %result.relative_path,
+                    "persist return-delete success complete"
+                );
             }
             continue;
         }
@@ -3448,6 +3795,9 @@ pub fn resolve_conflict_overwrite(
 
     let sync_root = std::path::Path::new(&task.local_path);
     let result = executor::execute_confirmed_overwrite(&task, &relative_path, sync_root, &db);
+    if result.success {
+        state.file_list_refresh.mark(id, "sync_completed");
+    }
 
     Ok(SyncActionResult {
         relative_path: result.relative_path,
@@ -3473,6 +3823,9 @@ pub fn resolve_conflict_keep_both(
 
     let sync_root = std::path::Path::new(&task.local_path);
     let result = executor::execute_conflict_keep_both(&task, &relative_path, sync_root, &db);
+    if result.success {
+        state.file_list_refresh.mark(id, "sync_completed");
+    }
 
     Ok(SyncActionResult {
         relative_path: result.relative_path,
@@ -3557,6 +3910,7 @@ pub fn restore_history_entry(
         .restore(&entry, sync_root, now_ms())
         .map_err(|e| e.to_string())?;
     history_repo.remove(&id, &eid).map_err(|e| e.to_string())?;
+    state.file_list_refresh.mark(id, "sync_completed");
 
     Ok(restored.to_string_lossy().to_string())
 }
@@ -4000,6 +4354,63 @@ mod return_sync_tests {
         }
     }
 
+    fn task_with_id(task_id: Uuid, local_path: String) -> SyncTask {
+        SyncTask {
+            id: task_id,
+            name: "return-delete-test".to_string(),
+            primary_device_id: "primary".to_string(),
+            secondary_device_id: "secondary".to_string(),
+            local_path,
+            remote_path: "remote".to_string(),
+            local_role: DeviceRole::Secondary,
+            enabled: true,
+            created_unix_ms: 1_000,
+            updated_unix_ms: 1_000,
+        }
+    }
+
+    fn deleted_pending_for(task_id: Uuid, relative_path: &str) -> PendingReturnChange {
+        PendingReturnChange {
+            task_id,
+            relative_path: relative_path.to_string(),
+            change_kind: ChangeKind::Deleted,
+            secondary_hash: None,
+            secondary_hash_status: HashStatus::Unavailable,
+            secondary_modified_unix_ms: 2_000,
+            created_unix_ms: 2_000,
+        }
+    }
+
+    fn snapshot_for(task_id: Uuid, relative_path: &str, size: i64) -> FileSnapshot {
+        FileSnapshot {
+            task_id,
+            relative_path: relative_path.to_string(),
+            kind: EntryKind::File,
+            size,
+            modified_unix_ms: 1_000,
+            blake3_hash: Some(format!("hash-{relative_path}")),
+            hash_status: HashStatus::Verified,
+            deleted: false,
+            is_symlink: false,
+        }
+    }
+
+    fn baseline_for(task_id: Uuid, relative_path: &str, size: i64) -> SyncBaseline {
+        SyncBaseline {
+            task_id,
+            relative_path: relative_path.to_string(),
+            primary_hash: Some(format!("hash-{relative_path}")),
+            primary_hash_status: HashStatus::Verified,
+            primary_size: size,
+            secondary_size: size,
+            primary_modified_unix_ms: 1_000,
+            secondary_hash: Some(format!("hash-{relative_path}")),
+            secondary_hash_status: HashStatus::Verified,
+            secondary_modified_unix_ms: 1_000,
+            last_synced_unix_ms: 1_000,
+        }
+    }
+
     fn snapshot_from_remote(remote: RemoteFileState) -> FileSnapshot {
         remote_file_state_to_snapshot(Uuid::nil(), &remote)
     }
@@ -4083,5 +4494,62 @@ mod return_sync_tests {
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].relative_path, "file.txt");
+    }
+
+    #[test]
+    fn persist_return_successes_clears_deleted_pending_assets() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::state::db::migrate(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = Uuid::new_v4();
+        let task = task_with_id(task_id, dir.path().to_string_lossy().to_string());
+        repository::SyncTaskRepository::new(&conn)
+            .insert(&task)
+            .unwrap();
+
+        let paths = ["Frame_2004.svg", "Frame_1980.png", "folder.svg"];
+        let mut pending_map = HashMap::new();
+        for (index, path) in paths.iter().enumerate() {
+            let change = deleted_pending_for(task_id, path);
+            repository::PendingReturnRepository::new(&conn)
+                .upsert(&change)
+                .unwrap();
+            repository::FileSnapshotRepository::new(&conn)
+                .upsert(&snapshot_for(task_id, path, (index + 1) as i64))
+                .unwrap();
+            repository::SyncBaselineRepository::new(&conn)
+                .upsert(&baseline_for(task_id, path, (index + 1) as i64))
+                .unwrap();
+            pending_map.insert((*path).to_string(), change);
+        }
+
+        let mut results = paths
+            .iter()
+            .map(|path| executor::ExecutionResult {
+                relative_path: (*path).to_string(),
+                success: true,
+                error: None,
+                retryable: false,
+            })
+            .collect::<Vec<_>>();
+
+        persist_return_successes(&task, &pending_map, &mut results, dir.path(), &conn);
+
+        assert!(results.iter().all(|result| result.success));
+        let pending_left = repository::PendingReturnRepository::new(&conn)
+            .list_by_task(&task_id)
+            .unwrap();
+        assert!(pending_left.is_empty());
+        for path in paths {
+            let snap = repository::FileSnapshotRepository::new(&conn)
+                .get(&task_id, path)
+                .unwrap()
+                .expect("snapshot should remain as a deleted marker");
+            assert!(snap.deleted);
+            assert!(repository::SyncBaselineRepository::new(&conn)
+                .get(&task_id, path)
+                .unwrap()
+                .is_none());
+        }
     }
 }

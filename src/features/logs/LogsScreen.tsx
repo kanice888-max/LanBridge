@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { listLogs, type LogEntry } from "../../lib/tauriApi";
 import { useTranslation } from "../../lib/i18n/context";
+import { isBrowserPreviewBridgeError } from "../../lib/runtime";
+import { AnimatedList } from "../../components/StagePrimitives";
 
 export function LogsScreen() {
   const { t } = useTranslation();
@@ -10,7 +12,13 @@ export function LogsScreen() {
 
   const loadLogs = async () => {
     setLoading(true);
-    try { const l = await listLogs(200); setLogs(l); } catch (e) { setError(String(e)); }
+    try {
+      const l = await listLogs(200);
+      setLogs(l);
+      setError(null);
+    } catch (e) {
+      if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+    }
     finally { setLoading(false); }
   };
 
@@ -46,16 +54,19 @@ export function LogsScreen() {
           <p>{t.logs.noLogsDesc}</p>
         </div>
       ) : (
-        <div className="logs-list">
-          {logs.map((log) => (
-            <div key={log.id} className={`log-entry level-${levelClass(log.level)}`}>
+        <AnimatedList
+          items={logs}
+          getKey={(log) => log.id ?? `${log.created_unix_ms}-${log.message}-${log.relative_path}`}
+          className="logs-list"
+          renderItem={(log) => (
+            <div className={`log-entry level-${levelClass(log.level)}`}>
               <span className="log-time">{formatTime(log.created_unix_ms)}</span>
               <span className={`log-level ${levelClass(log.level)}`}>{log.level}</span>
               <span className="log-message">{log.message}</span>
-              {log.relative_path && <span className="log-path">{log.relative_path}</span>}
+              <span className="log-path">{log.relative_path || ""}</span>
             </div>
-          ))}
-        </div>
+          )}
+        />
       )}
     </div>
   );

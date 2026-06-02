@@ -1,12 +1,22 @@
+import * as Popover from "@radix-ui/react-popover";
 import { useEffect, useState } from "react";
 import { getSettings, type AppSettings } from "../../lib/tauriApi";
 import { useTranslation, type Lang } from "../../lib/i18n/context";
 import { isBrowserPreviewBridgeError } from "../../lib/runtime";
 import { ChevronDownIcon } from "../../components/icons/animate-icons";
 
-export function SettingsScreen() {
+interface SettingsScreenProps {
+  minimizeToTrayOnClose: boolean;
+  onMinimizeToTrayOnCloseChange: (enabled: boolean) => void;
+}
+
+export function SettingsScreen({
+  minimizeToTrayOnClose,
+  onMinimizeToTrayOnCloseChange,
+}: SettingsScreenProps) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [languageOpen, setLanguageOpen] = useState(false);
   const { lang, setLang, t } = useTranslation();
 
   useEffect(() => {
@@ -27,16 +37,51 @@ export function SettingsScreen() {
         <div className="stage-section-label">{t.settings.fileStatus}</div>
         <label className="stage-row settings-stage-row">
           <span>{t.settings.language}</span>
-          <span className="settings-select-wrap">
-            <select
-              className="settings-select"
-              value={lang}
-              onChange={(e) => setLang(e.target.value as Lang)}
-            >
-              <option value="zh">{t.settings.langZh}</option>
-              <option value="en">{t.settings.langEn}</option>
-            </select>
-            <ChevronDownIcon size={15} isAnimated={false} />
+          <Popover.Root open={languageOpen} onOpenChange={setLanguageOpen}>
+            <Popover.Trigger asChild>
+              <button className="settings-language-trigger" type="button">
+                <span>{lang === "zh" ? t.settings.langZh : t.settings.langEn}</span>
+                <ChevronDownIcon size={15} isAnimated={false} />
+              </button>
+            </Popover.Trigger>
+            <Popover.Portal>
+              <Popover.Content
+                className="sort-popover settings-language-popover"
+                side="bottom"
+                sideOffset={8}
+                align="center"
+                collisionPadding={16}
+              >
+                {(["zh", "en"] as Lang[]).map((option) => (
+                  <button
+                    key={option}
+                    className={lang === option ? "active" : ""}
+                    type="button"
+                    onClick={() => {
+                      setLang(option);
+                      setLanguageOpen(false);
+                    }}
+                  >
+                    {option === "zh" ? t.settings.langZh : t.settings.langEn}
+                  </button>
+                ))}
+              </Popover.Content>
+            </Popover.Portal>
+          </Popover.Root>
+        </label>
+      </div>
+
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.windowBehavior}</div>
+        <label className="stage-row settings-stage-row">
+          <span>{t.settings.minimizeToTrayOnClose}</span>
+          <span className="settings-switch-wrap">
+            <input
+              type="checkbox"
+              checked={minimizeToTrayOnClose}
+              onChange={(event) => onMinimizeToTrayOnCloseChange(event.target.checked)}
+            />
+            <span className="settings-switch" aria-hidden="true" />
           </span>
         </label>
       </div>

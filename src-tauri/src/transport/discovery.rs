@@ -84,6 +84,7 @@ impl DiscoveryState {
     }
 
     pub fn list_devices(&self) -> Vec<OnlineDevice> {
+        prune_peers(self);
         self.devices.lock().unwrap().clone()
     }
 
@@ -551,6 +552,34 @@ mod tests {
         prune_peers(&state);
         let devices = state.list_devices();
         assert!(devices.is_empty(), "stale peers should be pruned");
+    }
+
+    #[test]
+    fn list_devices_prunes_stale_cached_devices() {
+        let state = DiscoveryState::new();
+        let announce = Announce {
+            device_id: "dev-1".to_string(),
+            display_name: "Stale".to_string(),
+            public_key: vec![1],
+            port: 9527,
+        };
+
+        state.record_peer(announce, "192.168.1.5".to_string(), None);
+        assert_eq!(state.devices.lock().unwrap().len(), 1);
+
+        {
+            let mut peers = state.peers.lock().unwrap();
+            let record = peers.get_mut("dev-1").unwrap();
+            for address in record.addresses.values_mut() {
+                address.last_seen_unix_ms = now_ms() - ((PEER_TIMEOUT_SECS as i64) * 1000) - 1_000;
+            }
+        }
+
+        let devices = state.list_devices();
+        assert!(
+            devices.is_empty(),
+            "list_devices should not return stale cached peers"
+        );
     }
 
     #[test]

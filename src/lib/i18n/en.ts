@@ -79,7 +79,7 @@ export const en: Translations = {
     discoveryStopped: "Discovery is not running",
     discoverySummary: "Listening on {addr}:{port}",
     noDevices: "No devices found yet",
-    noDevicesDesc: "Make sure the peer device has this app running, or connect manually.",
+    noDevicesDesc: "Make sure the peer app is open, or connect manually.",
     manualFallback: "Enter IP Manually",
     manualFallbackToggle: "Hide Manual Input",
     manualNotice:
@@ -197,7 +197,7 @@ export const en: Translations = {
     allTasks: "All Tasks",
     cleanup: "Clean History Files",
     loading: "Loading history...",
-    noEntries: "No history entries",
+    noEntries: "No history",
     noEntriesDesc:
       "Files deleted from primary or overwritten during conflict resolution will appear here.",
     restore: "Restore",
@@ -230,6 +230,8 @@ export const en: Translations = {
     language: "Language",
     langZh: "中文",
     langEn: "English",
+    windowBehavior: "Window Behavior",
+    minimizeToTrayOnClose: "Minimize to system tray on close",
     historyRetention: "History Retention",
     retentionPeriod: "Retention Period",
     days: "days",

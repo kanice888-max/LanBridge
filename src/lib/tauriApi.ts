@@ -83,6 +83,24 @@ export interface ReturnSyncResult {
   error: string | null;
 }
 
+export interface FolderInspection {
+  exists: boolean;
+  is_dir: boolean;
+  is_empty: boolean;
+  total_size: number;
+  file_count: number;
+  dir_count: number;
+  over_limit: boolean;
+}
+
+export type DeleteDestination = "LanBridgeHistory" | "SystemTrash";
+
+export interface DeleteEntryResult {
+  relative_path: string;
+  success: boolean;
+  error: string | null;
+}
+
 export interface LogEntry {
   id: number | null;
   level: "Info" | "Warn" | "Error";
@@ -170,6 +188,21 @@ export interface NetworkDiagnosticReport {
   tcp_port: number;
   checks: NetworkCheckItem[];
   suggestions: string[];
+}
+
+export type ImportCollisionPolicy = "Cancel" | "KeepBoth" | "Overwrite";
+
+export interface ImportEntryResult {
+  source_path: string;
+  relative_path: string;
+  success: boolean;
+  error: string | null;
+}
+
+export interface ImportTaskEntriesResult {
+  imported: ImportEntryResult[];
+  conflicts: ImportEntryResult[];
+  failed: ImportEntryResult[];
 }
 
 const previewNow = new Date("2026-05-22T22:04:59").getTime();
@@ -346,6 +379,29 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
     case "sync_now":
       previewShowTransfers = true;
       return [];
+    case "inspect_task_folder":
+      return {
+        exists: true,
+        is_dir: true,
+        is_empty: true,
+        total_size: 0,
+        file_count: 0,
+        dir_count: 0,
+        over_limit: false,
+      };
+    case "delete_task_entry":
+      return [{ relative_path: args?.relativePath, success: true, error: null }];
+    case "import_task_entries":
+      return {
+        imported: (args?.sourcePaths as string[] | undefined || []).map((sourcePath) => ({
+          source_path: sourcePath,
+          relative_path: sourcePath.split(/[/\\]/).pop() || "导入文件",
+          success: true,
+          error: null,
+        })),
+        conflicts: [],
+        failed: [],
+      };
     case "list_pending_returns":
       return (args?.taskId as string) === previewSecondaryTaskId ? previewPending : [];
     case "get_pending_count":
@@ -410,6 +466,10 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
       }));
     case "get_settings":
       return { history_retention_days: 30, history_size_limit_mb: 1024 };
+    case "hide_main_window_to_tray":
+    case "show_main_window":
+    case "quit_app":
+      return null;
     case "list_online_devices":
       return [
         {
@@ -432,6 +492,15 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
       };
     case "get_local_network_info":
       return { interfaces: [{ name: "Wi-Fi", ip: "192.168.1.5" }], tcp_port: 9527 };
+    case "disconnect_task_peer":
+      return {
+        task_id: args?.taskId,
+        peer_device_id: "preview-peer",
+        address: "192.168.1.5:9527",
+        connected: false,
+        last_seen_unix_ms: previewNow,
+        error: "manually disconnected",
+      };
     case "check_network_environment":
       return {
         ok: true,
@@ -549,6 +618,13 @@ export async function createSyncTask(
   request: CreateTaskRequest
 ): Promise<SyncTask> {
   return call("create_sync_task", { request });
+}
+
+export async function inspectTaskFolder(
+  path: string,
+  role: string
+): Promise<FolderInspection> {
+  return call("inspect_task_folder", { path, role });
 }
 
 export async function sendTaskInvite(
@@ -714,6 +790,18 @@ export async function getSettings(): Promise<AppSettings> {
   return call("get_settings");
 }
 
+export async function hideMainWindowToTray(): Promise<void> {
+  return call("hide_main_window_to_tray");
+}
+
+export async function showMainWindow(): Promise<void> {
+  return call("show_main_window");
+}
+
+export async function quitApp(): Promise<void> {
+  return call("quit_app");
+}
+
 export interface InterfaceInfo {
   name: string;
   ip: string;
@@ -734,6 +822,28 @@ export async function openInFileManager(path: string): Promise<void> {
 
 export async function deleteSyncTask(taskId: string): Promise<void> {
   return call("delete_sync_task", { taskId });
+}
+
+export async function deleteTaskEntry(
+  taskId: string,
+  relativePath: string,
+  destination: DeleteDestination
+): Promise<DeleteEntryResult[]> {
+  return call("delete_task_entry", { taskId, relativePath, destination });
+}
+
+export async function importTaskEntries(
+  taskId: string,
+  sourcePaths: string[],
+  targetRelativeDir: string,
+  collisionPolicy: ImportCollisionPolicy
+): Promise<ImportTaskEntriesResult> {
+  return call("import_task_entries", {
+    taskId,
+    sourcePaths,
+    targetRelativeDir,
+    collisionPolicy,
+  });
 }
 
 export interface TransferProgress {
@@ -808,4 +918,8 @@ export async function resumeTransfer(taskId: string, relativePath: string, direc
 
 export async function getTaskPeerStatus(taskId: string): Promise<TaskPeerStatus> {
   return call("get_task_peer_status", { taskId });
+}
+
+export async function disconnectTaskPeer(taskId: string): Promise<TaskPeerStatus> {
+  return call("disconnect_task_peer", { taskId });
 }

@@ -21,6 +21,7 @@ import { ReturnSyncScreen } from "../return-sync/ReturnSyncScreen";
 import { HistoryScreen } from "../history/HistoryScreen";
 import { useTranslation } from "../../lib/i18n/context";
 import { XIcon } from "../../components/icons/animate-icons";
+import { DeleteTaskConfirmDialog } from "../../components/DeleteTaskConfirmDialog";
 
 interface TaskDetailProps {
   taskId: string;
@@ -38,6 +39,8 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
   const [syncResults, setSyncResults] = useState<SyncActionResult[]>([]);
   const [peerStatus, setPeerStatus] = useState<TaskPeerStatus | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [subTab, setSubTab] = useState<SubTab>("info");
   const lastPeerConnected = useRef<boolean | null>(null);
@@ -168,8 +171,21 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
 
   const handleDelete = async () => {
     if (!task) return;
-    if (!window.confirm(`${t.dashboard.confirmDelete} "${task.name}"`)) return;
-    try { await deleteSyncTask(task.id); onClose(); } catch (e) { setError(String(e)); }
+    setDeleteDialogOpen(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!task) return;
+    setDeleteBusy(true);
+    try {
+      await deleteSyncTask(task.id);
+      setDeleteDialogOpen(false);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDeleteBusy(false);
+    }
   };
 
   const formatSize = (bytes: number) => {
@@ -344,6 +360,15 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
           <HistoryScreen taskId={taskId} />
         </div>
       )}
+      <DeleteTaskConfirmDialog
+        open={deleteDialogOpen}
+        taskName={task.name}
+        busy={deleteBusy}
+        onCancel={() => {
+          if (!deleteBusy) setDeleteDialogOpen(false);
+        }}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }

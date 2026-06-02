@@ -194,6 +194,16 @@ pub enum SyncMessage {
         delete_batch_id: Option<String>,
     },
 
+    /// Apply a conflict file that was uploaded to a temporary path.
+    ///
+    /// `mode` is `overwrite` or `keep_both`.
+    ConflictApply {
+        task_id: String,
+        relative_path: String,
+        staged_relative_path: String,
+        mode: String,
+    },
+
     /// Acknowledge successful file write.
     FileAck {
         task_id: String,
@@ -675,6 +685,30 @@ mod tests {
                 assert_eq!(delete_batch_id, None);
             }
             other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn round_trip_conflict_apply() {
+        let msg = SyncMessage::ConflictApply {
+            task_id: "task".to_string(),
+            relative_path: "folder/file.txt".to_string(),
+            staged_relative_path: ".lanbridge-temp/conflict-1/file.txt".to_string(),
+            mode: "overwrite".to_string(),
+        };
+        match round_trip(&msg) {
+            SyncMessage::ConflictApply {
+                task_id,
+                relative_path,
+                staged_relative_path,
+                mode,
+            } => {
+                assert_eq!(task_id, "task");
+                assert_eq!(relative_path, "folder/file.txt");
+                assert_eq!(staged_relative_path, ".lanbridge-temp/conflict-1/file.txt");
+                assert_eq!(mode, "overwrite");
+            }
+            other => panic!("unexpected conflict apply: {:?}", other),
         }
     }
 }

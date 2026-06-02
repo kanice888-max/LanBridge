@@ -115,12 +115,14 @@ impl Default for FileListRefreshTracker {
 impl FileListRefreshTracker {
     pub fn mark(&self, task_id: Uuid, reason: &'static str) {
         let mut tasks = self.tasks.lock().unwrap();
-        let state = tasks.entry(task_id).or_insert_with(|| FileListRefreshState {
-            revision: 0,
-            last_changed_at: None,
-            reason: "none",
-            last_metadata_check_at: None,
-        });
+        let state = tasks
+            .entry(task_id)
+            .or_insert_with(|| FileListRefreshState {
+                revision: 0,
+                last_changed_at: None,
+                reason: "none",
+                last_metadata_check_at: None,
+            });
         state.revision = state.revision.saturating_add(1);
         state.last_changed_at = Some(Instant::now());
         state.reason = reason;
@@ -146,12 +148,14 @@ impl FileListRefreshTracker {
     pub fn should_check_metadata(&self, task_id: Uuid, interval: Duration) -> bool {
         let now = Instant::now();
         let mut tasks = self.tasks.lock().unwrap();
-        let state = tasks.entry(task_id).or_insert_with(|| FileListRefreshState {
-            revision: 0,
-            last_changed_at: None,
-            reason: "none",
-            last_metadata_check_at: None,
-        });
+        let state = tasks
+            .entry(task_id)
+            .or_insert_with(|| FileListRefreshState {
+                revision: 0,
+                last_changed_at: None,
+                reason: "none",
+                last_metadata_check_at: None,
+            });
         if state
             .last_metadata_check_at
             .is_some_and(|last| now.duration_since(last) < interval)

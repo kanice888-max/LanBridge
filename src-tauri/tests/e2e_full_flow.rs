@@ -6,7 +6,9 @@ use lanbridge::core::model::{
 use lanbridge::core::{planner, scanner};
 use lanbridge::history::store::HistoryStore;
 use lanbridge::pairing::{derive_pairing_code, generate_nonce, DeviceIdentity, PublicIdentity};
-use lanbridge::platform::windows::WinPlatform;
+use lanbridge::platform::windows::WinPlatform as TestPlatform;
+#[cfg(target_os = "windows")]
+use lanbridge::platform::windows::WinPlatform as TestPlatform;
 use lanbridge::state::{
     db,
     repository::{
@@ -127,7 +129,7 @@ impl CommandTestNode {
         server.set_local_identity(public);
         let state = AppState::new(
             identity,
-            Box::new(WinPlatform::with_data_dir(app_dir)),
+            Box::new(TestPlatform::with_data_dir(app_dir)),
             DiscoveryState::new(),
             Some(server),
         )
@@ -1424,7 +1426,7 @@ async fn test_sync_now_rejects_paused_task() {
 }
 
 fn scan_task_files(task_id: Uuid, root: &Path) -> Vec<FileSnapshot> {
-    let platform = WinPlatform::with_data_dir(root.join("app-data"));
+    let platform = TestPlatform::with_data_dir(root.join("app-data"));
     scanner::scan_root(root, &platform)
         .unwrap()
         .into_iter()

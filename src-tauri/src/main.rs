@@ -14,39 +14,24 @@ mod transport;
 
 use anyhow::{Context, Result};
 use platform::traits::Platform;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing_subscriber::fmt::MakeWriter;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{
+    CustomMenuItem, Manager, PhysicalSize, Size, SystemTray, SystemTrayEvent, SystemTrayMenu,
+    Window, WindowEvent,
+};
 
-#[derive(Clone, Copy)]
-struct LanBridgeLogWriter;
-
-impl<'a> MakeWriter<'a> for LanBridgeLogWriter {
-    type Writer = Box<dyn Write + Send>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        let path = lanbridge_log_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            Ok(file) => Box::new(file),
-            Err(_) => Box::new(io::sink()),
-        }
-    }
-}
+const TRAY_OPEN_ID: &str = "open";
+const TRAY_QUIT_ID: &str = "quit";
+const DESIGN_ASPECT_RATIO: f64 = 863.0 / 561.0;
+static WINDOW_RATIO_RESIZE_GUARD: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     install_crash_hook();
     if let Err(error) = run_app() {
-        let message = format!("{error:?}");
-        write_startup_crash(&message);
-        write_lanbridge_log(&message);
+        write_startup_crash(&format!("{error:?}"));
         eprintln!("LanBridge failed to start: {error:?}");
         std::process::exit(1);
     }
@@ -58,13 +43,7 @@ fn run_app() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(LanBridgeLogWriter)
         .init();
-    write_lanbridge_log(&format!(
-        "LanBridge start; log_path={}",
-        lanbridge_log_path().display()
-    ));
-    tracing::info!(log_path = %lanbridge_log_path().display(), "LanBridge logging initialized");
 
     // Load identity BEFORE Tauri so discovery can use the real device_id
     let platform: Box<dyn Platform> = Box::new(
@@ -105,6 +84,7 @@ fn run_app() -> Result<()> {
         .context("failed to initialize app state")?;
 
     tauri::Builder::default()
+        .system_tray(build_system_tray())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::get_identity,
@@ -117,6 +97,7 @@ fn run_app() -> Result<()> {
             commands::list_online_devices,
             commands::get_discovery_status,
             commands::check_network_environment,
+            commands::inspect_task_folder,
             commands::send_task_invite,
             commands::poll_task_invite,
             commands::list_task_invites,
@@ -143,10 +124,15 @@ fn run_app() -> Result<()> {
             commands::list_logs,
             commands::write_log,
             commands::get_settings,
+            commands::hide_main_window_to_tray,
+            commands::show_main_window,
+            commands::quit_app,
             commands::set_transfer_speed_limit,
             commands::get_transfer_speed_limit,
             commands::open_in_file_manager,
             commands::get_local_network_info,
+            commands::delete_task_entry,
+            commands::import_task_entries,
             commands::delete_sync_task,
             commands::get_transfer_progress,
             commands::has_active_transfers,
@@ -154,18 +140,85 @@ fn run_app() -> Result<()> {
             commands::list_deferred_transfers,
             commands::resume_transfer,
             commands::get_task_peer_status,
+            commands::disconnect_task_peer,
             commands::cancel_transfer,
         ])
+        .on_window_event(|event| match event.event() {
+            WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = event.window().emit("lanbridge-close-requested", ());
+            }
+            WindowEvent::Resized(size) if event.window().label() == "main" => {
+                enforce_design_aspect_ratio(event.window(), size.width, size.height);
+            }
+            _ => {}
+        })
+        .on_system_tray_event(|app, event| match event {
+            SystemTrayEvent::LeftClick { .. } => {
+                let _ = show_main_window(app);
+            }
+            SystemTrayEvent::MenuItemClick { id, .. } if id.as_str() == TRAY_OPEN_ID => {
+                let _ = show_main_window(app);
+            }
+            SystemTrayEvent::MenuItemClick { id, .. } if id.as_str() == TRAY_QUIT_ID => {
+                app.exit(0);
+            }
+            _ => {}
+        })
         .run(tauri::generate_context!())
         .context("error while running tauri application")?;
     Ok(())
 }
 
+fn enforce_design_aspect_ratio(window: &Window, width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    if WINDOW_RATIO_RESIZE_GUARD.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let ratio = width as f64 / height as f64;
+    let (next_width, next_height) = if ratio > DESIGN_ASPECT_RATIO {
+        ((height as f64 * DESIGN_ASPECT_RATIO).round() as u32, height)
+    } else {
+        (width, (width as f64 / DESIGN_ASPECT_RATIO).round() as u32)
+    };
+
+    let needs_resize = width.abs_diff(next_width) > 2 || height.abs_diff(next_height) > 2;
+    if needs_resize {
+        let _ = window.set_size(Size::Physical(PhysicalSize {
+            width: next_width,
+            height: next_height,
+        }));
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(80));
+            WINDOW_RATIO_RESIZE_GUARD.store(false, Ordering::SeqCst);
+        });
+    } else {
+        WINDOW_RATIO_RESIZE_GUARD.store(false, Ordering::SeqCst);
+    }
+}
+
+fn build_system_tray() -> SystemTray {
+    let menu = SystemTrayMenu::new()
+        .add_item(CustomMenuItem::new(TRAY_OPEN_ID, "打开主窗口"))
+        .add_item(CustomMenuItem::new(TRAY_QUIT_ID, "退出"));
+    SystemTray::new().with_menu(menu)
+}
+
+fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_window("main") {
+        window.show()?;
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    Ok(())
+}
+
 fn install_crash_hook() {
     std::panic::set_hook(Box::new(|panic_info| {
-        let message = format!("panic: {panic_info}");
-        write_startup_crash(&message);
-        write_lanbridge_log(&message);
+        write_startup_crash(&format!("panic: {panic_info}"));
     }));
 }
 
@@ -184,14 +237,6 @@ fn write_startup_crash(message: &str) {
 }
 
 fn startup_crash_log_path() -> PathBuf {
-    app_data_dir().join("startup-crash.log")
-}
-
-fn lanbridge_log_path() -> PathBuf {
-    app_data_dir().join("lanbridge.log")
-}
-
-fn app_data_dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| {
@@ -201,20 +246,7 @@ fn app_data_dir() -> PathBuf {
         })
         .unwrap_or_else(std::env::temp_dir)
         .join("LanBridge")
-}
-
-fn write_lanbridge_log(message: &str) {
-    let path = lanbridge_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "[{}] {}", now_ms(), message);
-    }
+        .join("startup-crash.log")
 }
 
 fn now_ms() -> u128 {

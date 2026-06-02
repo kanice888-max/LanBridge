@@ -8,13 +8,14 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 /// Global speed limit in bytes/sec. 0 = unlimited.
 static GLOBAL_RATE_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const PEER_PING_TIMEOUT_MS: u64 = 1_500;
 /// Set the global transfer speed limit. Pass 0 to disable.
 pub fn set_transfer_speed_limit(bytes_per_sec: u64) {
     GLOBAL_RATE_LIMIT_BPS.store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
@@ -57,13 +58,6 @@ static DEFERRED_TRANSFERS: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const TRANSFER_DIRECTIONS: [&str; 4] = ["upload", "download", "receive", "serve"];
-
-fn recover_lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        tracing::error!(lock = name, "recovering poisoned transfer lock");
-        poisoned.into_inner()
-    })
-}
 
 pub fn new_transfer_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -467,59 +461,76 @@ pub struct PeerConnection {
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     pinned_identities: Arc<Mutex<HashMap<String, PublicIdentity>>>,
+    manually_disconnected: Arc<Mutex<HashSet<String>>>,
 }
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             pinned_identities: Arc::new(Mutex::new(HashMap::new())),
+            manually_disconnected: Arc::new(Mutex::new(HashSet::new())),
         }
     }
     /// Pin a peer identity after successful pairing.
     pub fn pin_peer(&self, identity: PublicIdentity) {
-        let mut pins = recover_lock(&self.pinned_identities, "pinned_identities");
+        let mut pins = self.pinned_identities.lock().unwrap();
         pins.insert(identity.device_id.clone(), identity);
     }
     /// Check if a device ID is pinned.
     pub fn is_pinned(&self, device_id: &str) -> bool {
-        let pins = recover_lock(&self.pinned_identities, "pinned_identities");
+        let pins = self.pinned_identities.lock().unwrap();
         pins.contains_key(device_id)
     }
     /// Get a pinned peer identity.
     pub fn get_pinned(&self, device_id: &str) -> Option<PublicIdentity> {
-        let pins = recover_lock(&self.pinned_identities, "pinned_identities");
+        let pins = self.pinned_identities.lock().unwrap();
         pins.get(device_id).cloned()
     }
     /// Register a connected peer.
     pub fn register_connection(&self, conn: PeerConnection) {
-        let mut peers = recover_lock(&self.peers, "peers");
+        let mut manual = self.manually_disconnected.lock().unwrap();
+        manual.remove(&conn.device_id);
+        let mut peers = self.peers.lock().unwrap();
         peers.insert(conn.device_id.clone(), conn);
     }
     /// Mark a peer as disconnected.
     pub fn disconnect(&self, device_id: &str) {
-        let mut peers = recover_lock(&self.peers, "peers");
+        let mut peers = self.peers.lock().unwrap();
         if let Some(peer) = peers.get_mut(device_id) {
             peer.connected = false;
         }
     }
+    /// Mark a peer as intentionally disconnected by the local user.
+    pub fn manual_disconnect(&self, device_id: &str) {
+        self.disconnect(device_id);
+        let mut manual = self.manually_disconnected.lock().unwrap();
+        manual.insert(device_id.to_string());
+    }
+    /// Check whether a peer was intentionally disconnected by the local user.
+    pub fn is_manually_disconnected(&self, device_id: &str) -> bool {
+        let manual = self.manually_disconnected.lock().unwrap();
+        manual.contains(device_id)
+    }
     /// Check if a peer is currently connected.
     pub fn is_connected(&self, device_id: &str) -> bool {
-        let peers = recover_lock(&self.peers, "peers");
+        let peers = self.peers.lock().unwrap();
         peers.get(device_id).map_or(false, |p| p.connected)
     }
     /// List all known peer connections.
     pub fn list_peers(&self) -> Vec<PeerConnection> {
-        let peers = recover_lock(&self.peers, "peers");
+        let peers = self.peers.lock().unwrap();
         peers.values().cloned().collect()
     }
     /// Get a known peer connection by device ID.
     pub fn get_peer(&self, device_id: &str) -> Option<PeerConnection> {
-        let peers = recover_lock(&self.peers, "peers");
+        let peers = self.peers.lock().unwrap();
         peers.get(device_id).cloned()
     }
 
     pub fn mark_connected(&self, device_id: &str) {
-        let mut peers = recover_lock(&self.peers, "peers");
+        let mut manual = self.manually_disconnected.lock().unwrap();
+        manual.remove(device_id);
+        let mut peers = self.peers.lock().unwrap();
         if let Some(peer) = peers.get_mut(device_id) {
             peer.connected = true;
             peer.last_seen_unix_ms = now_ms();
@@ -535,14 +546,18 @@ pub async fn connect_to_peer(address: &str, port: u16) -> Result<TcpStream> {
     Ok(stream)
 }
 pub async fn ping_peer_address(address: &str, port: u16) -> Result<()> {
-    let mut stream = connect_to_peer(address, port).await?;
-    stream
-        .write_all(&encode_message(&SyncMessage::Ping)?)
-        .await?;
-    match read_message(&mut stream).await? {
-        SyncMessage::Pong => Ok(()),
-        other => anyhow::bail!("unexpected ping response: {:?}", other),
-    }
+    tokio::time::timeout(Duration::from_millis(PEER_PING_TIMEOUT_MS), async {
+        let mut stream = connect_to_peer(address, port).await?;
+        stream
+            .write_all(&encode_message(&SyncMessage::Ping)?)
+            .await?;
+        match read_message(&mut stream).await? {
+            SyncMessage::Pong => Ok(()),
+            other => anyhow::bail!("unexpected ping response: {:?}", other),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("peer ping timed out"))?
 }
 
 pub async fn ping_known_peer(manager: &ConnectionManager, device_id: &str) -> Result<()> {

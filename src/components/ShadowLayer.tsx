@@ -155,7 +155,11 @@ export function useShadowTarget<T extends HTMLElement>({
         : ref.current;
     const rect = measured.getBoundingClientRect();
     const style = window.getComputedStyle(measured);
-    const visible = rect.width > 0 && rect.height > 0;
+    const visible =
+      rect.width > 0 &&
+      rect.height > 0 &&
+      style.visibility !== "hidden" &&
+      style.opacity !== "0";
 
     context.update({
       id,

@@ -37,11 +37,14 @@ type PaperRect = {
 };
 
 type PaperLayerProps = {
-  id: string;
-  path: MotionValue<string>;
+  rect: {
+    left: MotionValue<string>;
+    top: MotionValue<string>;
+    width: MotionValue<string>;
+    height: MotionValue<string>;
+    borderRadius: MotionValue<string>;
+  };
   opacity: MotionValue<number>;
-  backdropFill: string;
-  glassFill: string;
 };
 
 
@@ -139,12 +142,14 @@ function buildFrontHighlightClipPath(t: number) {
   `;
 }
 
+const paperCornerRadius = 11.5;
+
 const closedPaperRect: PaperRect = {
   x: 116.97,
   y: 128.944,
   width: 189.875,
   height: 129.915,
-  radius: 6.995,
+  radius: paperCornerRadius,
 };
 
 const openPaperBackRect: PaperRect = {
@@ -152,7 +157,7 @@ const openPaperBackRect: PaperRect = {
   y: 123.947,
   width: 129.914,
   height: 94.938,
-  radius: 6.995,
+  radius: paperCornerRadius,
 };
 
 const openPaperMidRect: PaperRect = {
@@ -160,7 +165,7 @@ const openPaperMidRect: PaperRect = {
   y: 138.938,
   width: 159.894,
   height: 94.937,
-  radius: 6.995,
+  radius: paperCornerRadius,
 };
 
 const openPaperTopRect: PaperRect = {
@@ -168,7 +173,7 @@ const openPaperTopRect: PaperRect = {
   y: 153.928,
   width: 189.875,
   height: 104.931,
-  radius: 6.995,
+  radius: paperCornerRadius,
 };
 
 function mixPaperRect(from: PaperRect, to: PaperRect, t: number): PaperRect {
@@ -181,63 +186,54 @@ function mixPaperRect(from: PaperRect, to: PaperRect, t: number): PaperRect {
   };
 }
 
-function buildRoundedRectPath(rect: PaperRect) {
-  const { x, y, width, height, radius } = rect;
-  const r = Math.min(radius, width / 2, height / 2);
-  const right = x + width;
-  const bottom = y + height;
-
-  return `
-    M ${x + r} ${y}
-    H ${right - r}
-    C ${right - r * 0.4477} ${y}, ${right} ${y + r * 0.4477}, ${right} ${y + r}
-    V ${bottom - r}
-    C ${right} ${bottom - r * 0.4477}, ${right - r * 0.4477} ${bottom}, ${right - r} ${bottom}
-    H ${x + r}
-    C ${x + r * 0.4477} ${bottom}, ${x} ${bottom - r * 0.4477}, ${x} ${bottom - r}
-    V ${y + r}
-    C ${x} ${y + r * 0.4477}, ${x + r * 0.4477} ${y}, ${x + r} ${y}
-    Z
-  `;
+function toViewBoxPercent(value: number, origin: number, size: number) {
+  return `${((value - origin) / size) * 100}%`;
 }
 
-function buildPaperPath(target: PaperRect, t: number) {
-  return buildRoundedRectPath(mixPaperRect(closedPaperRect, target, t));
+function usePaperCssRect(t: MotionValue<number>, target: PaperRect): PaperLayerProps["rect"] {
+  const rect = useTransform(t, (value) => mixPaperRect(closedPaperRect, target, value));
+  const radiusScale = 2.2;
+  return {
+    left: useTransform(rect, (value) => toViewBoxPercent(value.x, 60, 304)),
+    top: useTransform(rect, (value) => toViewBoxPercent(value.y, 50, 315)),
+    width: useTransform(rect, (value) => `${(value.width / 304) * 100}%`),
+    height: useTransform(rect, (value) => `${(value.height / 315) * 100}%`),
+    borderRadius: useTransform(
+      rect,
+      (value) => `${((value.radius * radiusScale) / 304) * 100}% / ${((value.radius * radiusScale) / 315) * 100}%`,
+    ),
+  };
 }
 
-function PaperLayer({ id, path, opacity, backdropFill, glassFill }: PaperLayerProps) {
+function PaperLayer({ rect, opacity }: PaperLayerProps) {
   return (
-    <>
-      <clipPath id={`${id}-clip`} clipPathUnits="userSpaceOnUse">
-        <motion.path d={path} />
-      </clipPath>
-
-      <g clipPath={`url(#${id}-clip)`} pointerEvents="none">
-        <path
-          d={backPath}
-          fill={backdropFill}
-          opacity="0.95"
-          filter={`url(#${id}-paper-frost-blur)`}
-        />
-        <motion.path
-          d={path}
-          fill="white"
-          style={{ opacity }}
-        />
-        <motion.path
-          d={path}
-          fill={glassFill}
-          opacity="0.42"
-        />
-        <motion.path
-          d={path}
-          fill="none"
-          stroke="white"
-          strokeWidth="5"
-          opacity="0.28"
-        />
-      </g>
-    </>
+    <motion.div
+      style={{
+        position: "absolute",
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        borderRadius: rect.borderRadius,
+        background: "rgba(228,238,255,0.16)",
+        border: "1px solid rgba(255,255,255,0.28)",
+        boxShadow:
+          "inset 0 1px 9px rgba(255,255,255,0.56), inset 0 -14px 24px rgba(67,120,255,0.15)",
+        backdropFilter: "blur(14px)",
+        WebkitBackdropFilter: "blur(14px)",
+        overflow: "hidden",
+      }}
+    >
+      <motion.div
+        style={{
+          position: "absolute",
+          inset: 0,
+          opacity,
+          background:
+            "linear-gradient(180deg, rgba(255,255,255,0.70) 0%, rgba(232,241,255,0.48) 48%, rgba(177,205,255,0.30) 100%)",
+        }}
+      />
+    </motion.div>
   );
 }
 
@@ -369,19 +365,13 @@ export function AnimatedFolder({
   const paperMidT = useTransform(progress, (t) => stagedElasticStep(t, 0.035, 1));
   const paperTopT = useTransform(progress, (t) => stagedElasticStep(t, 0.07, 1));
 
-  const paperBackPath = useTransform(paperBackT, (t) =>
-    buildPaperPath(openPaperBackRect, t)
-  );
-  const paperMidPath = useTransform(paperMidT, (t) =>
-    buildPaperPath(openPaperMidRect, t)
-  );
-  const paperTopPath = useTransform(paperTopT, (t) =>
-    buildPaperPath(openPaperTopRect, t)
-  );
+  const paperBackRect = usePaperCssRect(paperBackT, openPaperBackRect);
+  const paperMidRect = usePaperCssRect(paperMidT, openPaperMidRect);
+  const paperTopRect = usePaperCssRect(paperTopT, openPaperTopRect);
 
-  const paperBackOpacity = useTransform(progress, [0, 1], [1, 0.42]);
-  const paperMidOpacity = useTransform(progress, [0, 1], [1, 0.42]);
-  const paperTopOpacity = useTransform(progress, [0, 1], [1, 0.42]);
+  const paperBackOpacity = useTransform(progress, [0, 1], [0.68, 0.42]);
+  const paperMidOpacity = useTransform(progress, [0, 1], [0.58, 0.42]);
+  const paperTopOpacity = useTransform(progress, [0, 1], [0.5, 0.42]);
 
   return (
     <button
@@ -394,16 +384,26 @@ export function AnimatedFolder({
         aspectRatio: "424 / 443",
         display: "grid",
         placeItems: "center",
+        position: "relative",
         padding: 0,
         border: 0,
         background: "transparent",
         outline: "none",
+        overflow: "visible",
+        isolation: "isolate",
         cursor: onClick || !isControlled ? "pointer" : "default",
         WebkitTapHighlightColor: "transparent",
       }}
       aria-label={currentOpen ? "Close folder" : "Open folder"}
     >
-      <svg viewBox="60 50 304 315" width="100%" height="100%" fill="none" role="img">
+      <svg
+        viewBox="60 50 304 315"
+        width="100%"
+        height="100%"
+        fill="none"
+        aria-hidden="true"
+        style={{ position: "absolute", inset: 0, zIndex: 0, pointerEvents: "none" }}
+      >
         <defs>
           <linearGradient
             id={`folder-back-${gradientId}`}
@@ -411,18 +411,6 @@ export function AnimatedFolder({
             y1="78.977"
             x2="209.41"
             y2="183.908"
-            gradientUnits="userSpaceOnUse"
-          >
-            <stop stopColor="#011EF4" />
-            <stop offset="1" stopColor="#618EFF" />
-          </linearGradient>
-
-          <linearGradient
-            id={`folder-front-${gradientId}`}
-            x1="209.79"
-            y1="143.934"
-            x2="209.79"
-            y2="283.842"
             gradientUnits="userSpaceOnUse"
           >
             <stop stopColor="#011EF4" />
@@ -441,63 +429,12 @@ export function AnimatedFolder({
             <stop offset="1" stopColor="#FBFDFF" />
           </linearGradient>
 
-          <linearGradient
-            id={`highlight-mask-gradient-${gradientId}`}
-            x1="209.273"
-            y1="144"
-            x2="209.273"
-            y2="284"
-            gradientUnits="userSpaceOnUse"
-          >
-            <stop stopColor="#3B82F6" />
-            <stop offset="1" stopColor="#9CC1FF" />
-          </linearGradient>
-
-          <linearGradient
-            id={`paper-glass-gradient-${gradientId}`}
-            x1="211.5"
-            y1="122"
-            x2="211.5"
-            y2="258"
-            gradientUnits="userSpaceOnUse"
-          >
-            <stop stopColor="#FFFFFF" stopOpacity="0.72" />
-            <stop offset="0.44" stopColor="#EEF5FF" stopOpacity="0.42" />
-            <stop offset="1" stopColor="#BFD5FF" stopOpacity="0.24" />
-          </linearGradient>
-
-          <clipPath id={`front-highlight-clip-${gradientId}`} clipPathUnits="userSpaceOnUse">
-            <motion.path
-              d={highlightClipPath}
-              fill={`url(#highlight-mask-gradient-${gradientId})`}
-            />
-          </clipPath>
-
-          <clipPath id={`front-inner-glow-clip-${gradientId}`} clipPathUnits="userSpaceOnUse">
-            <motion.path d={frontPath} />
-          </clipPath>
-
           <clipPath id={`back-inner-glow-clip-${gradientId}`} clipPathUnits="userSpaceOnUse">
             <path d={backPath} />
           </clipPath>
 
           <filter
-            id={`front-highlight-blur-${gradientId}`}
-            x="107"
-            y="128"
-            width="209"
-            height="136.037"
-            filterUnits="userSpaceOnUse"
-            colorInterpolationFilters="sRGB"
-          >
-            <feFlood floodOpacity="0" result="BackgroundImageFix" />
-            <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape" />
-            <feGaussianBlur stdDeviation="8" result="effect1_foregroundBlur" />
-          </filter>
-
-
-          <filter
-            id={`inner-glow-small-blur-${gradientId}`}
+            id={`back-inner-glow-small-blur-${gradientId}`}
             x="80"
             y="80"
             width="280"
@@ -528,42 +465,6 @@ export function AnimatedFolder({
             y="270"
             width="285"
             height="75"
-            filterUnits="userSpaceOnUse"
-            colorInterpolationFilters="sRGB"
-          >
-            <feGaussianBlur stdDeviation="12" />
-          </filter>
-
-          <filter
-            id={`paper-back-${gradientId}-paper-frost-blur`}
-            x="70"
-            y="70"
-            width="290"
-            height="230"
-            filterUnits="userSpaceOnUse"
-            colorInterpolationFilters="sRGB"
-          >
-            <feGaussianBlur stdDeviation="12" />
-          </filter>
-
-          <filter
-            id={`paper-mid-${gradientId}-paper-frost-blur`}
-            x="70"
-            y="70"
-            width="290"
-            height="230"
-            filterUnits="userSpaceOnUse"
-            colorInterpolationFilters="sRGB"
-          >
-            <feGaussianBlur stdDeviation="12" />
-          </filter>
-
-          <filter
-            id={`paper-top-${gradientId}-paper-frost-blur`}
-            x="70"
-            y="70"
-            width="290"
-            height="230"
             filterUnits="userSpaceOnUse"
             colorInterpolationFilters="sRGB"
           >
@@ -615,33 +516,101 @@ export function AnimatedFolder({
             stroke="#ffffff"
             strokeWidth="14"
             opacity="0.3"
-            filter={`url(#inner-glow-small-blur-${gradientId})`}
+            filter={`url(#back-inner-glow-small-blur-${gradientId})`}
           />
         </g>
+      </svg>
 
+      <div
+        aria-hidden="true"
+        style={{ position: "absolute", inset: 0, zIndex: 1, pointerEvents: "none", overflow: "visible" }}
+      >
         <PaperLayer
-          id={`paper-back-${gradientId}`}
-          path={paperBackPath}
+          rect={paperBackRect}
           opacity={paperBackOpacity}
-          backdropFill={`url(#folder-back-${gradientId})`}
-          glassFill={`url(#paper-glass-gradient-${gradientId})`}
         />
 
         <PaperLayer
-          id={`paper-mid-${gradientId}`}
-          path={paperMidPath}
+          rect={paperMidRect}
           opacity={paperMidOpacity}
-          backdropFill={`url(#folder-back-${gradientId})`}
-          glassFill={`url(#paper-glass-gradient-${gradientId})`}
         />
 
         <PaperLayer
-          id={`paper-top-${gradientId}`}
-          path={paperTopPath}
+          rect={paperTopRect}
           opacity={paperTopOpacity}
-          backdropFill={`url(#folder-back-${gradientId})`}
-          glassFill={`url(#paper-glass-gradient-${gradientId})`}
         />
+      </div>
+
+      <svg
+        viewBox="60 50 304 315"
+        width="100%"
+        height="100%"
+        fill="none"
+        aria-hidden="true"
+        style={{ position: "absolute", inset: 0, zIndex: 2, pointerEvents: "none" }}
+      >
+        <defs>
+          <linearGradient
+            id={`folder-front-${gradientId}`}
+            x1="209.79"
+            y1="143.934"
+            x2="209.79"
+            y2="283.842"
+            gradientUnits="userSpaceOnUse"
+          >
+            <stop stopColor="#011EF4" />
+            <stop offset="1" stopColor="#618EFF" />
+          </linearGradient>
+
+          <linearGradient
+            id={`highlight-mask-gradient-${gradientId}`}
+            x1="209.273"
+            y1="144"
+            x2="209.273"
+            y2="284"
+            gradientUnits="userSpaceOnUse"
+          >
+            <stop stopColor="#3B82F6" />
+            <stop offset="1" stopColor="#9CC1FF" />
+          </linearGradient>
+
+          <clipPath id={`front-highlight-clip-${gradientId}`} clipPathUnits="userSpaceOnUse">
+            <motion.path
+              d={highlightClipPath}
+              fill={`url(#highlight-mask-gradient-${gradientId})`}
+            />
+          </clipPath>
+
+          <clipPath id={`front-inner-glow-clip-${gradientId}`} clipPathUnits="userSpaceOnUse">
+            <motion.path d={frontPath} />
+          </clipPath>
+
+          <filter
+            id={`front-highlight-blur-${gradientId}`}
+            x="107"
+            y="128"
+            width="209"
+            height="136.037"
+            filterUnits="userSpaceOnUse"
+            colorInterpolationFilters="sRGB"
+          >
+            <feFlood floodOpacity="0" result="BackgroundImageFix" />
+            <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape" />
+            <feGaussianBlur stdDeviation="8" result="effect1_foregroundBlur" />
+          </filter>
+
+          <filter
+            id={`front-inner-glow-small-blur-${gradientId}`}
+            x="80"
+            y="80"
+            width="280"
+            height="220"
+            filterUnits="userSpaceOnUse"
+            colorInterpolationFilters="sRGB"
+          >
+            <feGaussianBlur stdDeviation="7" />
+          </filter>
+        </defs>
 
         <motion.path d={frontPath} fill={`url(#folder-front-${gradientId})`} />
 
@@ -652,7 +621,7 @@ export function AnimatedFolder({
             stroke="#ffffff"
             strokeWidth="13"
             opacity="0.3"
-            filter={`url(#inner-glow-small-blur-${gradientId})`}
+            filter={`url(#front-inner-glow-small-blur-${gradientId})`}
           />
         </g>
 

@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 /// Global speed limit in bytes/sec. 0 = unlimited.
 static GLOBAL_RATE_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const PEER_PING_TIMEOUT_MS: u64 = 1_500;
 /// Set the global transfer speed limit. Pass 0 to disable.
 pub fn set_transfer_speed_limit(bytes_per_sec: u64) {
     GLOBAL_RATE_LIMIT_BPS.store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
@@ -460,12 +461,14 @@ pub struct PeerConnection {
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     pinned_identities: Arc<Mutex<HashMap<String, PublicIdentity>>>,
+    manually_disconnected: Arc<Mutex<HashSet<String>>>,
 }
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             pinned_identities: Arc::new(Mutex::new(HashMap::new())),
+            manually_disconnected: Arc::new(Mutex::new(HashSet::new())),
         }
     }
     /// Pin a peer identity after successful pairing.
@@ -485,6 +488,8 @@ impl ConnectionManager {
     }
     /// Register a connected peer.
     pub fn register_connection(&self, conn: PeerConnection) {
+        let mut manual = self.manually_disconnected.lock().unwrap();
+        manual.remove(&conn.device_id);
         let mut peers = self.peers.lock().unwrap();
         peers.insert(conn.device_id.clone(), conn);
     }
@@ -494,6 +499,17 @@ impl ConnectionManager {
         if let Some(peer) = peers.get_mut(device_id) {
             peer.connected = false;
         }
+    }
+    /// Mark a peer as intentionally disconnected by the local user.
+    pub fn manual_disconnect(&self, device_id: &str) {
+        self.disconnect(device_id);
+        let mut manual = self.manually_disconnected.lock().unwrap();
+        manual.insert(device_id.to_string());
+    }
+    /// Check whether a peer was intentionally disconnected by the local user.
+    pub fn is_manually_disconnected(&self, device_id: &str) -> bool {
+        let manual = self.manually_disconnected.lock().unwrap();
+        manual.contains(device_id)
     }
     /// Check if a peer is currently connected.
     pub fn is_connected(&self, device_id: &str) -> bool {
@@ -512,6 +528,8 @@ impl ConnectionManager {
     }
 
     pub fn mark_connected(&self, device_id: &str) {
+        let mut manual = self.manually_disconnected.lock().unwrap();
+        manual.remove(device_id);
         let mut peers = self.peers.lock().unwrap();
         if let Some(peer) = peers.get_mut(device_id) {
             peer.connected = true;
@@ -528,14 +546,18 @@ pub async fn connect_to_peer(address: &str, port: u16) -> Result<TcpStream> {
     Ok(stream)
 }
 pub async fn ping_peer_address(address: &str, port: u16) -> Result<()> {
-    let mut stream = connect_to_peer(address, port).await?;
-    stream
-        .write_all(&encode_message(&SyncMessage::Ping)?)
-        .await?;
-    match read_message(&mut stream).await? {
-        SyncMessage::Pong => Ok(()),
-        other => anyhow::bail!("unexpected ping response: {:?}", other),
-    }
+    tokio::time::timeout(Duration::from_millis(PEER_PING_TIMEOUT_MS), async {
+        let mut stream = connect_to_peer(address, port).await?;
+        stream
+            .write_all(&encode_message(&SyncMessage::Ping)?)
+            .await?;
+        match read_message(&mut stream).await? {
+            SyncMessage::Pong => Ok(()),
+            other => anyhow::bail!("unexpected ping response: {:?}", other),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("peer ping timed out"))?
 }
 
 pub async fn ping_known_peer(manager: &ConnectionManager, device_id: &str) -> Result<()> {

@@ -12,7 +12,6 @@ import {
 import { motion, useReducedMotion, type Transition } from "motion/react";
 import { AnimatedFolder } from "./AnimatedFolder";
 import { AppOverlayLayer } from "./OverlayPortal";
-import { startShadowSyncBurst } from "./ShadowLayer";
 
 type FolderTransitionKind = "sync" | "discover";
 
@@ -51,14 +50,17 @@ interface FolderRouteSnapshot {
 
 interface FolderTransitionContextValue {
   registerTarget: (kind: FolderTransitionKind, element: HTMLElement | null) => void;
-  startTransition: (from: FolderTransitionKind, to: FolderTransitionKind) => void;
+  startTransition: (from: FolderTransitionKind, to: FolderTransitionKind) => boolean;
   isTargetHidden: (kind: FolderTransitionKind) => boolean;
 }
 
 const FolderTransitionContext = createContext<FolderTransitionContextValue | null>(null);
 
 function rectFromElement(element: HTMLElement): FolderTransitionRect | null {
-  const target = element.querySelector<HTMLElement>(".stage-folder") || element;
+  const target =
+    element.querySelector<HTMLElement>(".folder-transition-anchor") ||
+    element.querySelector<HTMLElement>(".stage-folder") ||
+    element;
   const rect = target.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return null;
   return {
@@ -100,10 +102,8 @@ function createFlight(
   fromRect: FolderTransitionRect,
   toRect: FolderTransitionRect
 ): FolderTransitionFlight {
-  const width = Math.max(fromRect.width, toRect.width);
-  const height = Math.max(fromRect.height, toRect.height);
-  const from = frameAround(fromRect, width, height);
-  const to = frameAround(toRect, width, height);
+  const from = frameAround(fromRect, fromRect.width, fromRect.height);
+  const to = frameAround(toRect, toRect.width, toRect.height);
   return createFlightFromFrames(id, from, to);
 }
 
@@ -139,27 +139,54 @@ export function FolderTransitionProvider({ children }: { children: ReactNode }) 
     startedAt: number;
   } | null>(null);
   const [flight, setFlight] = useState<FolderTransitionFlight | null>(null);
+  const [holdFrame, setHoldFrame] = useState<FolderTransitionFrame | null>(null);
   const [hiddenKinds, setHiddenKinds] = useState<Set<FolderTransitionKind>>(() => new Set());
+  const [suppressRealShadows, setSuppressRealShadows] = useState(false);
   const [pendingVersion, setPendingVersion] = useState(0);
 
   const clearHidden = useCallback(() => {
     setHiddenKinds(new Set());
+    setHoldFrame(null);
+    setSuppressRealShadows(false);
   }, []);
+
+  const showFoldersThenShadows = useCallback(() => {
+    setHiddenKinds(new Set());
+    setHoldFrame(null);
+    window.requestAnimationFrame(() => {
+      setSuppressRealShadows(false);
+    });
+  }, []);
+
+  useEffect(() => {
+    const active = suppressRealShadows || hiddenKinds.size > 0 || Boolean(holdFrame) || Boolean(flight);
+    if (active) {
+      document.documentElement.dataset.folderTransitionActive = "true";
+    } else {
+      delete document.documentElement.dataset.folderTransitionActive;
+    }
+    return () => {
+      delete document.documentElement.dataset.folderTransitionActive;
+    };
+  }, [flight, hiddenKinds.size, holdFrame, suppressRealShadows]);
 
   const registerTarget = useCallback((kind: FolderTransitionKind, element: HTMLElement | null) => {
     targetsRef.current[kind] = element;
   }, []);
 
   const startTransition = useCallback((from: FolderTransitionKind, to: FolderTransitionKind) => {
-    if (from === to || reduceMotion) return;
+    if (from === to || reduceMotion) return false;
     const fromElement = targetsRef.current[from];
-    if (!fromElement) return;
+    if (!fromElement) return false;
     const fromRect = rectFromElement(fromElement);
-    if (!fromRect) return;
+    if (!fromRect) return false;
 
     pendingRef.current = { from, to, fromRect, startedAt: performance.now() };
-    setHiddenKinds(new Set([to]));
+    setHoldFrame(frameAround(fromRect, fromRect.width, fromRect.height));
+    setHiddenKinds(new Set([from, to]));
+    setSuppressRealShadows(true);
     setPendingVersion((version) => version + 1);
+    return true;
   }, [reduceMotion]);
 
   useEffect(() => {
@@ -168,16 +195,30 @@ export function FolderTransitionProvider({ children }: { children: ReactNode }) 
 
     let raf = 0;
     let timeout = 0;
+    let previousToRect: FolderTransitionRect | null = null;
+    let stableFrames = 0;
     const run = () => {
       const toElement = targetsRef.current[pending.to];
       const toRect = toElement ? rectFromElement(toElement) : null;
       if (!toRect) {
-        if (performance.now() - pending.startedAt < 700) {
+        if (performance.now() - pending.startedAt < 500) {
           raf = window.requestAnimationFrame(run);
         } else {
           timeout = window.setTimeout(clearHidden, 120);
           pendingRef.current = null;
         }
+        return;
+      }
+      if (!previousToRect || !rectsClose(previousToRect, toRect)) {
+        previousToRect = toRect;
+        stableFrames = 0;
+        raf = window.requestAnimationFrame(run);
+        return;
+      }
+      stableFrames += 1;
+      if (stableFrames < 1) {
+        previousToRect = toRect;
+        raf = window.requestAnimationFrame(run);
         return;
       }
 
@@ -203,9 +244,10 @@ export function FolderTransitionProvider({ children }: { children: ReactNode }) 
         toFrame: nextFlight.to,
       };
 
-      startShadowSyncBurst(520);
       setHiddenKinds(new Set([pending.from, pending.to]));
+      setSuppressRealShadows(true);
       setFlight(nextFlight);
+      setHoldFrame(null);
       pendingRef.current = null;
     };
 
@@ -228,10 +270,9 @@ export function FolderTransitionProvider({ children }: { children: ReactNode }) 
   return (
     <FolderTransitionContext.Provider value={value}>
       {children}
-      <FolderTransitionOverlay flight={flight} onDone={() => {
+      <FolderTransitionOverlay holdFrame={holdFrame} flight={flight} onDone={() => {
         setFlight(null);
-        clearHidden();
-        startShadowSyncBurst(220);
+        showFoldersThenShadows();
       }} />
     </FolderTransitionContext.Provider>
   );
@@ -270,49 +311,61 @@ export function useStartFolderTransition() {
 }
 
 function FolderTransitionOverlay({
+  holdFrame,
   flight,
   onDone,
 }: {
+  holdFrame: FolderTransitionFrame | null;
   flight: FolderTransitionFlight | null;
   onDone: () => void;
 }) {
   const reduceMotion = useReducedMotion();
-  if (!flight || reduceMotion) return null;
+  if ((!flight && !holdFrame) || reduceMotion) return null;
 
+  const frame = flight?.from ?? holdFrame!;
   const transition: Transition = {
-    duration: 0.38,
-    ease: [0.22, 1, 0.36, 1],
-    times: [0, 0.86, 1],
+    type: "spring",
+    stiffness: 305,
+    damping: 32,
+    mass: 0.85,
   };
+  const scaleX = flight ? flight.to.width / flight.from.width : 1;
+  const scaleY = flight ? flight.to.height / flight.from.height : 1;
+  const renderTransitionShadow = () => (
+    <div className="folder-transition-shadow stage-shadow-folder" aria-hidden="true">
+      <span className="stage-shadow-folder-layer stage-shadow-folder-diffuse" />
+      <span className="stage-shadow-folder-layer stage-shadow-folder-core" />
+      <span className="stage-shadow-folder-layer stage-shadow-folder-contact" />
+    </div>
+  );
 
   return (
     <AppOverlayLayer className="folder-page-transition-layer">
       <motion.div
-        key={flight.id}
         className="folder-page-transition-item"
         initial={{
-          x: flight.from.x,
-          y: flight.from.y,
-          width: flight.from.width,
-          height: flight.from.height,
+          x: frame.x,
+          y: frame.y,
+          scaleX: 1,
+          scaleY: 1,
         }}
         animate={{
-          x: [
-            flight.from.x,
-            flight.to.x + flight.overshootX,
-            flight.to.x,
-          ],
-          y: [
-            flight.from.y,
-            flight.to.y + flight.overshootY,
-            flight.to.y,
-          ],
-          width: flight.to.width,
-          height: flight.to.height,
+          x: flight ? flight.to.x : frame.x,
+          y: flight ? flight.to.y : frame.y,
+          scaleX,
+          scaleY,
         }}
         transition={transition}
-        onAnimationComplete={onDone}
+        style={{
+          width: frame.width,
+          height: frame.height,
+          transformOrigin: "top left",
+        }}
+        onAnimationComplete={() => {
+          if (flight) onDone();
+        }}
       >
+        {renderTransitionShadow()}
         <AnimatedFolder
           open={false}
           status="idle"

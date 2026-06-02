@@ -461,10 +461,52 @@ impl<'a> PendingReturnRepository<'a> {
         Ok(result)
     }
 
+    pub fn get(&self, task_id: &Uuid, relative_path: &str) -> Result<Option<PendingReturnChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, relative_path, change_kind, secondary_hash, secondary_hash_status, secondary_modified_unix_ms, created_unix_ms
+             FROM pending_return_changes WHERE task_id = ?1 AND relative_path = ?2",
+        )?;
+        let result = stmt.query_row(params![task_id.to_string(), relative_path], |row| {
+            let parse_hs = |s: String| match s.as_str() {
+                "Verified" => HashStatus::Verified,
+                "UnverifiedLargeFile" => HashStatus::UnverifiedLargeFile,
+                _ => HashStatus::Unavailable,
+            };
+            Ok(PendingReturnChange {
+                task_id: parse_uuid_text(row.get(0)?, 0)?,
+                relative_path: row.get(1)?,
+                change_kind: match row.get::<_, String>(2)?.as_str() {
+                    "Created" => ChangeKind::Created,
+                    "Modified" => ChangeKind::Modified,
+                    _ => ChangeKind::Deleted,
+                },
+                secondary_hash: row.get(3)?,
+                secondary_hash_status: parse_hs(row.get(4)?),
+                secondary_modified_unix_ms: row.get(5)?,
+                created_unix_ms: row.get(6)?,
+            })
+        });
+        match result {
+            Ok(change) => Ok(Some(change)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn remove(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM pending_return_changes WHERE task_id = ?1 AND relative_path = ?2",
             params![task_id.to_string(), relative_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_tree(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
+        let prefix = format!("{}/%", relative_path.trim_end_matches('/'));
+        self.conn.execute(
+            "DELETE FROM pending_return_changes
+             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3)",
+            params![task_id.to_string(), relative_path, prefix],
         )?;
         Ok(())
     }

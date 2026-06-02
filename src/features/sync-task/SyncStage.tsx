@@ -1,15 +1,19 @@
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import * as Popover from "@radix-ui/react-popover";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { appWindow } from "@tauri-apps/api/window";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent } from "react";
 import {
+  deleteTaskEntry,
   deleteSyncTask,
   detectConflicts,
+  disconnectTaskPeer,
   executeReturnSync,
   getSyncTask,
   getTaskFileListRefreshHint,
   getTaskPeerStatus,
   hasActiveTransfers,
+  importTaskEntries,
   listHistory,
   listPendingReturns,
   openInFileManager,
@@ -20,14 +24,19 @@ import {
   scanTask,
   syncNow,
   type ConflictInfo,
+  type DeleteDestination,
   type FileSnapshot,
   type HistoryEntry,
+  type ImportCollisionPolicy,
+  type ImportEntryResult,
+  type ImportTaskEntriesResult,
   type PendingReturnChange,
   type SyncActionResult,
   type SyncTask,
   type TaskPeerStatus,
 } from "../../lib/tauriApi";
 import { AnimatedFolder } from "../../components/AnimatedFolder";
+import { DeleteTaskConfirmDialog } from "../../components/DeleteTaskConfirmDialog";
 import { startShadowSyncBurst, useShadowTarget } from "../../components/ShadowLayer";
 import { useFolderTransitionTarget } from "../../components/FolderPageTransition";
 import {
@@ -54,6 +63,7 @@ interface SyncStageProps {
   onSelectTask: (taskId: string) => void;
   onCreateTask: () => void;
   onRefresh: () => void;
+  refreshToken?: number;
 }
 
 type Panel = "none" | "info" | "history" | "connection";
@@ -86,13 +96,74 @@ interface FileTreeNode {
   row?: FileRowModel;
   virtual?: boolean;
   pendingPaths?: string[];
+  conflictPaths?: string[];
+  pendingCount?: number;
+  conflictCount?: number;
   pendingFolder?: boolean;
   deletedFolder?: boolean;
+}
+
+interface DeleteTargetModel {
+  node: FileTreeNode;
+  x: number;
+  y: number;
 }
 
 interface RowPopoverAnchor {
   top: number;
   left: number;
+}
+
+interface FolderActionModel {
+  path: string;
+  name: string;
+  pendingPaths: string[];
+  conflictPaths: string[];
+  pendingCount: number;
+  conflictCount: number;
+  deletedFolder?: boolean;
+}
+
+interface DropImportModel {
+  sourcePaths: string[];
+  targetRelativeDir: string;
+}
+
+interface TaskBubbleLayout {
+  x: number;
+  y: number;
+  rotate: number;
+}
+
+const TASK_BUBBLE_LAYOUTS: Record<number, TaskBubbleLayout[]> = {
+  1: [{ x: 0, y: -166, rotate: -4 }],
+  2: [
+    { x: -88, y: -156, rotate: -9 },
+    { x: 88, y: -156, rotate: 9 },
+  ],
+  3: [
+    { x: -132, y: -130, rotate: -12 },
+    { x: 0, y: -190, rotate: 3 },
+    { x: 132, y: -130, rotate: 12 },
+  ],
+  4: [
+    { x: -146, y: -126, rotate: -12 },
+    { x: -56, y: -188, rotate: 6 },
+    { x: 56, y: -188, rotate: -6 },
+    { x: 146, y: -126, rotate: 12 },
+  ],
+  5: [
+    { x: -152, y: -120, rotate: -12 },
+    { x: -84, y: -182, rotate: 7 },
+    { x: 0, y: -214, rotate: -2 },
+    { x: 84, y: -182, rotate: -7 },
+    { x: 152, y: -120, rotate: 12 },
+  ],
+};
+
+function taskBubbleLayout(count: number, index: number) {
+  const boundedCount = Math.min(Math.max(count, 1), 5);
+  return TASK_BUBBLE_LAYOUTS[boundedCount]?.[index] ?? { x: 0, y: -166, rotate: 0 };
 }
 
 function formatSize(bytes: number) {
@@ -112,16 +183,36 @@ function newestTask(tasks: SyncTask[]) {
 }
 
 function sortLabel(sort: FileSort) {
-  switch (sort) {
-    case "mtime_asc":
-      return "修改时间 ↑";
-    case "size_desc":
-      return "文件大小 ↓";
-    case "size_asc":
-      return "文件大小 ↑";
-    default:
-      return "修改时间 ↓";
+  return sort.startsWith("size") ? "文件大小" : "修改时间";
+}
+
+function sortOptionActive(sort: FileSort, option: "mtime" | "size") {
+  return option === "size" ? sort.startsWith("size") : sort.startsWith("mtime");
+}
+
+function nextSortForOption(sort: FileSort, option: "mtime" | "size"): FileSort {
+  if (option === "mtime") {
+    if (sort === "mtime_desc") return "mtime_asc";
+    return "mtime_desc";
   }
+  if (sort === "size_desc") return "size_asc";
+  return "size_desc";
+}
+
+function peerStatusErrorLabel(error?: string | null) {
+  if (!error) return "对端暂时不可用";
+  const lower = error.toLowerCase();
+  if (lower.includes("timed out") || lower.includes("timeout")) return "对端未响应";
+  if (
+    lower.includes("connection refused") ||
+    lower.includes("disconnected") ||
+    lower.includes("not connected") ||
+    lower.includes("no known address") ||
+    lower.includes("unreachable")
+  ) {
+    return "连接已断开";
+  }
+  return "对端暂时不可用";
 }
 
 function compareTreeNodes(sort: FileSort, a: FileTreeNode, b: FileTreeNode) {
@@ -158,6 +249,10 @@ function aggregateFolderState(children: FileTreeNode[]): FileState {
     (current, child) => (stateRank(child.state) > stateRank(current) ? child.state : current),
     "synced"
   );
+}
+
+function uniquePaths(paths: string[]) {
+  return [...new Set(paths.filter(Boolean))];
 }
 
 function isDescendantPath(path: string, parent: string) {
@@ -200,6 +295,7 @@ function ensureFolderPath(root: FileTreeNode, folderPath: string, virtual = true
 interface PendingFolderInfo {
   path: string;
   pendingPaths: string[];
+  conflictPaths: string[];
   deleted: boolean;
   modifiedUnixMs: number;
   state: FileState;
@@ -239,6 +335,9 @@ function buildPendingFolderInfo(
     infos.set(folderPath, {
       path: folderPath,
       pendingPaths: related.map((item) => item.relative_path),
+      conflictPaths: related
+        .map((item) => item.relative_path)
+        .filter((path) => conflictPaths.has(path)),
       deleted,
       modifiedUnixMs: Math.max(...related.map((item) => item.secondary_modified_unix_ms), 0),
       state: hasConflict ? "conflict" : "pending",
@@ -266,6 +365,9 @@ function buildFileTree(
     node.pendingFolder = true;
     node.deletedFolder = info.deleted;
     node.pendingPaths = info.pendingPaths;
+    node.conflictPaths = info.conflictPaths;
+    node.pendingCount = uniquePaths(info.pendingPaths).length;
+    node.conflictCount = uniquePaths(info.conflictPaths).length;
     node.modifiedUnixMs = Math.max(node.modifiedUnixMs, info.modifiedUnixMs);
     node.state = info.state;
   }
@@ -284,6 +386,10 @@ function buildFileTree(
       modifiedUnixMs: row.modifiedUnixMs,
       state: row.state,
       row,
+      pendingPaths: row.pendingPaths || (row.pending ? [row.pending.relative_path] : []),
+      conflictPaths: row.conflict ? [row.conflict.relative_path] : [],
+      pendingCount: row.pendingPaths?.length || (row.pending ? 1 : 0),
+      conflictCount: row.conflict ? 1 : 0,
     });
   }
 
@@ -292,6 +398,16 @@ function buildFileTree(
     if (node.type === "folder") {
       node.size = node.children.reduce((sum, child) => sum + child.size, 0);
       node.modifiedUnixMs = Math.max(node.modifiedUnixMs, ...node.children.map((child) => child.modifiedUnixMs), 0);
+      node.pendingPaths = uniquePaths([
+        ...(node.pendingPaths || []),
+        ...node.children.flatMap((child) => child.pendingPaths || []),
+      ]);
+      node.conflictPaths = uniquePaths([
+        ...(node.conflictPaths || []),
+        ...node.children.flatMap((child) => child.conflictPaths || []),
+      ]);
+      node.pendingCount = node.pendingPaths.length;
+      node.conflictCount = node.conflictPaths.length;
       const childState = aggregateFolderState(node.children);
       if (node.pendingFolder) {
         node.state = stateRank(node.state) > stateRank(childState) ? node.state : childState;
@@ -349,6 +465,7 @@ export function SyncStage({
   onSelectTask,
   onCreateTask,
   onRefresh,
+  refreshToken = 0,
 }: SyncStageProps) {
   const { t } = useTranslation();
   const reduceMotion = useReducedMotion();
@@ -361,11 +478,24 @@ export function SyncStage({
   const [conflicts, setConflicts] = useState<ConflictInfo[]>([]);
   const [peerStatus, setPeerStatus] = useState<TaskPeerStatus | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
   const [panel, setPanel] = useState<Panel>("none");
   const [activeRow, setActiveRow] = useState<FileRowModel | null>(null);
   const [activeRowAnchor, setActiveRowAnchor] = useState<RowPopoverAnchor | null>(null);
   const [activeConflict, setActiveConflict] = useState<ConflictInfo | null>(null);
+  const [activeFolderAction, setActiveFolderAction] = useState<FolderActionModel | null>(null);
+  const [folderActionBusy, setFolderActionBusy] = useState<"safe" | "keep" | "overwrite" | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTargetModel | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<FileTreeNode | null>(null);
+  const [deleteTaskConfirmOpen, setDeleteTaskConfirmOpen] = useState(false);
+  const [deleteTaskBusy, setDeleteTaskBusy] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState<DeleteDestination | null>(null);
+  const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
+  const [pendingImport, setPendingImport] = useState<DropImportModel | null>(null);
+  const [importConflicts, setImportConflicts] = useState<ImportEntryResult[]>([]);
+  const [importBusy, setImportBusy] = useState<ImportCollisionPolicy | null>(null);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastResults, setLastResults] = useState<SyncActionResult[]>([]);
   const [fileSort, setFileSort] = useState<FileSort>("mtime_desc");
@@ -374,6 +504,8 @@ export function SyncStage({
   const loadingTaskData = useRef(false);
   const pendingFileListRefresh = useRef(false);
   const consumedFileListRevision = useRef(0);
+  const folderCloseTimer = useRef<number | null>(null);
+  const dropTargetPathRef = useRef<string>("");
   const folderShadowRef = useShadowTarget<HTMLDivElement>({
     type: "folder",
     variant: syncing ? "syncing" : "idle",
@@ -443,6 +575,93 @@ export function SyncStage({
     }
   }, [selectedFallback]);
 
+  const finishImport = useCallback(async (result: ImportTaskEntriesResult) => {
+    setImportConflicts([]);
+    setPendingImport(null);
+    setDropTargetPath(null);
+    await loadTaskData();
+    const importedCount = result.imported.length;
+    const failedCount = result.failed.length;
+    if (failedCount > 0) {
+      setError(result.failed.map((item) => item.error || "导入失败").join("；"));
+    }
+    if (importedCount === 0) return;
+    if (task?.local_role === "Primary") {
+      setImportNotice("已导入，正在同步");
+      try {
+        await syncNow(task.id);
+      } catch (e) {
+        setError("已导入，等待连接后同步");
+      }
+    } else {
+      setImportNotice("已导入");
+    }
+    window.setTimeout(() => setImportNotice(null), 2400);
+  }, [loadTaskData, task]);
+
+  const runImport = useCallback(async (
+    sourcePaths: string[],
+    targetRelativeDir: string,
+    collisionPolicy: ImportCollisionPolicy
+  ) => {
+    if (!task) return;
+    setImportBusy(collisionPolicy);
+    setError(null);
+    setImportNotice(null);
+    const target = { sourcePaths, targetRelativeDir };
+    try {
+      const result = await importTaskEntries(task.id, sourcePaths, targetRelativeDir, collisionPolicy);
+      if (result.conflicts.length > 0 && collisionPolicy === "Cancel") {
+        setDropTargetPath(null);
+        setPendingImport(target);
+        setImportConflicts(result.conflicts);
+        return;
+      }
+      await finishImport(result);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setImportBusy(null);
+    }
+  }, [finishImport, task]);
+
+  useEffect(() => {
+    dropTargetPathRef.current = dropTargetPath || "";
+  }, [dropTargetPath]);
+
+  useEffect(() => {
+    if (!task) return undefined;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    appWindow.onFileDropEvent((event) => {
+      if (disposed) return;
+      if (event.payload.type === "hover") {
+        setImportNotice("拖入以导入");
+        return;
+      }
+      if (event.payload.type === "cancel") {
+        setDropTargetPath(null);
+        setImportNotice(null);
+        return;
+      }
+      if (event.payload.type === "drop") {
+        const targetRelativeDir = dropTargetPathRef.current;
+        setImportNotice(null);
+        runImport(event.payload.paths, targetRelativeDir, "Cancel");
+      }
+    })
+      .then((nextUnlisten) => {
+        unlisten = nextUnlisten;
+      })
+      .catch((e) => {
+        if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [runImport, task]);
+
   useEffect(() => {
     consumedFileListRevision.current = 0;
     pendingFileListRefresh.current = false;
@@ -450,8 +669,26 @@ export function SyncStage({
   }, [loadTaskData]);
 
   useEffect(() => {
+    if (refreshToken === 0) return;
+    onRefresh();
+    loadTaskData();
+    if (selectedFallback) {
+      getTaskPeerStatus(selectedFallback)
+        .then(setPeerStatus)
+        .catch((e) => {
+          setPeerStatus((prev) =>
+            prev ? { ...prev, connected: false, error: String(e) } : null
+          );
+        });
+    }
+  }, [loadTaskData, onRefresh, refreshToken, selectedFallback]);
+
+  useEffect(() => {
     setActiveRow(null);
     setActiveRowAnchor(null);
+    setActiveFolderAction(null);
+    setDeleteTarget(null);
+    setDeleteConfirm(null);
     setExpandedFolders(new Set());
   }, [panel, selectedFallback]);
 
@@ -468,6 +705,19 @@ export function SyncStage({
       window.removeEventListener("scroll", close, true);
     };
   }, [activeRow]);
+
+  useEffect(() => {
+    if (!deleteTarget) return;
+    const close = () => setDeleteTarget(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [deleteTarget]);
 
   useEffect(() => {
     if (!selectedFallback) return;
@@ -557,6 +807,10 @@ export function SyncStage({
     () => buildPendingFolderInfo(pending, snapshots, conflicts),
     [conflicts, pending, snapshots]
   );
+  const pendingByPath = useMemo(
+    () => new Map(pending.map((item) => [item.relative_path, item])),
+    [pending]
+  );
   const deletedPendingFolderPaths = useMemo(
     () => [...pendingFolderByPath.values()]
       .filter((info) => info.deleted)
@@ -640,10 +894,99 @@ export function SyncStage({
     if (row.conflict) {
       setActiveRow(null);
       setActiveRowAnchor(null);
+      setActiveFolderAction(null);
       setActiveConflict(row.conflict);
     } else if (row.pending || row.pendingPaths?.length) {
+      setActiveFolderAction(null);
       setActiveRow(row);
       setActiveRowAnchor(rowPopoverAnchor(rect));
+    }
+  };
+
+  const folderActionFromNode = (node: FileTreeNode): FolderActionModel | null => {
+    const pendingPaths = uniquePaths(node.pendingPaths || []);
+    const conflictPaths = uniquePaths(node.conflictPaths || []);
+    if (pendingPaths.length === 0 && conflictPaths.length === 0) return null;
+    return {
+      path: node.path,
+      name: node.name,
+      pendingPaths,
+      conflictPaths,
+      pendingCount: pendingPaths.length,
+      conflictCount: conflictPaths.length,
+      deletedFolder: node.deletedFolder,
+    };
+  };
+
+  const safePendingPathsForFolder = (action: FolderActionModel) => {
+    const conflictPaths = new Set(action.conflictPaths);
+    return action.pendingPaths.filter((path) => {
+      if (conflictPaths.has(path)) return false;
+      const pendingItem = pendingByPath.get(path);
+      const deletesParentWithConflicts =
+        path === action.path &&
+        pendingItem?.change_kind === "Deleted" &&
+        action.conflictPaths.length > 0;
+      return !deletesParentWithConflicts;
+    });
+  };
+
+  const handleFolderActionClick = (node: FileTreeNode) => {
+    const action = folderActionFromNode(node);
+    if (!action) return false;
+    setActiveRow(null);
+    setActiveRowAnchor(null);
+    setActiveConflict(null);
+    setActiveFolderAction(action);
+    return true;
+  };
+
+  const handleFileContextMenu = (node: FileTreeNode, event: MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setActiveRow(null);
+    setActiveRowAnchor(null);
+    setActiveConflict(null);
+    setActiveFolderAction(null);
+    setDeleteTarget({ node, x: event.clientX, y: event.clientY });
+  };
+
+  const handleRootDragOver = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setDropTargetPath("");
+  };
+
+  const handleFolderDragOver = (node: FileTreeNode, event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    setDropTargetPath(node.path);
+  };
+
+  const clearDropTarget = () => {
+    setDropTargetPath(null);
+  };
+
+  const handleDeleteEntry = async (destination: DeleteDestination) => {
+    if (!task || !deleteConfirm) return;
+    setDeleteBusy(destination);
+    setError(null);
+    try {
+      const results = await deleteTaskEntry(task.id, deleteConfirm.path, destination);
+      const failed = results.find((result) => !result.success);
+      if (failed) {
+        setError(failed.error || "删除失败");
+        return;
+      }
+      setDeleteConfirm(null);
+      setDeleteTarget(null);
+      await loadTaskData();
+      onRefresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDeleteBusy(null);
     }
   };
 
@@ -720,23 +1063,98 @@ export function SyncStage({
     }
   };
 
+  const handleFolderAction = async (mode: "safe" | "keep" | "overwrite") => {
+    if (!task || !activeFolderAction) return;
+    const action = activeFolderAction;
+    const safePaths = safePendingPathsForFolder(action);
+    if (mode === "safe" && safePaths.length === 0) {
+      setError("没有可直接回传的无冲突项");
+      return;
+    }
+
+    setFolderActionBusy(mode);
+    setSyncing(true);
+    setError(null);
+    try {
+      const conflictResults: SyncActionResult[] = [];
+      if (mode === "keep" || mode === "overwrite") {
+        for (const path of action.conflictPaths) {
+          const result = mode === "keep"
+            ? await resolveConflictKeepBoth(task.id, path)
+            : await resolveConflictOverwrite(task.id, path);
+          conflictResults.push(result);
+          if (!result.success) {
+            throw new Error(result.error || `${path} 处理失败`);
+          }
+        }
+      }
+
+      let returnResults: SyncActionResult[] = [];
+      if (safePaths.length > 0) {
+        returnResults = await executeReturnSync(task.id, safePaths);
+        const failed = returnResults.find((result) => !result.success);
+        if (failed) {
+          setLastResults([...conflictResults, ...returnResults]);
+          throw new Error(failed.error || `${failed.relative_path} 回传失败`);
+        }
+      }
+
+      setLastResults([...conflictResults, ...returnResults]);
+      setActiveFolderAction(null);
+      await loadTaskData();
+      onRefresh();
+    } catch (e) {
+      setError(mode === "safe" ? formatReturnSyncError(e) : String(e));
+      await loadTaskData();
+    } finally {
+      setFolderActionBusy(null);
+      setSyncing(false);
+    }
+  };
+
   const handleDelete = async () => {
     if (!task) return;
-    if (!window.confirm(`${t.dashboard.confirmDelete} "${task.name}"`)) return;
+    setDeleteTaskConfirmOpen(true);
+  };
+
+  const confirmDeleteTask = async () => {
+    if (!task) return;
+    setDeleteTaskBusy(true);
     try {
       await deleteSyncTask(task.id);
       setTask(null);
       setPanel("none");
+      setDeleteTaskConfirmOpen(false);
       onRefresh();
     } catch (e) {
       setError(String(e));
+    } finally {
+      setDeleteTaskBusy(false);
+    }
+  };
+
+  const handleDisconnectPeer = async () => {
+    if (!task || disconnecting) return;
+    setDisconnecting(true);
+    setError(null);
+    try {
+      const status = await disconnectTaskPeer(task.id);
+      setPeerStatus(status);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDisconnecting(false);
     }
   };
 
   const handleConflictOverwrite = async () => {
     if (!task || !activeConflict) return;
     try {
-      await resolveConflictOverwrite(task.id, activeConflict.relative_path);
+      const result = await resolveConflictOverwrite(task.id, activeConflict.relative_path);
+      if (!result.success) {
+        setError(result.error || "覆盖主机失败");
+        return;
+      }
       setActiveConflict(null);
       setActiveRow(null);
       setActiveRowAnchor(null);
@@ -749,7 +1167,11 @@ export function SyncStage({
   const handleConflictKeepBoth = async () => {
     if (!task || !activeConflict) return;
     try {
-      await resolveConflictKeepBoth(task.id, activeConflict.relative_path);
+      const result = await resolveConflictKeepBoth(task.id, activeConflict.relative_path);
+      if (!result.success) {
+        setError(result.error || "保留两份失败");
+        return;
+      }
       setActiveConflict(null);
       setActiveRow(null);
       setActiveRowAnchor(null);
@@ -759,15 +1181,41 @@ export function SyncStage({
     }
   };
 
-  const openFolderMenu = useCallback(() => {
-    startShadowSyncBurst();
-    setFolderOpen(true);
+  const cancelFolderClose = useCallback(() => {
+    if (folderCloseTimer.current !== null) {
+      window.clearTimeout(folderCloseTimer.current);
+      folderCloseTimer.current = null;
+    }
   }, []);
 
+  const openFolderMenu = useCallback(() => {
+    cancelFolderClose();
+    startShadowSyncBurst();
+    setFolderOpen(true);
+  }, [cancelFolderClose]);
+
   const closeFolderMenu = useCallback(() => {
+    cancelFolderClose();
     startShadowSyncBurst();
     setFolderOpen(false);
-  }, []);
+  }, [cancelFolderClose]);
+
+  const scheduleFolderClose = useCallback(() => {
+    cancelFolderClose();
+    folderCloseTimer.current = window.setTimeout(() => {
+      folderCloseTimer.current = null;
+      closeFolderMenu();
+    }, 120);
+  }, [cancelFolderClose, closeFolderMenu]);
+
+  useEffect(() => {
+    const handleTransitionStart = () => closeFolderMenu();
+    window.addEventListener("lanbridge-folder-transition-start", handleTransitionStart);
+    return () => {
+      window.removeEventListener("lanbridge-folder-transition-start", handleTransitionStart);
+      cancelFolderClose();
+    };
+  }, [cancelFolderClose, closeFolderMenu]);
 
   if (tasks.length === 0) {
     return (
@@ -777,7 +1225,9 @@ export function SyncStage({
             className={`folder-shadow-host sync-folder-host ${folderTransitionTarget.hidden ? "folder-transition-hidden" : ""}`}
             ref={setFolderHostRef}
           >
-            <AnimatedFolder open={false} status="idle" size="clamp(300px, 34vw, 330px)" externalShadow className="stage-folder sync-folder" />
+            <div className="folder-transition-anchor sync-folder-hitbox">
+              <AnimatedFolder open={false} status="idle" size="clamp(300px, 34vw, 330px)" externalShadow className="stage-folder sync-folder" />
+            </div>
           </div>
           <button className="stage-primary-btn" onClick={onCreateTask}>
             {t.dashboard.createFirst}
@@ -795,7 +1245,9 @@ export function SyncStage({
             className={`folder-shadow-host sync-folder-host ${folderTransitionTarget.hidden ? "folder-transition-hidden" : ""}`}
             ref={setFolderHostRef}
           >
-            <AnimatedFolder open={false} status="discovering" size="clamp(300px, 34vw, 330px)" externalShadow className="stage-folder sync-folder" />
+            <div className="folder-transition-anchor sync-folder-hitbox">
+              <AnimatedFolder open={false} status="discovering" size="clamp(300px, 34vw, 330px)" externalShadow className="stage-folder sync-folder" />
+            </div>
           </div>
           <p className="stage-muted">{t.task.loading}</p>
         </div>
@@ -854,29 +1306,35 @@ export function SyncStage({
 
         <div
           className="folder-switcher"
-          onMouseEnter={openFolderMenu}
-          onMouseLeave={closeFolderMenu}
-          onFocus={openFolderMenu}
           onBlur={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget)) closeFolderMenu();
+            if (!event.currentTarget.contains(event.relatedTarget)) scheduleFolderClose();
           }}
         >
           <div
             className={`folder-shadow-host sync-folder-host ${folderTransitionTarget.hidden ? "folder-transition-hidden" : ""}`}
             ref={setFolderHostRef}
           >
-            <AnimatedFolder
-              open={folderOpen}
-              status={syncing ? "syncing" : peerOffline ? "warning" : "idle"}
-              size="clamp(300px, 34vw, 330px)"
-              externalShadow
-              className="stage-folder sync-folder"
-            />
+            <div
+              className="folder-transition-anchor sync-folder-hitbox"
+              onMouseEnter={openFolderMenu}
+              onMouseLeave={scheduleFolderClose}
+              onFocus={openFolderMenu}
+            >
+              <AnimatedFolder
+                open={folderOpen}
+                status={syncing ? "syncing" : peerOffline ? "warning" : "idle"}
+                size="clamp(300px, 34vw, 330px)"
+                externalShadow
+                className="stage-folder sync-folder"
+              />
+            </div>
           </div>
           <AnimatePresence>
             {folderOpen && (
               <motion.div
                 className="task-bubble-menu"
+                onMouseEnter={cancelFolderClose}
+                onMouseLeave={scheduleFolderClose}
                 initial="hidden"
                 animate="show"
                 exit="hidden"
@@ -885,41 +1343,48 @@ export function SyncStage({
                   show: { opacity: 1, transition: { staggerChildren: reduceMotion ? 0 : 0.035 } },
                 }}
               >
-                {tasks.slice(0, 5).map((item, index) => (
-                  <motion.button
-                    key={item.id}
-                    className={item.id === task.id ? "active" : ""}
-                    style={{ ["--bubble-index" as string]: index }}
-                    initial={reduceMotion
-                      ? {
-                          opacity: 1,
-                          x: [-128, -42, 46, -86, 86][index] ?? 0,
-                          y: [-146, -182, -173, -110, -106][index] ?? -138,
-                          rotate: [-14, 7, 9, -16, 12][index] ?? 0,
-                        }
-                      : { opacity: 0, scale: 0.35, x: 0, y: 22, rotate: 0 }}
-                    animate={{
-                      opacity: 1,
-                      scale: 1,
-                      x: [-128, -42, 46, -86, 86][index] ?? 0,
-                      y: [-146, -182, -173, -110, -106][index] ?? -138,
-                      rotate: [-14, 7, 9, -16, 12][index] ?? 0,
-                    }}
-                    exit={reduceMotion
-                      ? { opacity: 1 }
-                      : { opacity: 0, scale: 0.4, x: 0, y: 18, rotate: 0 }}
-                    whileHover={reduceMotion ? undefined : { scale: 1.12 }}
-                    whileTap={reduceMotion ? undefined : { scale: 1.04 }}
-                    transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 28 }}
-                    onClick={() => {
-                      onSelectTask(item.id);
-                      setFolderOpen(false);
-                    }}
-                  >
-                    <span className={`task-bubble-dot ${item.local_role === "Secondary" ? "secondary" : "primary"}`} />
-                    <span className="task-bubble-name">{item.name}</span>
-                  </motion.button>
-                ))}
+                {tasks.slice(0, 5).map((item, index, visibleTasks) => {
+                  const layout = taskBubbleLayout(visibleTasks.length, index);
+                  const centerIndex = (visibleTasks.length - 1) / 2;
+                  return (
+                    <motion.button
+                      key={item.id}
+                      className={item.id === task.id ? "active" : ""}
+                      style={{
+                        ["--bubble-index" as string]: index,
+                        zIndex: Math.round(20 - Math.abs(index - centerIndex)),
+                      }}
+                      initial={reduceMotion
+                        ? {
+                            opacity: 1,
+                            x: layout.x,
+                            y: layout.y,
+                            rotate: layout.rotate,
+                          }
+                        : { opacity: 0, scale: 0.35, x: 0, y: 22, rotate: 0 }}
+                      animate={{
+                        opacity: 1,
+                        scale: 1,
+                        x: layout.x,
+                        y: layout.y,
+                        rotate: layout.rotate,
+                      }}
+                      exit={reduceMotion
+                        ? { opacity: 1 }
+                        : { opacity: 0, scale: 0.4, x: 0, y: 18, rotate: 0 }}
+                      whileHover={reduceMotion ? undefined : { scale: 1.12 }}
+                      whileTap={reduceMotion ? undefined : { scale: 1.04 }}
+                      transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 460, damping: 28 }}
+                      onClick={() => {
+                        onSelectTask(item.id);
+                        setFolderOpen(false);
+                      }}
+                    >
+                      <span className={`task-bubble-dot ${item.local_role === "Secondary" ? "secondary" : "primary"}`} />
+                      <span className="task-bubble-name">{item.name}</span>
+                    </motion.button>
+                  );
+                })}
               </motion.div>
             )}
           </AnimatePresence>
@@ -968,10 +1433,16 @@ export function SyncStage({
                 </Tooltip.Portal>
               </Tooltip.Root>
               <Popover.Portal>
-                <Popover.Content className="stage-popover connection" sideOffset={10} align="end">
+                <Popover.Content
+                  className="connection-status-popover"
+                  side="bottom"
+                  sideOffset={10}
+                  align="end"
+                  collisionPadding={16}
+                >
                   <div className={`connection-popover-content ${connectionState}`}>
                     <span className={`connection-status-dot ${connectionState}`} />
-                    <div>
+                    <div className="connection-popover-main">
                       <strong>
                         {connectionState === "offline"
                           ? disconnectedPeerLabel
@@ -983,11 +1454,29 @@ export function SyncStage({
                         {connectionState === "online"
                           ? "同步操作可用"
                           : connectionState === "offline"
-                            ? (peerStatus?.error || "对端暂时不可用")
+                            ? (peerStatus?.error === "manually disconnected" ? "已手动断开连接" : peerStatusErrorLabel(peerStatus?.error))
                             : "自动检测中"}
                       </p>
-                      <span>{task.name}</span>
+                      <dl className="connection-meta-list">
+                        <div>
+                          <dt>任务</dt>
+                          <dd>{task.name}</dd>
+                        </div>
+                        {peerStatus?.address && (
+                          <div>
+                            <dt>地址</dt>
+                            <dd>{peerStatus.address}</dd>
+                          </div>
+                        )}
+                      </dl>
                     </div>
+                    <button
+                      className="connection-disconnect-btn"
+                      onClick={handleDisconnectPeer}
+                      disabled={disconnecting || connectionState !== "online"}
+                    >
+                      {disconnecting ? "断开中..." : "断开连接"}
+                    </button>
                   </div>
                 </Popover.Content>
               </Popover.Portal>
@@ -1044,7 +1533,9 @@ export function SyncStage({
             ) : (
               <motion.div
                 key="sync-file-panel"
-                className="sync-panel-page sync-file-panel"
+                className={`sync-panel-page sync-file-panel ${dropTargetPath === "" ? "drop-import-root-active" : ""}`}
+                onDragOver={handleRootDragOver}
+                onDragEnd={clearDropTarget}
                 {...sidePanelMotion}
                 transition={sidePanelTransition}
               >
@@ -1059,17 +1550,23 @@ export function SyncStage({
                         </button>
                       </Popover.Trigger>
                       <Popover.Portal>
-                        <Popover.Content className="sort-popover" sideOffset={8} align="end">
-                          {(["mtime_desc", "mtime_asc", "size_desc", "size_asc"] as FileSort[]).map((option) => (
+                        <Popover.Content
+                          className="sort-popover"
+                          side="bottom"
+                          sideOffset={8}
+                          align="center"
+                          collisionPadding={16}
+                        >
+                          {(["mtime", "size"] as const).map((option) => (
                             <button
                               key={option}
-                              className={option === fileSort ? "active" : ""}
+                              className={sortOptionActive(fileSort, option) ? "active" : ""}
                               onClick={() => {
-                                setFileSort(option);
+                                setFileSort((current) => nextSortForOption(current, option));
                                 setSortOpen(false);
                               }}
                             >
-                              {sortLabel(option)}
+                              {option === "mtime" ? "修改时间" : "文件大小"}
                             </button>
                           ))}
                         </Popover.Content>
@@ -1083,6 +1580,7 @@ export function SyncStage({
                 </div>
 
                 {error && <div className="top-inline-error">{error}</div>}
+                {importNotice && <div className="top-inline-info">{importNotice}</div>}
 
                 {fileTree.length === 0 ? (
                   <div className="stage-row empty-file-row">{t.app.selectTaskHint}</div>
@@ -1093,19 +1591,10 @@ export function SyncStage({
                     expanded={expandedFolders}
                     onToggleFolder={toggleFolderNode}
                     onFileClick={handleFileRowClick}
-                    onFolderPendingClick={(node, rect) => {
-                      if (!node.pendingFolder || !node.pendingPaths?.length) return;
-                      handleFileRowClick({
-                        key: `folder-pending:${node.path}`,
-                        path: node.path,
-                        name: node.name,
-                        size: node.size,
-                        modifiedUnixMs: node.modifiedUnixMs,
-                        state: node.state,
-                        pendingPaths: [node.path],
-                        isFolder: true,
-                      }, rect);
-                    }}
+                    onFolderActionClick={handleFolderActionClick}
+                    onContextMenu={handleFileContextMenu}
+                    dropTargetPath={dropTargetPath}
+                    onFolderDragOver={handleFolderDragOver}
                   />
                 )}
               </motion.div>
@@ -1147,6 +1636,76 @@ export function SyncStage({
           onCancel={() => setActiveConflict(null)}
         />
       )}
+
+      {activeFolderAction && (
+        <FolderActionModal
+          action={activeFolderAction}
+          safePendingCount={safePendingPathsForFolder(activeFolderAction).length}
+          busy={folderActionBusy}
+          onReturnSafe={() => handleFolderAction("safe")}
+          onKeepBoth={() => handleFolderAction("keep")}
+          onOverwrite={() => handleFolderAction("overwrite")}
+          onCancel={() => {
+            if (folderActionBusy) return;
+            setActiveFolderAction(null);
+          }}
+        />
+      )}
+
+      {deleteTarget && !deleteConfirm && (
+        <div
+          className="file-context-menu"
+          style={{ left: deleteTarget.x, top: deleteTarget.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              setDeleteConfirm(deleteTarget.node);
+              setDeleteTarget(null);
+            }}
+          >
+            删除
+          </button>
+        </div>
+      )}
+
+      {deleteConfirm && task && (
+        <DeleteEntryModal
+          node={deleteConfirm}
+          role={task.local_role}
+          busy={deleteBusy}
+          onCancel={() => {
+            if (deleteBusy) return;
+            setDeleteConfirm(null);
+          }}
+          onDelete={handleDeleteEntry}
+        />
+      )}
+      {pendingImport && importConflicts.length > 0 && (
+        <ImportConflictModal
+          targetRelativeDir={pendingImport.targetRelativeDir}
+          conflicts={importConflicts}
+          busy={importBusy}
+          onCancel={() => {
+            if (importBusy) return;
+            setPendingImport(null);
+            setImportConflicts([]);
+          }}
+          onKeepBoth={() => runImport(pendingImport.sourcePaths, pendingImport.targetRelativeDir, "KeepBoth")}
+          onOverwrite={() => runImport(pendingImport.sourcePaths, pendingImport.targetRelativeDir, "Overwrite")}
+        />
+      )}
+      {task && (
+        <DeleteTaskConfirmDialog
+          open={deleteTaskConfirmOpen}
+          taskName={task.name}
+          busy={deleteTaskBusy}
+          onCancel={() => {
+            if (!deleteTaskBusy) setDeleteTaskConfirmOpen(false);
+          }}
+          onConfirm={confirmDeleteTask}
+        />
+      )}
     </section>
   );
 }
@@ -1156,13 +1715,19 @@ function FileTreeList({
   expanded,
   onToggleFolder,
   onFileClick,
-  onFolderPendingClick,
+  onFolderActionClick,
+  onContextMenu,
+  dropTargetPath,
+  onFolderDragOver,
 }: {
   nodes: FileTreeNode[];
   expanded: Set<string>;
   onToggleFolder: (path: string) => void;
   onFileClick: (row: FileRowModel, rect: DOMRect) => void;
-  onFolderPendingClick: (node: FileTreeNode, rect: DOMRect) => void;
+  onFolderActionClick: (node: FileTreeNode) => boolean;
+  onContextMenu: (node: FileTreeNode, event: MouseEvent<HTMLElement>) => void;
+  dropTargetPath: string | null;
+  onFolderDragOver: (node: FileTreeNode, event: DragEvent<HTMLElement>) => void;
 }) {
   return (
     <AnimatedList
@@ -1176,7 +1741,10 @@ function FileTreeList({
           expanded={expanded}
           onToggleFolder={onToggleFolder}
           onFileClick={onFileClick}
-          onFolderPendingClick={onFolderPendingClick}
+          onFolderActionClick={onFolderActionClick}
+          onContextMenu={onContextMenu}
+          dropTargetPath={dropTargetPath}
+          onFolderDragOver={onFolderDragOver}
         />
       )}
     />
@@ -1189,30 +1757,36 @@ function FileTreeRow({
   expanded,
   onToggleFolder,
   onFileClick,
-  onFolderPendingClick,
+  onFolderActionClick,
+  onContextMenu,
+  dropTargetPath,
+  onFolderDragOver,
 }: {
   node: FileTreeNode;
   depth: number;
   expanded: Set<string>;
   onToggleFolder: (path: string) => void;
   onFileClick: (row: FileRowModel, rect: DOMRect) => void;
-  onFolderPendingClick: (node: FileTreeNode, rect: DOMRect) => void;
+  onFolderActionClick: (node: FileTreeNode) => boolean;
+  onContextMenu: (node: FileTreeNode, event: MouseEvent<HTMLElement>) => void;
+  dropTargetPath: string | null;
+  onFolderDragOver: (node: FileTreeNode, event: DragEvent<HTMLElement>) => void;
 }) {
   if (node.type === "folder") {
     const open = expanded.has(node.path);
     const canExpand = node.children.length > 0 && !node.deletedFolder;
+    const isDropTarget = dropTargetPath === node.path;
     return (
-      <div className={`file-tree-folder-card state-${node.state} ${open ? "open" : ""}`}>
+      <div className={`file-tree-folder-card state-${node.state} ${open ? "open" : ""} ${isDropTarget ? "drop-target" : ""}`}>
         <button
           className={`stage-file-row file-tree-row file-tree-folder-row state-${node.state}`}
           style={{ ["--tree-depth" as string]: depth }}
-          onClick={(event) => {
-            if (node.pendingFolder) {
-              onFolderPendingClick(node, event.currentTarget.getBoundingClientRect());
-              return;
-            }
+          onDragOver={(event) => onFolderDragOver(node, event)}
+          onClick={() => {
+            if (onFolderActionClick(node)) return;
             if (canExpand) onToggleFolder(node.path);
           }}
+          onContextMenu={(event) => onContextMenu(node, event)}
         >
           <span className="file-tree-name">
             <span
@@ -1253,7 +1827,10 @@ function FileTreeRow({
                   expanded={expanded}
                   onToggleFolder={onToggleFolder}
                   onFileClick={onFileClick}
-                  onFolderPendingClick={onFolderPendingClick}
+                  onFolderActionClick={onFolderActionClick}
+                  onContextMenu={onContextMenu}
+                  dropTargetPath={dropTargetPath}
+                  onFolderDragOver={onFolderDragOver}
                 />
               ))}
             </motion.div>
@@ -1270,6 +1847,7 @@ function FileTreeRow({
       onClick={(event: MouseEvent<HTMLButtonElement>) => {
         if (node.row) onFileClick(node.row, event.currentTarget.getBoundingClientRect());
       }}
+      onContextMenu={(event) => onContextMenu(node, event)}
     >
       <span className="file-tree-name">
         <span className="file-name">{node.name}</span>
@@ -1287,6 +1865,233 @@ function FileStateIcon({ state }: { state: FileState }) {
     return <TriangleAlertIcon {...common} className={`file-state-icon ${state}`} />;
   }
   return <InfoIcon {...common} className={`file-state-icon ${state}`} />;
+}
+
+function countTreeEntries(node: FileTreeNode) {
+  let files = node.type === "file" ? 1 : 0;
+  let folders = node.type === "folder" ? 1 : 0;
+  let size = node.size || 0;
+  for (const child of node.children) {
+    const next = countTreeEntries(child);
+    files += next.files;
+    folders += next.folders;
+    size += next.size;
+  }
+  return { files, folders, size };
+}
+
+function DeleteEntryModal({
+  node,
+  role,
+  busy,
+  onCancel,
+  onDelete,
+}: {
+  node: FileTreeNode;
+  role: "Primary" | "Secondary";
+  busy: DeleteDestination | null;
+  onCancel: () => void;
+  onDelete: (destination: DeleteDestination) => void;
+}) {
+  const counts = countTreeEntries(node);
+  const isFolder = node.type === "folder";
+  const disabled = busy !== null;
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal delete-entry-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="folder-action-head">
+          <span className="danger">
+            <TrashIcon size={18} />
+          </span>
+          <div>
+            <h2>删除{isFolder ? "文件夹" : "文件"}</h2>
+            <p>{node.name}</p>
+          </div>
+          <button className="folder-action-close" onClick={onCancel} disabled={disabled} aria-label="关闭">
+            <XIcon size={16} />
+          </button>
+        </div>
+        <div className="delete-entry-copy">
+          {isFolder ? (
+            <span>
+              包含 {counts.files} 个文件、{Math.max(0, counts.folders - 1)} 个子文件夹，
+              大小约 {formatSize(counts.size)}。
+            </span>
+          ) : (
+            <span>大小约 {formatSize(counts.size)}。</span>
+          )}
+          {role === "Secondary" ? (
+            <strong>仅删除本机副本，主机下次同步可能重新同步此文件。</strong>
+          ) : (
+            <strong>主机删除会在下次同步时让副机内容进入历史记录。</strong>
+          )}
+        </div>
+        <div className="folder-action-buttons">
+          <button className="btn btn-secondary" onClick={onCancel} disabled={disabled}>
+            取消
+          </button>
+          <button
+            className="btn btn-secondary"
+            onClick={() => onDelete("LanBridgeHistory")}
+            disabled={disabled}
+          >
+            {busy === "LanBridgeHistory" ? "删除中..." : "移入 LanBridge 历史"}
+          </button>
+          <button
+            className="btn btn-danger"
+            onClick={() => onDelete("SystemTrash")}
+            disabled={disabled}
+          >
+            {busy === "SystemTrash" ? "删除中..." : "移入系统回收站"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ImportConflictModal({
+  targetRelativeDir,
+  conflicts,
+  busy,
+  onCancel,
+  onKeepBoth,
+  onOverwrite,
+}: {
+  targetRelativeDir: string;
+  conflicts: ImportEntryResult[];
+  busy: ImportCollisionPolicy | null;
+  onCancel: () => void;
+  onKeepBoth: () => void;
+  onOverwrite: () => void;
+}) {
+  const disabled = busy !== null;
+  const targetLabel = targetRelativeDir ? targetRelativeDir : "任务根目录";
+  const firstConflict = conflicts[0]?.relative_path || "";
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal import-conflict-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="folder-action-head">
+          <span className="pending">
+            <InfoIcon size={18} isAnimated={false} />
+          </span>
+          <div>
+            <h2>目标已存在</h2>
+            <p>{targetLabel}</p>
+          </div>
+          <button className="folder-action-close" onClick={onCancel} disabled={disabled} aria-label="关闭">
+            <XIcon size={16} />
+          </button>
+        </div>
+        <div className="delete-entry-copy">
+          <span>
+            发现 {conflicts.length} 个同名项目
+            {firstConflict ? `：${firstConflict}` : ""}。
+          </span>
+          <strong>覆盖会替换本机任务目录中的同名文件；文件夹会合并覆盖。</strong>
+        </div>
+        <div className="folder-action-buttons">
+          <button className="btn btn-secondary" onClick={onCancel} disabled={disabled}>
+            取消
+          </button>
+          <button className="btn btn-secondary" onClick={onKeepBoth} disabled={disabled}>
+            {busy === "KeepBoth" ? "导入中..." : "保留两份"}
+          </button>
+          <button className="btn btn-danger" onClick={onOverwrite} disabled={disabled}>
+            {busy === "Overwrite" ? "覆盖中..." : "覆盖"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FolderActionModal({
+  action,
+  safePendingCount,
+  busy,
+  onReturnSafe,
+  onKeepBoth,
+  onOverwrite,
+  onCancel,
+}: {
+  action: FolderActionModel;
+  safePendingCount: number;
+  busy: "safe" | "keep" | "overwrite" | null;
+  onReturnSafe: () => void;
+  onKeepBoth: () => void;
+  onOverwrite: () => void;
+  onCancel: () => void;
+}) {
+  const hasPending = action.pendingCount > 0;
+  const hasConflict = action.conflictCount > 0;
+  const disabled = busy !== null;
+  const keepLabel = hasPending && safePendingCount > 0 ? "保留两份并回传" : "保留两份";
+  const overwriteLabel = hasPending && safePendingCount > 0 ? "覆盖主机并回传" : "覆盖主机";
+
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal folder-action-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="folder-action-head">
+          <span className={hasConflict ? "danger" : "pending"}>
+            {hasConflict
+              ? <TriangleAlertIcon size={18} isAnimated={false} />
+              : <InfoIcon size={18} isAnimated={false} />}
+          </span>
+          <div>
+            <h2>处理文件夹</h2>
+            <p>{action.name}</p>
+          </div>
+          <button className="folder-action-close" onClick={onCancel} disabled={disabled} aria-label="关闭">
+            <XIcon size={16} />
+          </button>
+        </div>
+
+        <div className="folder-action-summary">
+          <div>
+            <strong>{action.pendingCount}</strong>
+            <span>待回传</span>
+          </div>
+          <div>
+            <strong>{action.conflictCount}</strong>
+            <span>冲突</span>
+          </div>
+        </div>
+
+        {hasConflict && (
+          <div className="folder-action-notice">
+            覆盖主机前会逐个备份主机文件。
+          </div>
+        )}
+
+        <div className="folder-action-buttons">
+          <button className="btn btn-secondary" onClick={onCancel} disabled={disabled}>
+            取消
+          </button>
+          {hasPending && (
+            <button
+              className="btn btn-secondary"
+              onClick={onReturnSafe}
+              disabled={disabled || safePendingCount === 0}
+              title={safePendingCount === 0 ? "没有可直接回传的无冲突项" : undefined}
+            >
+              {busy === "safe" ? "回传中..." : hasConflict ? "回传无冲突项" : "回传"}
+            </button>
+          )}
+          {hasConflict && (
+            <>
+              <button className="btn btn-secondary" onClick={onKeepBoth} disabled={disabled}>
+                {busy === "keep" ? "处理中..." : keepLabel}
+              </button>
+              <button className="btn btn-danger" onClick={onOverwrite} disabled={disabled}>
+                {busy === "overwrite" ? "处理中..." : overwriteLabel}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function SyncHistoryPanel({ taskId }: { taskId: string }) {
@@ -1325,7 +2130,7 @@ function SyncHistoryPanel({ taskId }: { taskId: string }) {
   };
 
   if (loading) {
-    return <div className="stage-row empty-file-row">{t.history.loading}</div>;
+    return <div className="sync-history-empty-row">{t.history.loading}</div>;
   }
 
   if (error) {
@@ -1333,7 +2138,7 @@ function SyncHistoryPanel({ taskId }: { taskId: string }) {
   }
 
   if (entries.length === 0) {
-    return <div className="stage-row empty-file-row">{t.history.noEntries}</div>;
+    return <div className="sync-history-empty-row">{t.history.noEntries}</div>;
   }
 
   return (

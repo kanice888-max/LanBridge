@@ -25,6 +25,8 @@ use crate::transport::protocol::{
     TRANSFER_V1_CHUNK_SIZE, TRANSFER_V2_ACK_INTERVAL_BYTES, TRANSFER_V2_CHUNK_SIZE,
 };
 
+const PRIMARY_NON_EMPTY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Maps negotiated sync task IDs to the local root that should receive files.
 #[derive(Clone, Default)]
 pub struct TaskRootRegistry {
@@ -391,7 +393,6 @@ impl TaskRootRegistry {
         local_path: impl AsRef<Path>,
     ) -> Result<PendingTaskInvite> {
         let local_path = local_path.as_ref().to_path_buf();
-        validate_invite_local_path(&local_path)?;
         let invite_snapshot = {
             let invites = self.task_invites.lock().unwrap();
             invites
@@ -399,6 +400,7 @@ impl TaskRootRegistry {
                 .ok_or_else(|| anyhow::anyhow!("task invite not found"))?
                 .clone()
         };
+        validate_invite_local_path(&local_path, &invite_snapshot.proposed_role)?;
         self.ensure_trusted_peer_key_matches(
             &invite_snapshot.requester_device_id,
             &invite_snapshot.requester_public_key,
@@ -1354,6 +1356,37 @@ async fn handle_connection(
                                 Ok(()) => protocol::SyncMessage::FileAck {
                                     task_id,
                                     relative_path,
+                                    success: true,
+                                    error: None,
+                                },
+                                Err(e) => protocol::SyncMessage::FileAck {
+                                    task_id,
+                                    relative_path,
+                                    success: false,
+                                    error: Some(e.to_string()),
+                                },
+                            };
+                        writer.write_all(&protocol::encode_message(&ack)?).await?;
+                    }
+                    protocol::SyncMessage::ConflictApply {
+                        task_id,
+                        relative_path,
+                        staged_relative_path,
+                        mode,
+                    } => {
+                        let ack =
+                            match require_authenticated(&authenticated_device_id).and_then(|_| {
+                                apply_incoming_conflict_file(
+                                    &task_roots,
+                                    &task_id,
+                                    &relative_path,
+                                    &staged_relative_path,
+                                    &mode,
+                                )
+                            }) {
+                                Ok(applied_path) => protocol::SyncMessage::FileAck {
+                                    task_id,
+                                    relative_path: applied_path,
                                     success: true,
                                     error: None,
                                 },
@@ -2539,6 +2572,99 @@ fn move_incoming_delete_to_history(
     Ok(())
 }
 
+fn apply_incoming_conflict_file(
+    task_roots: &TaskRootRegistry,
+    task_id: &str,
+    relative_path: &str,
+    staged_relative_path: &str,
+    mode: &str,
+) -> Result<String> {
+    if mode != "overwrite" && mode != "keep_both" {
+        anyhow::bail!("unsupported conflict mode");
+    }
+    if !staged_relative_path.starts_with(".lanbridge-temp/") {
+        anyhow::bail!("invalid conflict staging path");
+    }
+    let root = task_roots
+        .root_for(task_id)
+        .ok_or_else(|| anyhow::anyhow!("task root not registered"))?;
+    let staged = safe_join(&root, staged_relative_path)?;
+    if !staged.is_file() {
+        anyhow::bail!("staged conflict file missing");
+    }
+
+    let now = now_ms();
+    let history = HistoryStore::new(&root);
+    let task_uuid = Uuid::parse_str(task_id)?;
+    let applied_relative_path = if mode == "overwrite" {
+        let target = safe_join(&root, relative_path)?;
+        if target.exists() {
+            history.check_storage_blocked(now)?;
+            let mut entry = history.move_to_overwritten(&target, relative_path, now)?;
+            entry.task_id = task_uuid;
+            if let Some(db_path) = task_roots.state_db_path() {
+                let conn = db::open_db(&db_path)?;
+                db::migrate(&conn)?;
+                repository::HistoryRepository::new(&conn).insert(&entry)?;
+            }
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&staged, &target)?;
+        relative_path.to_string()
+    } else {
+        let conflict_relative_path =
+            crate::core::conflict::conflict_filename(relative_path, "Secondary", now, |name| {
+                root.join(name).exists()
+            });
+        let target = safe_join(&root, &conflict_relative_path)?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&staged, &target)?;
+        conflict_relative_path
+    };
+
+    let applied_path = safe_join(&root, &applied_relative_path)?;
+    let applied_hash = crate::core::scanner::hash_file(&applied_path)?;
+    record_received_file(
+        task_roots,
+        task_id,
+        &applied_relative_path,
+        &applied_path,
+        &applied_hash,
+    )?;
+    cleanup_conflict_staging(task_roots, task_id, staged_relative_path);
+    Ok(applied_relative_path)
+}
+
+fn cleanup_conflict_staging(
+    task_roots: &TaskRootRegistry,
+    task_id: &str,
+    staged_relative_path: &str,
+) {
+    let Some(db_path) = task_roots.state_db_path() else {
+        return;
+    };
+    let Ok(task_uuid) = Uuid::parse_str(task_id) else {
+        return;
+    };
+    let Ok(conn) = db::open_db(&db_path) else {
+        return;
+    };
+    if db::migrate(&conn).is_err() {
+        return;
+    }
+    let _ = write_db_with_retry(|| {
+        repository::FileSnapshotRepository::new(&conn)
+            .remove_tree(&task_uuid, staged_relative_path)?;
+        repository::SyncBaselineRepository::new(&conn)
+            .remove_tree(&task_uuid, staged_relative_path)?;
+        Ok(())
+    });
+}
+
 fn validate_delete_expectation(
     target: &Path,
     expected_kind: Option<EntryKind>,
@@ -2877,7 +3003,7 @@ fn requester_address(peer_addr: SocketAddr, requester_port: u16) -> Option<Strin
     }
 }
 
-fn validate_invite_local_path(path: &Path) -> Result<()> {
+fn validate_invite_local_path(path: &Path, proposed_role: &str) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("invite local path must exist");
     }
@@ -2885,25 +3011,42 @@ fn validate_invite_local_path(path: &Path) -> Result<()> {
         anyhow::bail!("invite local path must be a directory");
     }
 
-    let entries = std::fs::read_dir(path)?;
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => {
-                anyhow::bail!("cannot read directory entry in invite local path");
-            }
-        };
+    let allow_non_empty = proposed_role == "Primary";
+    let mut total_size = 0u64;
+    let mut has_content = false;
+    let mut walker = walkdir::WalkDir::new(path)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = entry?;
+        let file_type = entry.file_type();
+        let is_dir = file_type.is_dir();
         let name = entry.file_name().to_string_lossy().to_string();
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-
-        if !crate::core::transient::is_common_ignored_entry_name(&name, is_dir) {
+        if crate::core::transient::is_common_ignored_entry_name(&name, is_dir) {
+            if is_dir {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        has_content = true;
+        if !allow_non_empty {
             anyhow::bail!(
                 "invite local path must be empty; found non-ignored entry '{}'",
                 name
             );
         }
+        if file_type.is_file() {
+            total_size = total_size.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+        }
+        if total_size > PRIMARY_NON_EMPTY_LIMIT_BYTES {
+            anyhow::bail!("invite local path exceeds primary folder size limit");
+        }
     }
 
+    if allow_non_empty && has_content && total_size > PRIMARY_NON_EMPTY_LIMIT_BYTES {
+        anyhow::bail!("invite local path exceeds primary folder size limit");
+    }
     Ok(())
 }
 

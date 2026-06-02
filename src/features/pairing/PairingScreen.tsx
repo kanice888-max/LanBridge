@@ -7,16 +7,19 @@ import {
   connectPeer,
   getDiscoveryStatus,
   getLocalNetworkInfo,
+  inspectTaskFolder,
   listOnlineDevices,
   listTaskInvites,
   pollTaskInvite,
   rejectTaskInvite,
   sendTaskInvite,
+  syncNow,
   type DiscoveryStatus,
   type IncomingTaskInviteInfo,
   type LocalNetworkInfo,
   type NetworkDiagnosticReport,
   type OnlineDevice,
+  type SyncTask,
   type TaskInviteProgress,
 } from "../../lib/tauriApi";
 import { AnimatedFolder } from "../../components/AnimatedFolder";
@@ -33,6 +36,7 @@ import { useTranslation } from "../../lib/i18n/context";
 
 interface PairingScreenProps {
   onComplete: () => void;
+  refreshToken?: number;
 }
 
 type FlowStep = "discover" | "manual" | "role" | "folder" | "invite";
@@ -46,6 +50,9 @@ function formatPairingError(error: unknown) {
   const message = String(error);
   if (message.includes("must be empty") || message.includes("non-ignored")) {
     return "请选择一个空文件夹";
+  }
+  if (message.includes("exceeds primary folder size limit") || message.includes("超过 2GB")) {
+    return "文件夹超过 2GB，请选择更小的文件夹";
   }
   if (message.includes("invite local path must exist")) {
     return "文件夹不存在";
@@ -65,7 +72,7 @@ function formatPairingError(error: unknown) {
   return message.replace(/^Error:\s*/, "");
 }
 
-export function PairingScreen({ onComplete }: PairingScreenProps) {
+export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenProps) {
   const { t } = useTranslation();
   const reduceMotion = useReducedMotion();
   const [step, setStep] = useState<FlowStep>("discover");
@@ -136,12 +143,20 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
   }, [refreshDiscovery, refreshInvites]);
 
   useEffect(() => {
+    if (refreshToken === 0) return;
+    getLocalNetworkInfo().then(setLocalNetwork).catch(() => {});
+    refreshDiscovery().catch(() => {});
+    refreshInvites();
+  }, [refreshDiscovery, refreshInvites, refreshToken]);
+
+  useEffect(() => {
     if (!pendingInvite || pendingInvite.status !== "Pending") return;
     const poll = async () => {
       try {
         const progress = await pollTaskInvite(pendingInvite.invite_id);
         if (progress.status === "Accepted" && progress.task) {
           setPendingInvite(null);
+          await runInitialSyncIfPrimary(progress.task);
           onComplete();
           return;
         }
@@ -164,6 +179,27 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
     pendingInvite?.status,
     t.pairing.inviteRejected,
   ]);
+
+  const ensureFolderAllowed = async (path: string, nextRole: string) => {
+    const inspection = await inspectTaskFolder(path, nextRole);
+    if (!inspection.exists) throw new Error("文件夹不存在");
+    if (!inspection.is_dir) throw new Error("请选择文件夹");
+    if (nextRole === "Secondary" && !inspection.is_empty) {
+      throw new Error("请选择一个空文件夹");
+    }
+    if (nextRole === "Primary" && inspection.over_limit) {
+      throw new Error("文件夹超过 2GB，请选择更小的文件夹");
+    }
+  };
+
+  const runInitialSyncIfPrimary = async (nextTask: SyncTask) => {
+    if (nextTask.local_role !== "Primary") return;
+    try {
+      await syncNow(nextTask.id);
+    } catch (e) {
+      setError(formatPairingError(e));
+    }
+  };
 
   const handleSelectDevice = async (device: OnlineDevice) => {
     setConnecting(true);
@@ -204,6 +240,10 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
   };
 
   const handleCheckNetwork = async () => {
+    if (panel === "network") {
+      setPanel("none");
+      return;
+    }
     setPanel("network");
     setCheckingNetwork(true);
     setError(null);
@@ -221,6 +261,7 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
     try {
       const folder = await pickFolder(t.pairing.chooseFolder);
       if (!folder) return;
+      await ensureFolderAllowed(folder, role);
       setLocalPath(folder);
       if (!taskName.trim()) setTaskName(folderName(folder));
       setStep("invite");
@@ -233,6 +274,7 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
     if (!selectedPeer || !localPath.trim()) return;
     setError(null);
     try {
+      await ensureFolderAllowed(localPath, role);
       const progress = await sendTaskInvite({
         name: taskName.trim() || folderName(localPath),
         local_path: localPath,
@@ -240,6 +282,7 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
         local_role: role,
       });
       if (progress.status === "Accepted" && progress.task) {
+        await runInitialSyncIfPrimary(progress.task);
         onComplete();
         return;
       }
@@ -254,6 +297,7 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
     try {
       const folder = await pickFolder(t.dashboard.chooseFolder);
       if (folder) {
+        await ensureFolderAllowed(folder, invite.proposed_role);
         setInvitePaths((prev) => ({ ...prev, [invite.invite_id]: folder }));
       }
     } catch (e) {
@@ -268,7 +312,9 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
       return;
     }
     try {
-      await acceptTaskInvite(invite.invite_id, path);
+      await ensureFolderAllowed(path, invite.proposed_role);
+      const task = await acceptTaskInvite(invite.invite_id, path);
+      await runInitialSyncIfPrimary(task);
       await refreshInvites();
       onComplete();
     } catch (e) {
@@ -460,13 +506,15 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
             folderTransitionTarget.setRef(element);
           }}
         >
-          <AnimatedFolder
-            open={false}
-            status={pendingInvite ? "syncing" : "idle"}
-            size="clamp(300px, 34vw, 330px)"
-            externalShadow
-            className="stage-folder"
-          />
+          <div className="folder-transition-anchor discover-folder-hitbox">
+            <AnimatedFolder
+              open={false}
+              status={pendingInvite ? "syncing" : "idle"}
+              size="clamp(300px, 34vw, 330px)"
+              externalShadow
+              className="stage-folder"
+            />
+          </div>
         </div>
 
         <div className="discover-below-stage">
@@ -533,7 +581,19 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
         </div>
 
         {step !== "discover" && step !== "manual" && (
-          <div className="connection-flow">
+          <div className={`connection-flow ${step === "invite" ? "invite-flow" : ""}`}>
+            {step === "invite" && (
+              <div className="invite-project-name-zone">
+                <input
+                  className="project-name-input"
+                  value={taskName}
+                  onChange={(e) => setTaskName(e.target.value)}
+                  placeholder={folderName(localPath)}
+                  aria-label="项目名称"
+                />
+              </div>
+            )}
+
             <div className="stage-stepper">
               {["选择角色", "选择目标文件夹", "发送邀请"].map((label, index) => {
                 const stepNumber = index + 1;
@@ -601,14 +661,7 @@ export function PairingScreen({ onComplete }: PairingScreenProps) {
             )}
 
             {step === "invite" && (
-              <div className="invite-send-zone">
-                <input
-                  className="project-name-input"
-                  value={taskName}
-                  onChange={(e) => setTaskName(e.target.value)}
-                  placeholder={folderName(localPath)}
-                  aria-label="项目名称"
-                />
+              <div className="invite-action-zone">
                 <button
                   className="stage-primary-btn"
                   onClick={handleSendInvite}
@@ -690,7 +743,7 @@ function IncomingInviteCard({
       <button className="incoming-invite-head" onClick={() => setOpen((value) => !value)}>
         <div>
           <strong>{invite.task_name || "对方项目名"}</strong>
-          <span>对方设备名称 请求连接</span>
+          <span>对方请求连接</span>
         </div>
         <span className="incoming-invite-chevron">
           {open
@@ -702,8 +755,8 @@ function IncomingInviteCard({
         <div className="incoming-invite-body">
           <label>选择目标文件夹</label>
           <div className="folder-input-row compact">
-            <input value={path} onChange={(e) => onPathChange(e.target.value)} placeholder="请选择一个空文件夹" />
-            <button onClick={onPick}>选择文件夹</button>
+            <input value={path} onChange={(e) => onPathChange(e.target.value)} placeholder="请选择空文件夹" />
+            <button onClick={onPick}>选择</button>
           </div>
           <div className="incoming-actions">
             <button className="mini-dark-btn" onClick={onAccept}>接受</button>

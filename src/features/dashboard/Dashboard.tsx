@@ -13,6 +13,7 @@ import {
 } from "../../lib/tauriApi";
 import { pickFolder } from "../../lib/folderPicker";
 import { useTranslation } from "../../lib/i18n/context";
+import { DeleteTaskConfirmDialog } from "../../components/DeleteTaskConfirmDialog";
 
 interface DashboardProps {
   identity: IdentityInfo | null;
@@ -30,6 +31,11 @@ interface TaskStatus {
   lastResults: SyncActionResult[];
 }
 
+interface DeleteTaskTarget {
+  id: string;
+  name: string;
+}
+
 export function Dashboard({
   identity: _identity,
   tasks,
@@ -43,6 +49,8 @@ export function Dashboard({
   const [incomingInvites, setIncomingInvites] = useState<IncomingTaskInviteInfo[]>([]);
   const [invitePaths, setInvitePaths] = useState<Record<string, string>>({});
   const [inviteError, setInviteError] = useState<string | null>(null);
+  const [deleteTaskTarget, setDeleteTaskTarget] = useState<DeleteTaskTarget | null>(null);
+  const [deleteTaskBusy, setDeleteTaskBusy] = useState(false);
 
   const refreshInvites = useCallback(async () => {
     try {
@@ -109,11 +117,21 @@ export function Dashboard({
 
   const handleDeleteTask = async (e: React.MouseEvent, taskId: string, taskName: string) => {
     e.stopPropagation();
-    if (!window.confirm(`${t.dashboard.confirmDelete} "${taskName}"`)) return;
+    setDeleteTaskTarget({ id: taskId, name: taskName });
+  };
+
+  const confirmDeleteTask = async () => {
+    if (!deleteTaskTarget) return;
+    setDeleteTaskBusy(true);
     try {
-      await deleteSyncTask(taskId);
+      await deleteSyncTask(deleteTaskTarget.id);
+      setDeleteTaskTarget(null);
       onRefresh();
-    } catch (err) { /* silent */ }
+    } catch (err) {
+      setInviteError(String(err));
+    } finally {
+      setDeleteTaskBusy(false);
+    }
   };
 
   const handleRejectInvite = async (invite: IncomingTaskInviteInfo) => {
@@ -250,6 +268,15 @@ export function Dashboard({
           </>
         )}
       </div>
+      <DeleteTaskConfirmDialog
+        open={Boolean(deleteTaskTarget)}
+        taskName={deleteTaskTarget?.name || ""}
+        busy={deleteTaskBusy}
+        onCancel={() => {
+          if (!deleteTaskBusy) setDeleteTaskTarget(null);
+        }}
+        onConfirm={confirmDeleteTask}
+      />
     </aside>
   );
 }

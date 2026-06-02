@@ -4,7 +4,7 @@ import { useTranslation } from "../../lib/i18n/context";
 import { isBrowserPreviewBridgeError } from "../../lib/runtime";
 import { AnimatedList } from "../../components/StagePrimitives";
 
-export function LogsScreen() {
+export function LogsScreen({ refreshToken = 0 }: { refreshToken?: number }) {
   const { t } = useTranslation();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -22,7 +22,7 @@ export function LogsScreen() {
     finally { setLoading(false); }
   };
 
-  useEffect(() => { loadLogs(); }, []);
+  useEffect(() => { loadLogs(); }, [refreshToken]);
 
   const formatTime = (unixMs: number) => new Date(unixMs).toLocaleString();
 
@@ -54,19 +54,21 @@ export function LogsScreen() {
           <p>{t.logs.noLogsDesc}</p>
         </div>
       ) : (
-        <AnimatedList
-          items={logs}
-          getKey={(log) => log.id ?? `${log.created_unix_ms}-${log.message}-${log.relative_path}`}
-          className="logs-list"
-          renderItem={(log) => (
-            <div className={`log-entry level-${levelClass(log.level)}`}>
-              <span className="log-time">{formatTime(log.created_unix_ms)}</span>
-              <span className={`log-level ${levelClass(log.level)}`}>{log.level}</span>
-              <span className="log-message">{log.message}</span>
-              <span className="log-path">{log.relative_path || ""}</span>
-            </div>
-          )}
-        />
+        <div className="logs-list-shell">
+          <AnimatedList
+            items={logs}
+            getKey={(log) => log.id ?? `${log.created_unix_ms}-${log.message}-${log.relative_path}`}
+            className="logs-list logs-list-scroll"
+            renderItem={(log) => (
+              <div className={`log-entry level-${levelClass(log.level)}`}>
+                <span className="log-time">{formatTime(log.created_unix_ms)}</span>
+                <span className={`log-level ${levelClass(log.level)}`}>{log.level}</span>
+                <span className="log-message" title={log.message}>{log.message}</span>
+                <span className="log-path" title={log.relative_path || ""}>{log.relative_path || ""}</span>
+              </div>
+            )}
+          />
+        </div>
       )}
     </div>
   );

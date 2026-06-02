@@ -4,7 +4,10 @@ use lanbridge::core::model::{
 use lanbridge::core::{planner, scanner};
 use lanbridge::pairing::PublicIdentity;
 use lanbridge::pairing::{derive_pairing_code, generate_nonce, DeviceIdentity};
-use lanbridge::platform::macos::MacPlatform;
+#[cfg(target_os = "macos")]
+use lanbridge::platform::macos::MacPlatform as TestPlatform;
+#[cfg(target_os = "windows")]
+use lanbridge::platform::windows::WinPlatform as TestPlatform;
 use lanbridge::state::{
     db,
     repository::{FileSnapshotRepository, SyncBaselineRepository, SyncTaskRepository},
@@ -16,6 +19,7 @@ use lanbridge::transport::{
     decode_message, encode_message, ConnectionManager, PeerConnection, SyncMessage,
 };
 use rusqlite::Connection;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
@@ -298,6 +302,30 @@ async fn test_ping_peer_address_roundtrip() {
     lanbridge::transport::connection::ping_peer_address("127.0.0.1", server.port())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_ping_peer_address_times_out_when_peer_stalls() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 64];
+            let _ = stream.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    let started = Instant::now();
+    let result = lanbridge::transport::connection::ping_peer_address("127.0.0.1", port).await;
+
+    assert!(result.is_err(), "stalled peer should fail ping");
+    assert!(
+        started.elapsed() < Duration::from_millis(2_500),
+        "ping should fail quickly instead of blocking for OS TCP/read timeout"
+    );
 }
 
 #[tokio::test]
@@ -2032,7 +2060,7 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
     .unwrap();
     assert!(empty_remote_scan.is_empty());
 
-    let platform = MacPlatform::with_data_dir(primary_dir.path().join("app-data"));
+    let platform = TestPlatform::with_data_dir(primary_dir.path().join("app-data"));
     let mut snapshots = scanner::scan_root(primary_dir.path(), &platform)
         .unwrap()
         .into_iter()

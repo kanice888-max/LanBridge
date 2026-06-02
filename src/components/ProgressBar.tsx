@@ -14,7 +14,7 @@ import {
   type DeferredTransfer,
 } from "../lib/tauriApi";
 import { AppOverlayLayer } from "./OverlayPortal";
-import { XIcon } from "./icons/animate-icons";
+import { CircleCheckIcon, XIcon } from "./icons/animate-icons";
 
 interface DisplayItem {
   key: string;
@@ -85,7 +85,7 @@ function TransferCard({
     <div
       role={clickable ? "button" : undefined}
       tabIndex={clickable ? 0 : undefined}
-      className={`transfer-card ${clickable ? "clickable" : ""} ${item.fading ? "is-fading" : ""}`}
+      className={`transfer-card ${clickable ? "clickable" : ""} ${item.fading ? "is-fading" : ""} ${item.cancellable || item.fading ? "has-action" : ""}`}
       onClick={clickable ? onToggle : undefined}
       aria-disabled={!clickable}
       onKeyDown={(event) => {
@@ -97,8 +97,12 @@ function TransferCard({
       <span className="transfer-title">传输{item.path}</span>
       <span className="transfer-speed">
         {item.mbps > 0 ? `${item.mbps.toFixed(1)} MB/s` : ""}
-        {item.fading ? " ✓" : ""}
       </span>
+      {item.fading && (
+        <span className="transfer-done" title="传输完成">
+          <CircleCheckIcon size={15} isAnimated={false} />
+        </span>
+      )}
       {item.cancellable && (
         <span
           className="transfer-cancel"

@@ -27,6 +27,8 @@ These rules protect user data. Do not weaken them without updating the PRD and t
 - File receive must write to a temporary path, verify, then atomically rename where possible.
 - Large files must use chunked/streaming transfer rather than single JSON payloads.
 - Receiver state should be updated after successful receive/ACK where supported.
+- File hashing and scanning must be streaming/heap-buffered, not backed by large stack arrays. A stack overflow can crash packaged Windows builds without reaching the Rust panic hook.
+- LanBridge runtime files and folders must not enter the sync model. At minimum, `.lanbridge-history`, `.lanbridge-temp`, partial files, `lanbridge.log`, `startup-crash.log`, and `crash-diagnostics.log` must be ignored by scanner, watcher, transfer, and pending-return flows.
 
 ## UI Rules
 

@@ -7,6 +7,8 @@
 - If a review comment repeats, promote it into a test, doc, validation command, or invariant.
 - Keep platform differences explicit; do not assume Windows and macOS paths behave the same.
 - Prefer scanner correctness before watcher cleverness.
+- Do not allocate large file/hash buffers on thread stacks. Scanner and transfer code must use heap buffers or streaming readers, because Windows/Tauri worker stacks can be small and stack overflow may terminate the app without a Rust panic.
+- Keep LanBridge runtime artifacts out of sync content. Logs, crash diagnostics, databases, identity keys, pins, temporary files, and history internals must be ignored or rejected as task roots instead of scanned, displayed, transferred, or returned.
 - Prefer a reliable manual/explicit flow before background automation.
 
 ## Product

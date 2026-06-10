@@ -1,9 +1,40 @@
-.worktrees/
-worktrees/
 node_modules/
 dist/
 target/
 src-tauri/target/
+src-tauri/target/release/bundle/
+
+# Local worktrees and agent/tool state
+.worktrees/
+worktrees/
+.claude/
+.codex/
+
+# Local OS/editor files
 .DS_Store
 Thumbs.db
-.claude/
+.vscode/
+.idea/
+
+# Local media/prototype projects
+remotion-promo/
+redesign/*
+!redesign/
+!redesign/design.md
+docs/superpowers/*.docx
+
+# Build/release artifacts
+*.app
+*.dmg
+*.msi
+*.exe
+*.zip
+
+# Runtime state, logs, and secrets
+lanbridge.log
+startup-crash.log
+crash-diagnostics.log
+crash-diagnostics-*.log
+identity.key
+*.sqlite
+*.db

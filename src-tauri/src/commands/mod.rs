@@ -891,6 +891,17 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn file_manager_path_helper_rejects_similar_prefix() {
+        let root = Path::new("/tmp/lanbridge-task");
+        let child = Path::new("/tmp/lanbridge-task/sub/file.txt");
+        let sibling = Path::new("/tmp/lanbridge-task-other/file.txt");
+
+        assert!(is_same_or_child_path(root, root));
+        assert!(is_same_or_child_path(child, root));
+        assert!(!is_same_or_child_path(sibling, root));
+    }
+
     fn task_with_local_path(path: &str) -> SyncTask {
         SyncTask {
             id: Uuid::new_v4(),
@@ -4899,7 +4910,8 @@ pub fn get_transfer_speed_limit() -> Result<u64, String> {
 // ─── File Manager ───
 
 #[tauri::command]
-pub fn open_in_file_manager(path: String) -> Result<(), String> {
+pub fn open_in_file_manager(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let path = validate_file_manager_path(state.inner(), &path)?;
     if cfg!(target_os = "macos") {
         std::process::Command::new("open")
             .arg(&path)
@@ -4914,6 +4926,57 @@ pub fn open_in_file_manager(path: String) -> Result<(), String> {
         return Err("unsupported platform".to_string());
     }
     Ok(())
+}
+
+fn validate_file_manager_path(state: &AppState, path: &str) -> Result<PathBuf, String> {
+    if path.contains("://") || path.starts_with("file:") {
+        return Err("只能打开 LanBridge 管理的本地路径".to_string());
+    }
+
+    let target = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|_| "无法打开该路径".to_string())?;
+
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| "数据库暂时不可用".to_string())?;
+    let tasks = repository::SyncTaskRepository::new(&db)
+        .list_all()
+        .map_err(|e| format!("读取任务列表失败: {}", e))?;
+    drop(db);
+
+    for task in tasks {
+        let Ok(root) = PathBuf::from(&task.local_path).canonicalize() else {
+            continue;
+        };
+        if is_same_or_child_path(&target, &root) {
+            return Ok(target);
+        }
+
+        let history = root.join(".lanbridge-history");
+        if let Ok(history) = history.canonicalize() {
+            if is_same_or_child_path(&target, &history) {
+                return Ok(target);
+            }
+        }
+    }
+
+    if let Ok(log_path) = state.platform.log_path() {
+        if let Some(log_dir) = log_path.parent() {
+            if let Ok(log_dir) = log_dir.canonicalize() {
+                if is_same_or_child_path(&target, &log_dir) {
+                    return Ok(target);
+                }
+            }
+        }
+    }
+
+    Err("只能打开任务、历史或诊断日志路径".to_string())
+}
+
+fn is_same_or_child_path(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 // ─── Local Network Info ───
@@ -5143,7 +5206,11 @@ pub fn get_window_cursor_position(window: Window) -> Result<Option<WindowCursorP
 
         let inner_position = window.inner_position().map_err(|e| e.to_string())?;
         let scale_factor = window.scale_factor().map_err(|e| e.to_string())?;
-        let scale_factor = if scale_factor <= 0.0 { 1.0 } else { scale_factor };
+        let scale_factor = if scale_factor <= 0.0 {
+            1.0
+        } else {
+            scale_factor
+        };
 
         return Ok(Some(WindowCursorPosition {
             x: (point.x - inner_position.x) as f64 / scale_factor,

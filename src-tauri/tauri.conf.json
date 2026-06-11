@@ -14,7 +14,7 @@
       "all": false,
       "shell": {
         "all": false,
-        "open": true
+        "open": false
       },
       "dialog": {
         "all": false,
@@ -34,7 +34,7 @@
       ]
     },
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http://localhost:* ws://localhost:*"
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
     },
     "systemTray": {
       "iconPath": "icons/32x32.png",

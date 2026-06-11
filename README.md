@@ -24,6 +24,12 @@ LanBridge is built around a conservative data-safety model:
 
 See [sync invariants](docs/rules/invariants.md) for the detailed rules.
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for supported versions, vulnerability reporting, and LanBridge's local-network security boundary.
+
+The current security hardening plan is tracked in [docs/security/security-hardening-plan.md](docs/security/security-hardening-plan.md).
+
 ## Requirements
 
 - Node.js 18 or newer.

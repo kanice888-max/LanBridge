@@ -137,9 +137,9 @@ pub async fn connect_discovered_peer(
         .find(|device| device.device_id == peer_device_id)
     {
         if !device.compatible {
-            return Err(device.compatibility_reason.unwrap_or_else(|| {
-                "对端版本不兼容，请升级两端应用".to_string()
-            }));
+            return Err(device
+                .compatibility_reason
+                .unwrap_or_else(|| "对端版本不兼容，请升级两端应用".to_string()));
         }
     }
 
@@ -244,7 +244,7 @@ pub fn check_network_environment(
             status: "error".to_string(),
             detail: "同步服务未监听端口，其他设备无法连接到本机。".to_string(),
         });
-        suggestions.push("重启应用；如果仍失败，请检查 9527 端口是否被其他程序占用。".to_string());
+        suggestions.push("重启应用；如果仍失败，请检查本机端口占用或安全软件拦截。".to_string());
     } else {
         let localhost = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port));
         match TcpStream::connect_timeout(&localhost, Duration::from_millis(500)) {
@@ -265,7 +265,13 @@ pub fn check_network_environment(
     }
 
     let discovery = state.discovery.status();
-    if discovery.running && discovery.error.is_none() {
+    if !discovery.enabled {
+        checks.push(NetworkCheckItem {
+            label: "自动发现".to_string(),
+            status: "warn".to_string(),
+            detail: "自动发现已关闭，仍可使用手动 IP 连接。".to_string(),
+        });
+    } else if discovery.running && discovery.error.is_none() {
         checks.push(NetworkCheckItem {
             label: "自动发现".to_string(),
             status: "ok".to_string(),
@@ -402,7 +408,7 @@ fn platform_network_permission_suggestion() -> String {
 
 #[cfg(target_os = "windows")]
 fn platform_network_permission_suggestion() -> String {
-    "确认两端应用都已启动；Windows 防火墙需要允许 LanBridge.exe 入站 TCP 9527 和 UDP 53530。"
+    "确认两端应用都已启动；Windows 防火墙需要允许 LanBridge.exe 入站 TCP 当前监听端口和 UDP 53530。"
         .to_string()
 }
 

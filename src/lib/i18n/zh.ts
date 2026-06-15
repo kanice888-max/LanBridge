@@ -222,6 +222,7 @@ export const zh = {
     langZh: "中文",
     langEn: "English",
     windowBehavior: "窗口行为",
+    discoveryEnabled: "自动发现设备",
     minimizeToTrayOnClose: "关闭时最小化到系统托盘",
     historyRetention: "历史记录",
     retentionPeriod: "保留周期",

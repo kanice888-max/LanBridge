@@ -98,6 +98,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
   const [pendingInvite, setPendingInvite] = useState<TaskInviteProgress | null>(null);
   const [incomingInvites, setIncomingInvites] = useState<IncomingTaskInviteInfo[]>([]);
   const [invitePaths, setInvitePaths] = useState<Record<string, string>>({});
+  const discoveryDisabled = discoveryStatus?.enabled === false;
   const carouselRef = useRef<HTMLDivElement | null>(null);
   const dragState = useRef<{
     x: number;
@@ -532,10 +533,13 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
                 exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
                 transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
               >
-                <strong>自动发现中<LoadingDots /></strong>
+                <strong>
+                  {discoveryDisabled ? "自动发现已关闭" : <>自动发现中<LoadingDots /></>}
+                </strong>
                 <span>
-                  正在监听 {discoveryStatus?.multicast_addr || "239.10.10.10"}:
-                  {discoveryStatus?.multicast_port || 53530}
+                  {discoveryDisabled
+                    ? "可使用手动输入连接对端。"
+                    : `正在监听 ${discoveryStatus?.multicast_addr || "239.10.10.10"}:${discoveryStatus?.multicast_port || 53530}`}
                 </span>
               </motion.div>
             )}
@@ -692,8 +696,8 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
           >
             {devices.length === 0 ? (
               <div className="device-card ghost">
-                <strong>{t.pairing.noDevices}</strong>
-                <span>{t.pairing.noDevicesDesc}</span>
+                <strong>{discoveryDisabled ? "自动发现已关闭" : t.pairing.noDevices}</strong>
+                <span>{discoveryDisabled ? "请使用手动连接，或在设置中开启自动发现。" : t.pairing.noDevicesDesc}</span>
               </div>
             ) : (
               devices.map((device) => (

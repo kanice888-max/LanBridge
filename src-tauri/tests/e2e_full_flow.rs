@@ -105,7 +105,7 @@ impl TestNode {
     fn insert_task(&self, task: &SyncTask) {
         SyncTaskRepository::new(&self.conn).insert(task).unwrap();
         self.server
-            .register_task_root(task.id.to_string(), &task.local_path)
+            .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
             .unwrap();
     }
 }
@@ -175,7 +175,7 @@ impl CommandTestNode {
                 ._server
                 .as_ref()
                 .unwrap()
-                .register_task_root(task.id.to_string(), &task.local_path)
+                .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
                 .unwrap();
         }
     }

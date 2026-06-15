@@ -31,6 +31,7 @@ const PRIMARY_NON_EMPTY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Clone, Default)]
 pub struct TaskRootRegistry {
     roots: Arc<Mutex<HashMap<String, PathBuf>>>,
+    authorized_peers: Arc<Mutex<HashMap<String, String>>>,
     trusted_peers: Arc<Mutex<HashMap<String, PublicIdentity>>>,
     incoming: Arc<Mutex<HashMap<String, IncomingTransfer>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
@@ -270,20 +271,63 @@ pub struct PendingTaskInvite {
     pub created_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PersistedTaskRoot {
+    root: String,
+    #[serde(default)]
+    peer_device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PersistedTaskRootEntry {
+    Current(PersistedTaskRoot),
+    Legacy(String),
+}
+
 impl TaskRootRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn register(&self, task_id: impl Into<String>, root: impl AsRef<Path>) -> Result<()> {
+        self.register_inner(task_id, root, None)
+    }
+
+    pub fn register_for_peer(
+        &self,
+        task_id: impl Into<String>,
+        root: impl AsRef<Path>,
+        peer_device_id: impl Into<String>,
+    ) -> Result<()> {
+        self.register_inner(task_id, root, Some(peer_device_id.into()))
+    }
+
+    fn register_inner(
+        &self,
+        task_id: impl Into<String>,
+        root: impl AsRef<Path>,
+        peer_device_id: Option<String>,
+    ) -> Result<()> {
+        let task_id = task_id.into();
         let root = root.as_ref();
         if !root.exists() {
             std::fs::create_dir_all(root)?;
         }
 
         let mut roots = self.roots.lock().unwrap();
-        roots.insert(task_id.into(), root.to_path_buf());
+        roots.insert(task_id.clone(), root.to_path_buf());
         drop(roots);
+        let mut authorized_peers = self.authorized_peers.lock().unwrap();
+        match peer_device_id {
+            Some(peer_device_id) => {
+                authorized_peers.insert(task_id, peer_device_id);
+            }
+            None => {
+                authorized_peers.remove(&task_id);
+            }
+        }
+        drop(authorized_peers);
         self.save_roots()?;
         Ok(())
     }
@@ -292,6 +336,10 @@ impl TaskRootRegistry {
         let mut roots = self.roots.lock().unwrap();
         roots.remove(task_id);
         drop(roots);
+
+        let mut authorized_peers = self.authorized_peers.lock().unwrap();
+        authorized_peers.remove(task_id);
+        drop(authorized_peers);
 
         let prefix = format!("{}\n", task_id);
         let mut incoming = self.incoming.lock().unwrap();
@@ -306,6 +354,9 @@ impl TaskRootRegistry {
         let mut roots = self.roots.lock().unwrap();
         roots.retain(|task_id, _| task_ids.contains(task_id));
         drop(roots);
+        let mut authorized_peers = self.authorized_peers.lock().unwrap();
+        authorized_peers.retain(|task_id, _| task_ids.contains(task_id));
+        drop(authorized_peers);
         self.save_roots()?;
         Ok(())
     }
@@ -313,6 +364,18 @@ impl TaskRootRegistry {
     fn root_for(&self, task_id: &str) -> Option<PathBuf> {
         let roots = self.roots.lock().unwrap();
         roots.get(task_id).cloned()
+    }
+
+    fn authorize_task_access(&self, task_id: &str, device_id: &str) -> Result<()> {
+        if self.root_for(task_id).is_none() {
+            anyhow::bail!("task root not registered");
+        }
+        let authorized_peers = self.authorized_peers.lock().unwrap();
+        match authorized_peers.get(task_id) {
+            Some(authorized_peer) if authorized_peer == device_id => Ok(()),
+            Some(_) => anyhow::bail!("peer is not authorized for task"),
+            None => anyhow::bail!("task peer authorization is missing"),
+        }
     }
 
     pub fn cancel_incoming_transfer(&self, task_id: &str, relative_path: &str) -> Result<()> {
@@ -405,7 +468,11 @@ impl TaskRootRegistry {
             &invite_snapshot.requester_device_id,
             &invite_snapshot.requester_public_key,
         )?;
-        self.register(&invite_snapshot.task_id, &local_path)?;
+        self.register_for_peer(
+            &invite_snapshot.task_id,
+            &local_path,
+            &invite_snapshot.requester_device_id,
+        )?;
 
         let mut invites = self.task_invites.lock().unwrap();
         let invite = invites
@@ -497,10 +564,22 @@ impl TaskRootRegistry {
 
         if path.exists() {
             let bytes = std::fs::read(&path)?;
-            let persisted: HashMap<String, String> = serde_json::from_slice(&bytes)?;
+            let persisted: HashMap<String, PersistedTaskRootEntry> =
+                serde_json::from_slice(&bytes)?;
             let mut roots = self.roots.lock().unwrap();
-            for (task_id, root) in persisted {
-                roots.insert(task_id, PathBuf::from(root));
+            let mut authorized_peers = self.authorized_peers.lock().unwrap();
+            for (task_id, entry) in persisted {
+                match entry {
+                    PersistedTaskRootEntry::Current(entry) => {
+                        roots.insert(task_id.clone(), PathBuf::from(entry.root));
+                        if let Some(peer_device_id) = entry.peer_device_id {
+                            authorized_peers.insert(task_id, peer_device_id);
+                        }
+                    }
+                    PersistedTaskRootEntry::Legacy(root) => {
+                        roots.insert(task_id, PathBuf::from(root));
+                    }
+                }
             }
         }
 
@@ -570,9 +649,18 @@ impl TaskRootRegistry {
         };
 
         let roots = self.roots.lock().unwrap();
+        let authorized_peers = self.authorized_peers.lock().unwrap();
         let persisted = roots
             .iter()
-            .map(|(task_id, root)| (task_id.clone(), root.to_string_lossy().to_string()))
+            .map(|(task_id, root)| {
+                (
+                    task_id.clone(),
+                    PersistedTaskRoot {
+                        root: root.to_string_lossy().to_string(),
+                        peer_device_id: authorized_peers.get(task_id).cloned(),
+                    },
+                )
+            })
             .collect::<HashMap<_, _>>();
         let bytes = serde_json::to_vec_pretty(&persisted)?;
         std::fs::write(path, bytes)?;
@@ -589,8 +677,24 @@ pub struct SyncServer {
 
 impl SyncServer {
     pub fn start_in_background(port: u16) -> Result<Self> {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = std::net::TcpListener::bind(&addr)?;
+        Self::start_with_bound_listener(std::net::TcpListener::bind(format!("0.0.0.0:{}", port))?)
+    }
+
+    pub fn start_in_background_with_fallback(preferred_port: u16) -> Result<Self> {
+        match Self::start_in_background(preferred_port) {
+            Ok(server) => Ok(server),
+            Err(preferred_error) => {
+                tracing::warn!(
+                    "failed to bind preferred sync port {}: {}; falling back to an OS-assigned port",
+                    preferred_port,
+                    preferred_error
+                );
+                Self::start_in_background(0)
+            }
+        }
+    }
+
+    fn start_with_bound_listener(listener: std::net::TcpListener) -> Result<Self> {
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -658,8 +762,10 @@ impl SyncServer {
         &self,
         task_id: impl Into<String>,
         root: impl AsRef<Path>,
+        peer_device_id: impl Into<String>,
     ) -> Result<()> {
-        self.task_roots.register(task_id, root)
+        self.task_roots
+            .register_for_peer(task_id, root, peer_device_id)
     }
 
     pub fn unregister_task_root(&self, task_id: &str) -> Result<()> {
@@ -739,6 +845,22 @@ impl SyncServer {
             requester_path,
             proposed_role.to_string(),
         )
+    }
+}
+
+#[cfg(test)]
+mod sync_server_tests {
+    use super::*;
+
+    #[test]
+    fn background_server_falls_back_when_preferred_port_is_busy() {
+        let busy = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let preferred_port = busy.local_addr().unwrap().port();
+
+        let server = SyncServer::start_in_background_with_fallback(preferred_port).unwrap();
+
+        assert_ne!(server.port(), preferred_port);
+        assert!(server.port() > 0);
     }
 }
 
@@ -907,32 +1029,36 @@ async fn handle_connection(
                         relative_path,
                         direction,
                     } => {
-                        connection::cancel_active_transfer(
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
                             &task_id,
-                            &relative_path,
-                            direction.as_deref(),
-                        );
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                if direction.as_deref() == Some("serve") {
-                                    Ok(())
-                                } else {
-                                    task_roots.cancel_incoming_transfer(&task_id, &relative_path)
-                                }
-                            }) {
-                                Ok(()) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        )
+                        .and_then(|_| {
+                            connection::cancel_active_transfer(
+                                &task_id,
+                                &relative_path,
+                                direction.as_deref(),
+                            );
+                            if direction.as_deref() == Some("serve") {
+                                Ok(())
+                            } else {
+                                task_roots.cancel_incoming_transfer(&task_id, &relative_path)
+                            }
+                        }) {
+                            Ok(()) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::FileTransfer {
@@ -942,30 +1068,34 @@ async fn handle_connection(
                         total_bytes,
                         data,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                write_incoming_file(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    &file_hash,
-                                    total_bytes,
-                                    &data,
-                                )
-                            }) {
-                                Ok(()) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            write_incoming_file(
+                                &task_roots,
+                                &task_id,
+                                &relative_path,
+                                &file_hash,
+                                total_bytes,
+                                &data,
+                            )
+                        }) {
+                            Ok(()) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::FileChunkStart {
@@ -974,29 +1104,33 @@ async fn handle_connection(
                         file_hash,
                         total_bytes,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                start_incoming_chunked_file(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    &file_hash,
-                                    total_bytes,
-                                )
-                            }) {
-                                Ok(()) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            start_incoming_chunked_file(
+                                &task_roots,
+                                &task_id,
+                                &relative_path,
+                                &file_hash,
+                                total_bytes,
+                            )
+                        }) {
+                            Ok(()) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::FileChunk {
@@ -1005,44 +1139,48 @@ async fn handle_connection(
                         offset,
                         data,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                append_incoming_chunk(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    offset,
-                                    &data,
-                                )
-                            }) {
-                                Ok(needs_ack) => match needs_ack {
-                                    IncomingChunkAck::Checkpoint(received) => {
-                                        Some(protocol::SyncMessage::FileChunkAck {
-                                            task_id,
-                                            relative_path,
-                                            received_bytes: received,
-                                            success: true,
-                                            error: None,
-                                        })
-                                    }
-                                    IncomingChunkAck::LegacyFileAck => {
-                                        Some(protocol::SyncMessage::FileAck {
-                                            task_id,
-                                            relative_path,
-                                            success: true,
-                                            error: None,
-                                        })
-                                    }
-                                    IncomingChunkAck::None => None,
-                                },
-                                Err(e) => Some(protocol::SyncMessage::FileChunkAck {
-                                    task_id,
-                                    relative_path,
-                                    received_bytes: 0,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                }),
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            append_incoming_chunk(
+                                &task_roots,
+                                &task_id,
+                                &relative_path,
+                                offset,
+                                &data,
+                            )
+                        }) {
+                            Ok(needs_ack) => match needs_ack {
+                                IncomingChunkAck::Checkpoint(received) => {
+                                    Some(protocol::SyncMessage::FileChunkAck {
+                                        task_id,
+                                        relative_path,
+                                        received_bytes: received,
+                                        success: true,
+                                        error: None,
+                                    })
+                                }
+                                IncomingChunkAck::LegacyFileAck => {
+                                    Some(protocol::SyncMessage::FileAck {
+                                        task_id,
+                                        relative_path,
+                                        success: true,
+                                        error: None,
+                                    })
+                                }
+                                IncomingChunkAck::None => None,
+                            },
+                            Err(e) => Some(protocol::SyncMessage::FileChunkAck {
+                                task_id,
+                                relative_path,
+                                received_bytes: 0,
+                                success: false,
+                                error: Some(e.to_string()),
+                            }),
+                        };
                         if let Some(ack) = ack {
                             writer.write_all(&protocol::encode_message(&ack)?).await?;
                         }
@@ -1052,28 +1190,32 @@ async fn handle_connection(
                         relative_path,
                         file_hash,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                finish_incoming_chunked_file(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    file_hash.as_deref(),
-                                )
-                            }) {
-                                Ok(()) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            finish_incoming_chunked_file(
+                                &task_roots,
+                                &task_id,
+                                &relative_path,
+                                file_hash.as_deref(),
+                            )
+                        }) {
+                            Ok(()) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::FileStreamStartV2 {
@@ -1082,14 +1224,15 @@ async fn handle_connection(
                         total_bytes,
                     } => {
                         if let Err(e) =
-                            require_authenticated(&authenticated_device_id).and_then(|_| {
-                                start_incoming_v2(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    total_bytes,
-                                )
-                            })
+                            require_authorized_task(&task_roots, &authenticated_device_id, &task_id)
+                                .and_then(|_| {
+                                    start_incoming_v2(
+                                        &task_roots,
+                                        &task_id,
+                                        &relative_path,
+                                        total_bytes,
+                                    )
+                                })
                         {
                             let ack = protocol::SyncMessage::FileAck {
                                 task_id,
@@ -1134,7 +1277,11 @@ async fn handle_connection(
                                     continue;
                                 }
                             };
-                        let ack_result = match require_authenticated(&authenticated_device_id) {
+                        let ack_result = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        ) {
                             Ok(()) => {
                                 let task_roots_for_write = task_roots.clone();
                                 let task_id_for_write = task_id.clone();
@@ -1188,36 +1335,39 @@ async fn handle_connection(
                         relative_path,
                         file_hash,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                finish_incoming_v2(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    &file_hash,
-                                )
-                            }) {
-                                Ok(()) => protocol::SyncMessage::FileStreamAckV2 {
-                                    task_id: task_id.clone(),
-                                    relative_path: relative_path.clone(),
-                                    received_bytes: 0,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileStreamAckV2 {
-                                    task_id: task_id.clone(),
-                                    relative_path: relative_path.clone(),
-                                    received_bytes: 0,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            finish_incoming_v2(&task_roots, &task_id, &relative_path, &file_hash)
+                        }) {
+                            Ok(()) => protocol::SyncMessage::FileStreamAckV2 {
+                                task_id: task_id.clone(),
+                                relative_path: relative_path.clone(),
+                                received_bytes: 0,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileStreamAckV2 {
+                                task_id: task_id.clone(),
+                                relative_path: relative_path.clone(),
+                                received_bytes: 0,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         write_v2_stream_ack(&mut writer, &task_roots, ack).await?;
                     }
                     protocol::SyncMessage::FileDownloadRequestV2 {
                         task_id,
                         relative_path,
-                    } => match require_authenticated(&authenticated_device_id).map(|_| ()) {
+                    } => match require_authorized_task(
+                        &task_roots,
+                        &authenticated_device_id,
+                        &task_id,
+                    ) {
                         Ok(()) => {
                             if let Err(e) = send_file_download_v2(
                                 &task_roots,
@@ -1280,7 +1430,11 @@ async fn handle_connection(
                     protocol::SyncMessage::FileDownloadRequest {
                         task_id,
                         relative_path,
-                    } => match require_authenticated(&authenticated_device_id).map(|_| ()) {
+                    } => match require_authorized_task(
+                        &task_roots,
+                        &authenticated_device_id,
+                        &task_id,
+                    ) {
                         Ok(()) => {
                             if let Err(e) = send_file_download(
                                 &task_roots,
@@ -1313,23 +1467,27 @@ async fn handle_connection(
                         task_id,
                         relative_path,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                create_incoming_directory(&task_roots, &task_id, &relative_path)
-                            }) {
-                                Ok(()) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            create_incoming_directory(&task_roots, &task_id, &relative_path)
+                        }) {
+                            Ok(()) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::FileDelete {
@@ -1342,33 +1500,37 @@ async fn handle_connection(
                         expected_modified_unix_ms,
                         delete_batch_id,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                move_incoming_delete_to_history(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    expected_kind,
-                                    expected_hash.as_deref(),
-                                    expected_hash_status,
-                                    expected_size,
-                                    expected_modified_unix_ms,
-                                    delete_batch_id.as_deref(),
-                                )
-                            }) {
-                                Ok(()) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            move_incoming_delete_to_history(
+                                &task_roots,
+                                &task_id,
+                                &relative_path,
+                                expected_kind,
+                                expected_hash.as_deref(),
+                                expected_hash_status,
+                                expected_size,
+                                expected_modified_unix_ms,
+                                delete_batch_id.as_deref(),
+                            )
+                        }) {
+                            Ok(()) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::ConflictApply {
@@ -1377,35 +1539,41 @@ async fn handle_connection(
                         staged_relative_path,
                         mode,
                     } => {
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                apply_incoming_conflict_file(
-                                    &task_roots,
-                                    &task_id,
-                                    &relative_path,
-                                    &staged_relative_path,
-                                    &mode,
-                                )
-                            }) {
-                                Ok(applied_path) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path: applied_path,
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => protocol::SyncMessage::FileAck {
-                                    task_id,
-                                    relative_path,
-                                    success: false,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                        let ack = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| {
+                            apply_incoming_conflict_file(
+                                &task_roots,
+                                &task_id,
+                                &relative_path,
+                                &staged_relative_path,
+                                &mode,
+                            )
+                        }) {
+                            Ok(applied_path) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path: applied_path,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => protocol::SyncMessage::FileAck {
+                                task_id,
+                                relative_path,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::TaskRegister { task_id, root_path } => {
-                        let ack = match require_authenticated(&authenticated_device_id)
-                            .and_then(|_| task_roots.register(&task_id, &root_path))
-                        {
+                        let ack = match require_authenticated(&authenticated_device_id).and_then(
+                            |device_id| {
+                                task_roots.register_for_peer(&task_id, &root_path, device_id)
+                            },
+                        ) {
                             Ok(()) => protocol::SyncMessage::TaskAck {
                                 task_id,
                                 success: true,
@@ -1475,11 +1643,9 @@ async fn handle_connection(
                         proposed_role,
                     } => {
                         let error_task_id = task_id.clone();
-                        let ack =
-                            match require_authenticated(&authenticated_device_id).and_then(|_| {
-                                let requester_device_id = authenticated_device_id
-                                    .clone()
-                                    .unwrap_or_else(|| "unknown".to_string());
+                        let ack = match require_authenticated(&authenticated_device_id).and_then(
+                            |requester_device_id| {
+                                let requester_device_id = requester_device_id.to_string();
                                 if !task_roots.auto_accept_task_invites() {
                                     let invite = task_roots.record_task_invite(
                                         invite_id.clone(),
@@ -1497,22 +1663,27 @@ async fn handle_connection(
                                     });
                                 }
                                 let root = task_roots.invite_root(&task_id, &task_name)?;
-                                task_roots.register(&task_id, &root)?;
+                                task_roots.register_for_peer(
+                                    &task_id,
+                                    &root,
+                                    &requester_device_id,
+                                )?;
                                 Ok(protocol::SyncMessage::TaskInviteAck {
                                     task_id,
                                     success: true,
                                     remote_path: Some(root.to_string_lossy().to_string()),
                                     error: None,
                                 })
-                            }) {
-                                Ok(msg) => msg,
-                                Err(e) => protocol::SyncMessage::TaskInviteAck {
-                                    task_id: error_task_id,
-                                    success: false,
-                                    remote_path: None,
-                                    error: Some(e.to_string()),
-                                },
-                            };
+                            },
+                        ) {
+                            Ok(msg) => msg,
+                            Err(e) => protocol::SyncMessage::TaskInviteAck {
+                                task_id: error_task_id,
+                                success: false,
+                                remote_path: None,
+                                error: Some(e.to_string()),
+                            },
+                        };
                         writer.write_all(&protocol::encode_message(&ack)?).await?;
                     }
                     protocol::SyncMessage::TaskInviteStatusRequest { invite_id } => {
@@ -1559,8 +1730,12 @@ async fn handle_connection(
                         tracing::info!("received control message from {}", peer_addr);
                     }
                     protocol::SyncMessage::ScanRequest { task_id } => {
-                        let response = match require_authenticated(&authenticated_device_id)
-                            .and_then(|_| scan_task_root(&task_roots, &task_id))
+                        let response = match require_authorized_task(
+                            &task_roots,
+                            &authenticated_device_id,
+                            &task_id,
+                        )
+                        .and_then(|_| scan_task_root(&task_roots, &task_id))
                         {
                             Ok(files) => protocol::SyncMessage::ScanResponse {
                                 task_id,
@@ -1588,12 +1763,19 @@ async fn handle_connection(
     Ok(())
 }
 
-fn require_authenticated(authenticated_device_id: &Option<String>) -> Result<()> {
-    if authenticated_device_id.is_some() {
-        Ok(())
-    } else {
-        anyhow::bail!("peer is not authenticated")
-    }
+fn require_authenticated(authenticated_device_id: &Option<String>) -> Result<&str> {
+    authenticated_device_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("peer is not authenticated"))
+}
+
+fn require_authorized_task(
+    task_roots: &TaskRootRegistry,
+    authenticated_device_id: &Option<String>,
+    task_id: &str,
+) -> Result<()> {
+    let device_id = require_authenticated(authenticated_device_id)?;
+    task_roots.authorize_task_access(task_id, device_id)
 }
 
 fn verify_auth_proof(
@@ -2753,6 +2935,18 @@ mod tests {
         let paths: Vec<String> = files.into_iter().map(|file| file.relative_path).collect();
 
         assert_eq!(paths, vec!["ready.txt".to_string()]);
+    }
+
+    #[test]
+    fn task_root_authorization_requires_matching_peer() {
+        let dir = TempDir::new().unwrap();
+        let registry = TaskRootRegistry::new();
+        registry
+            .register_for_peer("task", dir.path(), "peer-a")
+            .unwrap();
+
+        assert!(registry.authorize_task_access("task", "peer-a").is_ok());
+        assert!(registry.authorize_task_access("task", "peer-b").is_err());
     }
 
     #[test]

@@ -37,6 +37,7 @@ LanBridge is not general bidirectional sync. It uses a fixed primary-secondary m
 - Real-device test instructions live in `docs/testing/` when present.
 - Transfer protocol details: `docs/architecture/transfer-protocol.md`
 - Current transfer strategy and return-sync/conflict plan: `docs/architecture/current-transfer-and-return-sync-strategy.md`
+- Local Tauri/Tao runtime patch note: `docs/architecture/tao-local-patch.md`
 
 ## Current Automation Level
 

@@ -674,12 +674,6 @@ pub async fn create_sync_task(
         updated_unix_ms: now_ms(),
     };
 
-    if let Some(server) = &state._server {
-        server
-            .register_task_root(task.id.to_string(), &task.local_path)
-            .map_err(|e| e.to_string())?;
-    }
-
     let mut task = task;
     if task.remote_path.is_empty() {
         let proposed_role = match task.local_role {
@@ -737,6 +731,11 @@ pub async fn create_sync_task(
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let repo = repository::SyncTaskRepository::new(&db);
         repo.insert(&task).map_err(|e| e.to_string())?;
+    }
+    if let Some(server) = &state._server {
+        server
+            .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
+            .map_err(|e| e.to_string())?;
     }
     state.start_task_watcher(&task).map_err(|e| e.to_string())?;
     if task.local_role == DeviceRole::Primary {
@@ -1249,7 +1248,7 @@ fn create_task_from_invite(
 
     if let Some(server) = &state._server {
         server
-            .register_task_root(task.id.to_string(), &task.local_path)
+            .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
             .map_err(|e| e.to_string())?;
     }
 
@@ -1385,7 +1384,7 @@ pub fn toggle_task_enabled(
     if enabled {
         if let Some(server) = &state._server {
             server
-                .register_task_root(task.id.to_string(), &task.local_path)
+                .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -4361,17 +4360,15 @@ pub fn list_history(
         .ok_or("task not found")?;
     let repo = repository::HistoryRepository::new(&db);
     let entries = repo.list_by_task(&id).map_err(|e| e.to_string())?;
-    let mut entries = entries
-        .into_iter()
-        .filter(|entry| {
-            if Path::new(&entry.stored_path).exists() {
-                true
-            } else {
-                let _ = repo.remove(&id, &entry.id);
-                false
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut existing_entries = Vec::new();
+    for entry in entries {
+        if Path::new(&entry.stored_path).exists() {
+            existing_entries.push(entry);
+        } else {
+            repo.remove(&id, &entry.id).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut entries = existing_entries;
     let mut known_paths = entries
         .iter()
         .map(|entry| entry.stored_path.clone())
@@ -4642,14 +4639,73 @@ pub fn write_log(
 pub struct AppSettings {
     pub history_retention_days: i64,
     pub history_size_limit_mb: i64,
+    pub discovery_enabled: bool,
 }
 
 #[tauri::command]
-pub fn get_settings() -> Result<AppSettings, String> {
+pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    load_app_settings(&state)
+}
+
+#[tauri::command]
+pub fn get_app_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    load_app_settings(&state)
+}
+
+#[tauri::command]
+pub fn set_discovery_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<crate::transport::DiscoveryStatus, String> {
+    let mut settings =
+        crate::app_settings::load(state.platform.as_ref()).map_err(|e| e.to_string())?;
+    settings.discovery_enabled = enabled;
+    crate::app_settings::save(state.platform.as_ref(), &settings).map_err(|e| e.to_string())?;
+
+    if enabled {
+        let server = state
+            ._server
+            .as_ref()
+            .ok_or_else(|| "同步服务未启动，无法开启自动发现".to_string())?;
+        let public = state.identity.public();
+        let hostname = default_hostname();
+        crate::transport::discovery::start_existing_in_background(
+            state.discovery.clone(),
+            public.device_id,
+            hostname,
+            public.public_key,
+            server.port(),
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        state.discovery.mark_disabled();
+    }
+
+    Ok(state.discovery.status())
+}
+
+fn load_app_settings(state: &State<'_, AppState>) -> Result<AppSettings, String> {
+    let settings = crate::app_settings::load(state.platform.as_ref()).map_err(|e| e.to_string())?;
     Ok(AppSettings {
         history_retention_days: 30,
         history_size_limit_mb: 1024,
+        discovery_enabled: settings.discovery_enabled,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn default_hostname() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "Device".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn default_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Device".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn default_hostname() -> String {
+    "Device".to_string()
 }
 
 #[tauri::command]
@@ -5289,7 +5345,7 @@ fn should_ignore_import_entry(
     name: &str,
     is_dir: bool,
 ) -> bool {
-    if name == ".lanbridge-history" || name == ".lanbridge-tmp" {
+    if name == ".lanbridge-history" || name == ".lanbridge-temp" {
         return true;
     }
     matches!(
@@ -5376,11 +5432,77 @@ fn copy_import_entry(
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目标文件夹失败: {}", e))?;
         }
-        std::fs::copy(source, destination)
-            .map(|_| ())
-            .map_err(|e| format!("复制文件失败: {}", e))
+        copy_file_atomically(source, destination)
     } else {
         Err("不支持导入此类型".to_string())
+    }
+}
+
+fn copy_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "目标路径无效".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建目标文件夹失败: {}", e))?;
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "目标文件名无效".to_string())?;
+    let temp_path = parent.join(format!(
+        ".{}.{}.lanbridge-import-partial",
+        file_name,
+        Uuid::new_v4()
+    ));
+    let backup_path = parent.join(format!(
+        ".{}.{}.lanbridge-import-backup",
+        file_name,
+        Uuid::new_v4()
+    ));
+
+    let source_size = std::fs::metadata(source)
+        .map_err(|e| format!("读取源文件失败: {}", e))?
+        .len();
+    if let Err(error) = std::fs::copy(source, &temp_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("复制文件失败: {}", error));
+    }
+    match std::fs::metadata(&temp_path) {
+        Ok(metadata) if metadata.len() == source_size => {}
+        Ok(_) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err("复制文件失败: 文件大小不一致".to_string());
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("验证复制文件失败: {}", error));
+        }
+    }
+
+    if destination.exists() {
+        if destination.is_dir() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err("目标已存在且不是文件".to_string());
+        }
+        std::fs::rename(destination, &backup_path)
+            .map_err(|e| format!("备份现有文件失败: {}", e))?;
+        if let Err(error) = std::fs::rename(&temp_path, destination) {
+            let restore_result = std::fs::rename(&backup_path, destination);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(match restore_result {
+                Ok(()) => format!("替换文件失败，已恢复原文件: {}", error),
+                Err(restore_error) => format!(
+                    "替换文件失败，且恢复原文件失败: {}; {}",
+                    error, restore_error
+                ),
+            });
+        }
+        let _ = std::fs::remove_file(&backup_path);
+        Ok(())
+    } else {
+        if let Err(error) = std::fs::rename(&temp_path, destination) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("写入目标文件失败: {}", error));
+        }
+        Ok(())
     }
 }
 
@@ -5410,7 +5532,7 @@ fn copy_import_directory(
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("创建目标文件夹失败: {}", e))?;
             }
-            std::fs::copy(&path, &next_destination).map_err(|e| format!("复制文件失败: {}", e))?;
+            copy_file_atomically(&path, &next_destination)?;
         }
     }
     Ok(())
@@ -5478,6 +5600,7 @@ pub fn delete_sync_task(state: State<'_, AppState>, task_id: String) -> Result<(
 #[cfg(test)]
 mod return_sync_tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn pending_return(change_kind: ChangeKind) -> PendingReturnChange {
         PendingReturnChange {
@@ -5587,6 +5710,34 @@ mod return_sync_tests {
 
     fn snapshot_from_remote(remote: RemoteFileState) -> FileSnapshot {
         remote_file_state_to_snapshot(Uuid::nil(), &remote)
+    }
+
+    #[test]
+    fn import_copy_replaces_existing_file_after_full_temp_copy() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        std::fs::write(&source, "new content").unwrap();
+        std::fs::write(&destination, "old content").unwrap();
+
+        copy_file_atomically(&source, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "new content"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.contains("lanbridge-import"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]

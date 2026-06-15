@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -74,6 +75,7 @@ pub struct OnlineDevice {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveryStatus {
+    pub enabled: bool,
     pub running: bool,
     pub error: Option<String>,
     pub interfaces: Vec<String>,
@@ -91,11 +93,18 @@ pub struct DiscoveryState {
     peers: Mutex<HashMap<String, PeerRecord>>,
     devices: Mutex<Vec<OnlineDevice>>,
     status: Mutex<DiscoveryStatus>,
+    generation: AtomicU64,
 }
 
 impl DiscoveryState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::with_status(false, None, Vec::new()))
+    }
+
+    pub fn disabled() -> Arc<Self> {
+        let state = Arc::new(Self::with_status(false, None, Vec::new()));
+        state.mark_disabled();
+        state
     }
 
     pub fn failed(error: String) -> Arc<Self> {
@@ -107,12 +116,14 @@ impl DiscoveryState {
             peers: Mutex::new(HashMap::new()),
             devices: Mutex::new(Vec::new()),
             status: Mutex::new(DiscoveryStatus {
+                enabled: true,
                 running,
                 error,
                 interfaces,
                 multicast_addr: MULTICAST_ADDR.to_string(),
                 multicast_port: MULTICAST_PORT,
             }),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -125,17 +136,40 @@ impl DiscoveryState {
         self.status.lock().unwrap().clone()
     }
 
-    pub fn mark_running(&self, interfaces: Vec<String>) {
+    pub fn mark_running(&self, interfaces: Vec<String>) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut status = self.status.lock().unwrap();
+        status.enabled = true;
         status.running = true;
         status.error = None;
         status.interfaces = interfaces;
+        generation
     }
 
     pub fn mark_failed(&self, error: String) {
         let mut status = self.status.lock().unwrap();
         status.running = false;
         status.error = Some(error);
+    }
+
+    pub fn mark_disabled(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut peers) = self.peers.lock() {
+            peers.clear();
+        }
+        if let Ok(mut devices) = self.devices.lock() {
+            devices.clear();
+        }
+        let mut status = self.status.lock().unwrap();
+        status.enabled = false;
+        status.running = false;
+        status.error = None;
+        status.interfaces.clear();
+    }
+
+    fn worker_active(&self, generation: u64) -> bool {
+        let status = self.status.lock().unwrap();
+        status.enabled && status.running && self.generation.load(Ordering::SeqCst) == generation
     }
 
     pub fn record_peer(&self, announce: Announce, ip: String, interface_name: Option<String>) {
@@ -184,17 +218,35 @@ pub fn start_in_background(
     public_key: Vec<u8>,
     port: u16,
 ) -> Result<Arc<DiscoveryState>> {
+    start_existing_in_background(
+        DiscoveryState::new(),
+        device_id,
+        display_name,
+        public_key,
+        port,
+    )
+}
+
+pub fn start_existing_in_background(
+    state: Arc<DiscoveryState>,
+    device_id: String,
+    display_name: String,
+    public_key: Vec<u8>,
+    port: u16,
+) -> Result<Arc<DiscoveryState>> {
     if port == 0 {
         return Err(anyhow!("discovery requires a valid TCP port"));
     }
+    if state.status().running {
+        return Ok(state);
+    }
 
-    let state = DiscoveryState::new();
     let sockets = create_multicast_sockets()?;
     let interface_names = sockets
         .iter()
         .filter_map(|(_, name)| name.clone())
         .collect::<Vec<_>>();
-    state.mark_running(interface_names);
+    let generation = state.mark_running(interface_names);
 
     let return_state = state.clone();
     std::thread::spawn(move || {
@@ -225,14 +277,22 @@ pub fn start_in_background(
 
                 let announce_socket = socket.clone();
                 let announce_msg = announce.clone();
+                let announce_state = state.clone();
                 tokio::spawn(async move {
-                    announce_loop(announce_socket, announce_msg).await;
+                    announce_loop(announce_socket, announce_msg, announce_state, generation).await;
                 });
 
                 let listen_state = state.clone();
                 let listen_device_id = device_id.clone();
                 tokio::spawn(async move {
-                    listen_loop(socket, listen_device_id, listen_state, interface_name).await;
+                    listen_loop(
+                        socket,
+                        listen_device_id,
+                        listen_state,
+                        interface_name,
+                        generation,
+                    )
+                    .await;
                 });
             }
 
@@ -248,7 +308,12 @@ pub fn start_in_background(
     Ok(return_state)
 }
 
-async fn announce_loop(socket: Arc<UdpSocket>, announce: Announce) {
+async fn announce_loop(
+    socket: Arc<UdpSocket>,
+    announce: Announce,
+    state: Arc<DiscoveryState>,
+    generation: u64,
+) {
     let data = serde_json::to_vec(&announce).expect("failed to serialize announce");
     let multicast_addr: SocketAddr = format!("{}:{}", MULTICAST_ADDR, MULTICAST_PORT)
         .parse()
@@ -257,7 +322,7 @@ async fn announce_loop(socket: Arc<UdpSocket>, announce: Announce) {
         .parse()
         .unwrap();
 
-    loop {
+    while state.worker_active(generation) {
         if let Err(e) = socket.send_to(&data, multicast_addr).await {
             tracing::warn!("failed to send multicast announce: {}", e);
         }
@@ -273,10 +338,11 @@ async fn listen_loop(
     local_device_id: String,
     state: Arc<DiscoveryState>,
     interface_name: Option<String>,
+    generation: u64,
 ) {
     let mut buf = [0u8; 2048];
 
-    loop {
+    while state.worker_active(generation) {
         match tokio::time::timeout(
             Duration::from_secs(ANNOUNCE_INTERVAL_SECS),
             socket.recv_from(&mut buf),
@@ -534,7 +600,10 @@ mod tests {
         assert_eq!(devices[0].ip, "192.168.1.5");
         assert_eq!(devices[0].port, 9527);
         assert!(devices[0].compatible);
-        assert_eq!(devices[0].protocol_version, Some(DISCOVERY_PROTOCOL_VERSION));
+        assert_eq!(
+            devices[0].protocol_version,
+            Some(DISCOVERY_PROTOCOL_VERSION)
+        );
     }
 
     #[test]
@@ -660,6 +729,7 @@ mod tests {
     fn discovery_state_failed() {
         let state = DiscoveryState::failed("no interfaces".to_string());
         let status = state.status();
+        assert!(status.enabled);
         assert!(!status.running);
         assert_eq!(status.error, Some("no interfaces".to_string()));
     }
@@ -669,8 +739,26 @@ mod tests {
         let state = DiscoveryState::new();
         state.mark_running(vec!["en0".to_string(), "eth0".to_string()]);
         let status = state.status();
+        assert!(status.enabled);
         assert!(status.running);
         assert!(status.error.is_none());
         assert_eq!(status.interfaces.len(), 2);
+    }
+
+    #[test]
+    fn discovery_state_disabled_clears_devices_and_status() {
+        let state = DiscoveryState::new();
+        let announce = make_announce("dev-1", "Mac", 9527);
+        state.record_peer(announce, "192.168.1.5".to_string(), None);
+        assert_eq!(state.list_devices().len(), 1);
+
+        state.mark_disabled();
+
+        let status = state.status();
+        assert!(!status.enabled);
+        assert!(!status.running);
+        assert!(status.error.is_none());
+        assert!(status.interfaces.is_empty());
+        assert!(state.list_devices().is_empty());
     }
 }

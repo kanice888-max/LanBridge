@@ -474,7 +474,11 @@ impl AppState {
             }
             if task.enabled {
                 if let Some(server) = &server {
-                    server.register_task_root(task.id.to_string(), &task.local_path)?;
+                    server.register_task_root(
+                        task.id.to_string(),
+                        &task.local_path,
+                        task.peer_device_id(),
+                    )?;
                     crate::diagnostics::record_operation(
                         "task_root_registered",
                         format!("task_id={} path={}", task.id, task.local_path),

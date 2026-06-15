@@ -231,6 +231,7 @@ export const en: Translations = {
     langZh: "中文",
     langEn: "English",
     windowBehavior: "Window Behavior",
+    discoveryEnabled: "Automatic device discovery",
     minimizeToTrayOnClose: "Minimize to system tray on close",
     historyRetention: "History Retention",
     retentionPeriod: "Retention Period",

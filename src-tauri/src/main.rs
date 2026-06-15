@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 
+mod app_settings;
 mod app_state;
 mod commands;
 mod core;
@@ -87,7 +88,11 @@ fn run_app() -> Result<()> {
     // Start discovery service in its own thread + tokio runtime
     let hostname = default_hostname();
     let pub_id = identity.public();
-    let server = match transport::server::SyncServer::start_in_background(9527) {
+    let settings = app_settings::load(platform.as_ref()).unwrap_or_else(|error| {
+        diagnostics::record_operation("settings_load_failed", error.to_string());
+        app_settings::AppSettings::default()
+    });
+    let server = match transport::server::SyncServer::start_in_background_with_fallback(9527) {
         Ok(server) => Some(server),
         Err(e) => {
             diagnostics::record_operation("sync_server_start_failed", e.to_string());
@@ -100,17 +105,22 @@ fn run_app() -> Result<()> {
     }
     let advertised_port = server.as_ref().map_or(0, |server| server.port());
     diagnostics::record_operation("sync_server_ready", format!("port={advertised_port}"));
-    let discovery = match transport::discovery::start_in_background(
-        pub_id.device_id.clone(),
-        hostname,
-        pub_id.public_key.clone(),
-        advertised_port,
-    ) {
-        Ok(discovery) => discovery,
-        Err(e) => {
-            diagnostics::record_operation("discovery_start_failed", e.to_string());
-            transport::DiscoveryState::failed(e.to_string())
+    let discovery = if settings.discovery_enabled {
+        match transport::discovery::start_in_background(
+            pub_id.device_id.clone(),
+            hostname,
+            pub_id.public_key.clone(),
+            advertised_port,
+        ) {
+            Ok(discovery) => discovery,
+            Err(e) => {
+                diagnostics::record_operation("discovery_start_failed", e.to_string());
+                transport::DiscoveryState::failed(e.to_string())
+            }
         }
+    } else {
+        diagnostics::record_operation("discovery_disabled", "automatic discovery is disabled");
+        transport::DiscoveryState::disabled()
     };
 
     let app_state = app_state::AppState::new(identity, platform, discovery, server)
@@ -158,6 +168,8 @@ fn run_app() -> Result<()> {
             commands::list_logs,
             commands::write_log,
             commands::get_settings,
+            commands::get_app_settings,
+            commands::set_discovery_enabled,
             commands::hide_main_window_to_tray,
             commands::show_main_window,
             commands::quit_app,

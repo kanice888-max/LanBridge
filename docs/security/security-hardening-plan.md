@@ -62,11 +62,11 @@ The packaged app CSP is tightened so `connect-src` is limited to `'self'`. Devel
 
 ### SyncServer Port Fallback
 
-Current behavior prefers the default TCP port. A future change should bind `9527` when available and fall back to a system-assigned port when needed. Discovery must advertise the real listening port, and the UI must show the real port.
+Implemented plan: bind `9527` when available and fall back to a system-assigned port when needed. Discovery advertises the real listening port, and network diagnostics show the real port.
 
 ### Discovery Privacy Mode
 
-Add a setting for automatic discovery:
+Implemented plan: add a setting for automatic discovery:
 
 - On: broadcast on the LAN and listen for peers.
 - Off: do not actively broadcast; manual connection remains available.
@@ -75,7 +75,7 @@ This reduces exposure on networks the user does not trust.
 
 ### CI Security Audit
 
-Add GitHub Actions for:
+Implemented plan: add GitHub Actions for:
 
 - `npm ci`
 - `npm run build`
@@ -87,7 +87,7 @@ Initial audit rules may report or block only critical findings so the repository
 
 ### Local `tao` Patch Documentation
 
-Document why `src-tauri/patches/tao-0.16.11/` is vendored, what was changed, and what must be verified before removing the patch.
+Implemented plan: document why `src-tauri/patches/tao-0.16.11/` is vendored, what must be verified before removing the patch, and why the directory must remain in the GitHub source release. See `docs/architecture/tao-local-patch.md`.
 
 ## Deferred Items
 

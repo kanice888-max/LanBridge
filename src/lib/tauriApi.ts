@@ -113,6 +113,7 @@ export interface LogEntry {
 export interface AppSettings {
   history_retention_days: number;
   history_size_limit_mb: number;
+  discovery_enabled: boolean;
 }
 
 export interface CreateTaskRequest {
@@ -174,6 +175,7 @@ export interface OnlineDeviceAddress {
 }
 
 export interface DiscoveryStatus {
+  enabled: boolean;
   running: boolean;
   error: string | null;
   interfaces: string[];
@@ -476,7 +478,17 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
         created_unix_ms: previewNow,
       }));
     case "get_settings":
-      return { history_retention_days: 30, history_size_limit_mb: 1024 };
+    case "get_app_settings":
+      return { history_retention_days: 30, history_size_limit_mb: 1024, discovery_enabled: true };
+    case "set_discovery_enabled":
+      return {
+        enabled: args?.enabled ?? true,
+        running: args?.enabled ?? true,
+        error: null,
+        interfaces: args?.enabled === false ? [] : ["en0"],
+        multicast_addr: "239.10.10.10",
+        multicast_port: 53530,
+      };
     case "hide_main_window_to_tray":
     case "show_main_window":
     case "quit_app":
@@ -499,6 +511,7 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
       ];
     case "get_discovery_status":
       return {
+        enabled: true,
         running: true,
         error: null,
         interfaces: ["en0"],
@@ -803,6 +816,14 @@ export async function writeLog(
 
 export async function getSettings(): Promise<AppSettings> {
   return call("get_settings");
+}
+
+export async function getAppSettings(): Promise<AppSettings> {
+  return call("get_app_settings");
+}
+
+export async function setDiscoveryEnabled(enabled: boolean): Promise<DiscoveryStatus> {
+  return call("set_discovery_enabled", { enabled });
 }
 
 export async function hideMainWindowToTray(): Promise<void> {

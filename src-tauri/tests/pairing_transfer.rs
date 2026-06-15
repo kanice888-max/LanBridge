@@ -356,7 +356,7 @@ async fn test_sync_server_rejects_unauthenticated_file_transfer() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(task_id, remote_dir.path(), "unused-peer")
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -403,7 +403,11 @@ async fn test_sync_server_receives_authenticated_file_transfer_and_acks() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-auth-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -451,7 +455,11 @@ async fn test_sync_server_keeps_legacy_v1_chunk_ack_contract() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-legacy-v1-ack";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -516,7 +524,11 @@ async fn test_sync_server_v1_streaming_uses_checkpoint_acks() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-v1-checkpoint-ack";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -600,7 +612,11 @@ async fn test_sync_server_rejects_windows_reserved_relative_path() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-reserved-path-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -641,7 +657,11 @@ async fn test_connection_manager_sends_message_to_registered_peer() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-002";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -749,7 +769,11 @@ async fn test_unregister_task_root_rejects_later_file_transfer() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-unregistered";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
     server.unregister_task_root(task_id).unwrap();
 
@@ -1331,7 +1355,11 @@ async fn test_authenticated_chunked_transfer_supports_files_over_message_limit()
     let source_dir = TempDir::new().unwrap();
     let task_id = "task-large-file-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let source_path = source_dir.path().join("large.bin");
@@ -1374,7 +1402,11 @@ async fn test_authenticated_v2_upload_negotiates_and_transfers_file() {
     let task_id = "task-v2-upload-001";
     let peer_id = "v2-upload-peer";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let source_path = source_dir.path().join("v2-upload.bin");
@@ -1420,7 +1452,11 @@ async fn test_v2_upload_rejects_bad_offset_and_cleans_partial() {
     let task_id = "task-v2-bad-offset";
     let relative_path = "bad-offset.bin";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -1710,7 +1746,11 @@ async fn test_authenticated_file_download_request_streams_file_to_client() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-download-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
     std::fs::create_dir_all(remote_dir.path().join("docs")).unwrap();
     std::fs::write(
@@ -1753,7 +1793,11 @@ async fn test_authenticated_v2_file_download_uses_checkpoint_acks() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-download-v2-checkpoint";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let source = remote_dir.path().join("large-download.bin");
@@ -1859,7 +1903,11 @@ async fn test_server_updates_db_after_authenticated_chunked_receive() {
         })
         .unwrap();
     server
-        .register_task_root(task_id.to_string(), remote_dir.path())
+        .register_task_root(
+            task_id.to_string(),
+            remote_dir.path(),
+            local_public.device_id.clone(),
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -2034,7 +2082,11 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
     primary_server
-        .register_task_root(task_id.to_string(), primary_dir.path())
+        .register_task_root(
+            task_id.to_string(),
+            primary_dir.path(),
+            secondary_public.device_id.clone(),
+        )
         .unwrap();
 
     let register_response = lanbridge::transport::connection::send_authenticated_message_to_peer(

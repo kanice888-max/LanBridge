@@ -63,6 +63,15 @@ pub struct SyncTask {
     pub updated_unix_ms: i64,
 }
 
+impl SyncTask {
+    pub fn peer_device_id(&self) -> &str {
+        match self.local_role {
+            DeviceRole::Primary => &self.secondary_device_id,
+            DeviceRole::Secondary => &self.primary_device_id,
+        }
+    }
+}
+
 /// Snapshot of a file or directory at scan time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSnapshot {

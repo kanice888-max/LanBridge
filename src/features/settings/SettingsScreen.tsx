@@ -1,6 +1,6 @@
 import * as Popover from "@radix-ui/react-popover";
 import { useEffect, useState } from "react";
-import { getSettings, type AppSettings } from "../../lib/tauriApi";
+import { getSettings, setDiscoveryEnabled, type AppSettings } from "../../lib/tauriApi";
 import { useTranslation, type Lang } from "../../lib/i18n/context";
 import { isBrowserPreviewBridgeError } from "../../lib/runtime";
 import { ChevronDownIcon } from "../../components/icons/animate-icons";
@@ -15,6 +15,7 @@ export function SettingsScreen({
   onMinimizeToTrayOnCloseChange,
 }: SettingsScreenProps) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [savingDiscovery, setSavingDiscovery] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [languageOpen, setLanguageOpen] = useState(false);
   const { lang, setLang, t } = useTranslation();
@@ -24,6 +25,21 @@ export function SettingsScreen({
       if (!isBrowserPreviewBridgeError(e)) setError(String(e));
     });
   }, []);
+
+  const handleDiscoveryChange = async (enabled: boolean) => {
+    setSavingDiscovery(true);
+    setError(null);
+    setSettings((prev) => (prev ? { ...prev, discovery_enabled: enabled } : prev));
+    try {
+      await setDiscoveryEnabled(enabled);
+      setSettings((prev) => (prev ? { ...prev, discovery_enabled: enabled } : prev));
+    } catch (e) {
+      setSettings((prev) => (prev ? { ...prev, discovery_enabled: !enabled } : prev));
+      if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+    } finally {
+      setSavingDiscovery(false);
+    }
+  };
 
   return (
     <section className="settings-screen stage-list-page">
@@ -73,6 +89,18 @@ export function SettingsScreen({
 
       <div className="settings-group">
         <div className="stage-section-label">{t.settings.windowBehavior}</div>
+        <label className="stage-row settings-stage-row">
+          <span>{t.settings.discoveryEnabled}</span>
+          <span className="settings-switch-wrap">
+            <input
+              type="checkbox"
+              checked={settings?.discovery_enabled ?? true}
+              disabled={savingDiscovery}
+              onChange={(event) => handleDiscoveryChange(event.target.checked)}
+            />
+            <span className="settings-switch" aria-hidden="true" />
+          </span>
+        </label>
         <label className="stage-row settings-stage-row">
           <span>{t.settings.minimizeToTrayOnClose}</span>
           <span className="settings-switch-wrap">

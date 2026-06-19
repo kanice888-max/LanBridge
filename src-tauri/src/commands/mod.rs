@@ -1599,8 +1599,7 @@ pub fn scan_task(state: State<'_, AppState>, task_id: String) -> Result<Vec<File
     };
 
     let sync_root = std::path::Path::new(&task.local_path);
-    let cached_snapshot_list = cached_snapshots;
-    let cache = snapshot_cache_by_path(cached_snapshot_list.clone());
+    let cache = snapshot_cache_by_path(&cached_snapshots);
     let results =
         guarded_scan_root_with_cache(id, sync_root, &*state.platform, &cache, "scan_task")?;
 
@@ -1627,7 +1626,7 @@ fn refresh_task_snapshots(state: &AppState, task: &SyncTask) -> Result<Vec<FileS
             .list_by_task(&task.id)
             .map_err(|e| e.to_string())?
     };
-    let cache = snapshot_cache_by_path(cached_snapshots);
+    let cache = snapshot_cache_by_path(&cached_snapshots);
     let results = guarded_scan_root_with_cache(
         task.id,
         sync_root,
@@ -1653,10 +1652,10 @@ fn refresh_task_snapshots(state: &AppState, task: &SyncTask) -> Result<Vec<FileS
     Ok(snapshots)
 }
 
-fn snapshot_cache_by_path(snapshots: Vec<FileSnapshot>) -> HashMap<String, FileSnapshot> {
+fn snapshot_cache_by_path(snapshots: &[FileSnapshot]) -> HashMap<String, FileSnapshot> {
     snapshots
-        .into_iter()
-        .map(|snapshot| (snapshot.relative_path.clone(), snapshot))
+        .iter()
+        .map(|snapshot| (snapshot.relative_path.clone(), snapshot.clone()))
         .collect()
 }
 
@@ -1909,8 +1908,7 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
 
     // Scan outside the SQLite lock; hashing can be the slowest local stage.
     let local_scan_start = Instant::now();
-    let cached_snapshot_list = cached_snapshots;
-    let cache = snapshot_cache_by_path(cached_snapshot_list.clone());
+    let cache = snapshot_cache_by_path(&cached_snapshots);
     let scan_results =
         guarded_scan_root_with_cache(id, sync_root, &*state.platform, &cache, "sync_now")?;
     let local_scan_ms = local_scan_start.elapsed().as_millis() as u64;
@@ -1937,7 +1935,7 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
     if task.local_role == DeviceRole::Primary {
         let recovered_delete_count = append_recovered_delete_actions(
             &mut actions,
-            &cached_snapshot_list,
+            &cached_snapshots,
             &snapshots,
             &baselines,
         );
@@ -3360,7 +3358,7 @@ pub fn run_refresh_pending_returns(
     }
 
     let sync_root = Path::new(&task.local_path);
-    let cache = snapshot_cache_by_path(cached_snapshots);
+    let cache = snapshot_cache_by_path(&cached_snapshots);
     let scan_results = guarded_scan_root_with_cache(
         id,
         sync_root,

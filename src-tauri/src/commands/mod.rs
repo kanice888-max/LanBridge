@@ -513,9 +513,11 @@ pub fn list_task_invites(
     state: State<'_, AppState>,
 ) -> Result<Vec<IncomingTaskInviteInfo>, String> {
     let server = state._server.as_ref().ok_or("sync server is not running")?;
+    let local_device_id = state.identity.public().device_id;
     Ok(server
         .list_task_invites()
         .into_iter()
+        .filter(|invite| invite.requester_device_id != local_device_id)
         .map(|invite| IncomingTaskInviteInfo {
             invite_id: invite.invite_id,
             task_id: invite.task_id,

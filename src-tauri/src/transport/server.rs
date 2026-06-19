@@ -517,6 +517,14 @@ impl TaskRootRegistry {
         requester_path: Option<String>,
         proposed_role: String,
     ) -> Result<PendingTaskInvite> {
+        if self
+            .local_identity()
+            .as_ref()
+            .map(|identity| identity.device_id.as_str())
+            == Some(requester_device_id.as_str())
+        {
+            anyhow::bail!("不能连接本机");
+        }
         self.ensure_trusted_peer_key_matches(&requester_device_id, &requester_public_key)?;
         let invite = PendingTaskInvite {
             invite_id: invite_id.clone(),

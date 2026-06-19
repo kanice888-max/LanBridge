@@ -179,6 +179,10 @@ export interface DiscoveryStatus {
   running: boolean;
   error: string | null;
   interfaces: string[];
+  joined_interfaces: string[];
+  announce_interfaces: string[];
+  skipped_interfaces: string[];
+  socket_errors: string[];
   multicast_addr: string;
   multicast_port: number;
 }

@@ -113,11 +113,11 @@ pub async fn connect_peer(
         .await
         .map_err(|e| e.to_string())?;
 
-    let peer = Some(
-        connection::request_peer_identity(&address, port)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
+    let peer_identity = connection::request_peer_identity(&address, port)
+        .await
+        .map_err(|e| e.to_string())?;
+    ensure_not_local_device(&state.identity.public().device_id, &peer_identity.device_id)?;
+    let peer = Some(peer_identity);
     crate::transport::connection::pin_connected_peer(&state.connections, &address, port, peer)
         .map_err(|e| e.to_string())
 }
@@ -130,6 +130,7 @@ pub async fn connect_discovered_peer(
     peer_device_id: String,
     peer_public_key: Vec<u8>,
 ) -> Result<String, String> {
+    ensure_not_local_device(&state.identity.public().device_id, &peer_device_id)?;
     if let Some(device) = state
         .discovery
         .list_devices()
@@ -203,6 +204,13 @@ fn peer_identity_from_args(
     }
 }
 
+fn ensure_not_local_device(local_device_id: &str, peer_device_id: &str) -> Result<(), String> {
+    if !peer_device_id.is_empty() && peer_device_id == local_device_id {
+        return Err("不能连接本机".to_string());
+    }
+    Ok(())
+}
+
 // ─── Online Devices ───
 
 #[tauri::command]
@@ -272,14 +280,36 @@ pub fn check_network_environment(
             detail: "自动发现已关闭，仍可使用手动 IP 连接。".to_string(),
         });
     } else if discovery.running && discovery.error.is_none() {
+        let announce_detail = if discovery.announce_interfaces.is_empty() {
+            "暂未识别到广播网卡".to_string()
+        } else {
+            format!("正在通过 {} 广播", discovery.announce_interfaces.join("；"))
+        };
         checks.push(NetworkCheckItem {
             label: "自动发现".to_string(),
             status: "ok".to_string(),
             detail: format!(
-                "发现服务运行中，监听 {}:{}。",
-                discovery.multicast_addr, discovery.multicast_port
+                "发现服务运行中，监听 {}:{}，{}。",
+                discovery.multicast_addr, discovery.multicast_port, announce_detail
             ),
         });
+        if !discovery.skipped_interfaces.is_empty() {
+            checks.push(NetworkCheckItem {
+                label: "自动发现网卡".to_string(),
+                status: "warn".to_string(),
+                detail: format!(
+                    "检测到低优先级 VPN/虚拟网卡：{}",
+                    discovery.skipped_interfaces.join("；")
+                ),
+            });
+        }
+        if !discovery.socket_errors.is_empty() {
+            checks.push(NetworkCheckItem {
+                label: "自动发现诊断".to_string(),
+                status: "warn".to_string(),
+                detail: discovery.socket_errors.join("；"),
+            });
+        }
     } else {
         checks.push(NetworkCheckItem {
             label: "自动发现".to_string(),
@@ -430,5 +460,20 @@ mod hex {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_not_local_device;
+
+    #[test]
+    fn reject_local_device_connection() {
+        assert!(ensure_not_local_device("local", "local").is_err());
+    }
+
+    #[test]
+    fn allow_remote_device_connection() {
+        assert!(ensure_not_local_device("local", "remote").is_ok());
     }
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::core::model::{HistoryEntry, HistoryReason};
+use crate::core::path_safety::{ensure_safe_for_mutation, safe_join, TaskRootHandle};
 
 /// Default history retention: 30 days in milliseconds.
 pub const DEFAULT_RETENTION_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -76,10 +77,11 @@ impl HistoryStore {
         relative_path: &str,
         now_unix_ms: i64,
     ) -> Result<HistoryEntry> {
-        let dest = self
-            .overwritten_dir()
-            .join(now_unix_ms.to_string())
-            .join(relative_path);
+        let dest = unique_history_dest(
+            self.overwritten_dir()
+                .join(now_unix_ms.to_string())
+                .join(relative_path),
+        );
         self.move_to_history(
             source,
             &dest,
@@ -87,6 +89,42 @@ impl HistoryStore {
             HistoryReason::Overwritten,
             now_unix_ms,
         )
+    }
+
+    /// Copy an existing file to a unique overwritten-history location while
+    /// leaving the live target in place. Receive commits use this form so a
+    /// failed replacement never removes the current target.
+    pub fn backup_to_overwritten(
+        &self,
+        source: &Path,
+        relative_path: &str,
+        now_unix_ms: i64,
+    ) -> Result<HistoryEntry> {
+        let dest = unique_history_dest(
+            self.overwritten_dir()
+                .join(now_unix_ms.to_string())
+                .join(relative_path),
+        );
+        let sync_root = self
+            .history_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("history has no task root"))?;
+        let root_handle = TaskRootHandle::new(sync_root)?;
+        let source_guard = root_handle.prepare_mutation(source)?;
+        let dest_guard = root_handle.prepare_mutation(&dest)?;
+        source_guard.validate()?;
+        dest_guard.validate()?;
+        let size = std::fs::copy(source, &dest)? as i64;
+        std::fs::File::open(&dest)?.sync_all()?;
+        Ok(HistoryEntry {
+            id: Uuid::new_v4(),
+            task_id: Uuid::nil(),
+            original_relative_path: relative_path.to_string(),
+            stored_path: dest.to_string_lossy().to_string(),
+            reason: HistoryReason::Overwritten,
+            created_unix_ms: now_unix_ms,
+            size,
+        })
     }
 
     /// Restore a history entry to its original relative path.
@@ -99,7 +137,18 @@ impl HistoryStore {
         now_unix_ms: i64,
     ) -> Result<PathBuf> {
         let source = Path::new(&entry.stored_path);
-        let original = sync_root.join(&entry.original_relative_path);
+        let history_root = self
+            .history_dir
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("history root is unavailable: {e}"))?;
+        let canonical_source = source
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("history source is unavailable: {e}"))?;
+        if !canonical_source.starts_with(&history_root) {
+            anyhow::bail!("UnsafePath: history source is outside task history");
+        }
+        ensure_safe_for_mutation(sync_root, source)?;
+        let original = safe_join(sync_root, &entry.original_relative_path)?;
 
         let dest = if original.exists() {
             // Original path occupied — use timestamped name
@@ -121,16 +170,24 @@ impl HistoryStore {
             let ts = dt.format("%Y-%m-%d %H%M%S").to_string();
 
             let restored_name = format!("{} (restored {}){}", stem, ts, ext);
-            sync_root.join(parent).join(restored_name)
+            let restored_relative = if parent.as_os_str().is_empty() {
+                restored_name
+            } else {
+                parent.join(restored_name).to_string_lossy().to_string()
+            };
+            safe_join(sync_root, &restored_relative)?
         } else {
             original
         };
 
         // Ensure parent directory exists
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let root_handle = TaskRootHandle::new(sync_root)?;
+        let source_guard = root_handle.prepare_mutation(source)?;
+        let dest_guard = root_handle.prepare_mutation(&dest)?;
+        ensure_safe_for_mutation(sync_root, &dest)?;
 
+        source_guard.validate()?;
+        dest_guard.validate()?;
         std::fs::rename(source, &dest)?;
         Ok(dest)
     }
@@ -219,10 +276,13 @@ impl HistoryStore {
         reason: HistoryReason,
         now_unix_ms: i64,
     ) -> Result<HistoryEntry> {
-        // Ensure destination directory exists
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let sync_root = self
+            .history_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("history has no task root"))?;
+        let root_handle = TaskRootHandle::new(sync_root)?;
+        let source_guard = root_handle.prepare_mutation(source)?;
+        let dest_guard = root_handle.prepare_mutation(dest)?;
 
         // Get file size before moving
         let size = std::fs::metadata(source)
@@ -230,6 +290,8 @@ impl HistoryStore {
             .unwrap_or(0);
 
         // Move the file
+        source_guard.validate()?;
+        dest_guard.validate()?;
         std::fs::rename(source, dest)?;
         if let Err(e) = self.cleanup_to_size_limit_preserving(DEFAULT_SIZE_LIMIT_BYTES, Some(dest))
         {

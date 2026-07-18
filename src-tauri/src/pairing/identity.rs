@@ -29,6 +29,7 @@ impl DeviceIdentity {
         if path.exists() {
             let bytes = std::fs::read(path)?;
             if bytes.len() == 32 {
+                harden_key_file_permissions(path)?;
                 let signing_key = SigningKey::from_bytes(
                     bytes
                         .as_slice()
@@ -44,6 +45,7 @@ impl DeviceIdentity {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, identity.signing_key.as_bytes())?;
+        harden_key_file_permissions(path)?;
         Ok(identity)
     }
 
@@ -77,6 +79,24 @@ impl DeviceIdentity {
     }
 }
 
+#[cfg(unix)]
+fn harden_key_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    if permissions.mode() & 0o777 != 0o600 {
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_key_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Simple hex encoding (avoiding extra dependency).
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
@@ -87,6 +107,8 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     #[test]
@@ -150,12 +172,23 @@ mod tests {
         let key_path = dir.path().join("identity.key");
 
         let id = DeviceIdentity::load_or_create(&key_path).unwrap();
-        let public = id.public();
 
         assert!(key_path.exists(), "key file should be created");
         let stored = std::fs::read(&key_path).unwrap();
         assert_eq!(stored.len(), 32, "stored key should be 32 bytes");
         assert_eq!(stored, id.key_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_creates_key_with_private_permissions() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("identity.key");
+
+        DeviceIdentity::load_or_create(&key_path).unwrap();
+
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
@@ -173,6 +206,22 @@ mod tests {
 
         assert_eq!(public1.device_id, public2.device_id);
         assert_eq!(public1.public_key, public2.public_key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_repairs_existing_key_permissions() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("identity.key");
+        std::fs::write(&key_path, [7u8; 32]).unwrap();
+        let mut permissions = std::fs::metadata(&key_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&key_path, permissions).unwrap();
+
+        DeviceIdentity::load_or_create(&key_path).unwrap();
+
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

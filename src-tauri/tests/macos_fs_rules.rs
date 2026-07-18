@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 use lanbridge::platform::macos::fs_rules;
 use lanbridge::platform::macos::MacPlatform;
 use lanbridge::platform::traits::{IgnoreDecision, IgnoreReason, Platform};

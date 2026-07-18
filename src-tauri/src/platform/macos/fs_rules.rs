@@ -1,7 +1,13 @@
 use crate::platform::traits::{IgnoreDecision, IgnoreReason};
 
 /// Exact file names to ignore on macOS.
-const EXACT_FILE_NAMES: &[&str] = &[".DS_Store", ".AppleDouble"];
+const EXACT_FILE_NAMES: &[&str] = &[
+    ".DS_Store",
+    ".AppleDouble",
+    crate::diagnostics::APP_LOG_FILE_NAME,
+    crate::diagnostics::STARTUP_CRASH_FILE_NAME,
+    crate::diagnostics::CRASH_DIAGNOSTICS_FILE_NAME,
+];
 
 /// Exact directory names to ignore (matched with trailing slash).
 const EXACT_DIR_NAMES: &[&str] = &[
@@ -120,6 +126,18 @@ mod tests {
         assert_eq!(
             classify_entry(".DS_Store", false),
             IgnoreDecision::Ignored(IgnoreReason::ExactName(".DS_Store".to_string()))
+        );
+        assert_eq!(
+            classify_entry("lanbridge.log", false),
+            IgnoreDecision::Ignored(IgnoreReason::ExactName("lanbridge.log".to_string()))
+        );
+        assert_eq!(
+            classify_entry("startup-crash.log", false),
+            IgnoreDecision::Ignored(IgnoreReason::ExactName("startup-crash.log".to_string()))
+        );
+        assert_eq!(
+            classify_entry("crash-diagnostics.log", false),
+            IgnoreDecision::Ignored(IgnoreReason::ExactName("crash-diagnostics.log".to_string()))
         );
     }
 

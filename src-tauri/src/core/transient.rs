@@ -24,6 +24,7 @@ pub fn is_protocol_ignored_component_name(entry_name: &str) -> bool {
         || is_lanbridge_transient_dir_name(entry_name)
         || is_lanbridge_partial_file_name(entry_name)
         || is_common_incomplete_download_name(entry_name)
+        || crate::diagnostics::INTERNAL_DIAGNOSTIC_FILE_NAMES.contains(&entry_name)
 }
 
 /// Platform-junk file names that should never block "empty directory" validation.
@@ -72,6 +73,9 @@ mod tests_ignored_entry {
     fn protocol_ignored_entries_are_ignored() {
         assert!(is_common_ignored_entry_name(".lanbridge-history", true));
         assert!(is_common_ignored_entry_name(".lanbridge-temp", true));
+        assert!(is_common_ignored_entry_name("lanbridge.log", false));
+        assert!(is_common_ignored_entry_name("startup-crash.log", false));
+        assert!(is_common_ignored_entry_name("crash-diagnostics.log", false));
         assert!(is_common_ignored_entry_name(
             "file.txt.lanbridge-partial",
             false

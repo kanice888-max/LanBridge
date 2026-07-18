@@ -1,7 +1,6 @@
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
-  acceptTaskInvite,
   checkNetworkEnvironment,
   connectDiscoveredPeer,
   connectPeer,
@@ -9,13 +8,10 @@ import {
   getLocalNetworkInfo,
   inspectTaskFolder,
   listOnlineDevices,
-  listTaskInvites,
   pollTaskInvite,
-  rejectTaskInvite,
   sendTaskInvite,
   syncNow,
   type DiscoveryStatus,
-  type IncomingTaskInviteInfo,
   type LocalNetworkInfo,
   type NetworkDiagnosticReport,
   type OnlineDevice,
@@ -26,13 +22,11 @@ import { AnimatedFolder } from "../../components/AnimatedFolder";
 import { useShadowTarget } from "../../components/ShadowLayer";
 import { useFolderTransitionTarget } from "../../components/FolderPageTransition";
 import { TopMessageList, type TopMessage } from "../../components/TopMessageList";
-import {
-  ChevronDownIcon,
-  ChevronLeftIcon,
-  ChevronUpIcon,
-} from "../../components/icons/animate-icons";
+import { ChevronLeftIcon } from "../../components/icons/animate-icons";
 import { pickFolder } from "../../lib/folderPicker";
 import { useTranslation } from "../../lib/i18n/context";
+import primaryRoleIcon from "../../assets/role-primary.svg";
+import secondaryRoleIcon from "../../assets/role-secondary.svg";
 
 interface PairingScreenProps {
   onComplete: () => void;
@@ -46,28 +40,48 @@ function folderName(path: string) {
   return path.replace(/[/\\]$/, "").split(/[/\\]/).pop() || path;
 }
 
-function formatPairingError(error: unknown) {
+function formatPairingError(error: unknown, t: ReturnType<typeof useTranslation>["t"]) {
   const message = String(error);
+  const normalized = message.toLowerCase();
   if (message.includes("must be empty") || message.includes("non-ignored")) {
-    return "请选择一个空文件夹";
+    return t.pairingErrors.emptyFolder;
   }
-  if (message.includes("exceeds primary folder size limit") || message.includes("超过 2GB")) {
-    return "文件夹超过 2GB，请选择更小的文件夹";
+  if (message.includes("exceeds primary folder size limit") || message.includes("2GB")) {
+    return t.pairingErrors.folderTooLarge;
   }
   if (message.includes("invite local path must exist")) {
-    return "文件夹不存在";
+    return t.pairingErrors.folderMissing;
   }
   if (message.includes("invite local path must be a directory")) {
-    return "请选择文件夹";
+    return t.pairingErrors.chooseFolder;
   }
   if (message.includes("sync folder overlaps with existing task")) {
-    return "该文件夹已用于其他任务";
+    return t.pairingErrors.folderInUse;
   }
-  if (message.includes("connection refused")) {
-    return "连接被拒绝，请确认对方已打开 LanBridge";
+  if (message.includes("对端版本不兼容") || normalized.includes("version is incompatible")) {
+    return t.pairing.versionIncompatible;
   }
-  if (message.includes("timed out") || message.includes("timeout")) {
-    return "连接超时，请检查网络环境";
+  if (message.includes("不能连接本机") || normalized.includes("connect local device")) {
+    return t.pairingErrors.selfConnect;
+  }
+  if (
+    message.includes("无法连接对端") ||
+    normalized.includes("no route to host") ||
+    normalized.includes("network is unreachable") ||
+    normalized.includes("host is down") ||
+    normalized.includes("os error 65") ||
+    normalized.includes("os error 51") ||
+    normalized.includes("os error 113") ||
+    normalized.includes("os error 10051") ||
+    normalized.includes("os error 10065")
+  ) {
+    return t.pairingErrors.networkUnreachable;
+  }
+  if (message.includes("对端未监听") || normalized.includes("connection refused")) {
+    return t.pairingErrors.connectionRefused;
+  }
+  if (message.includes("对端未响应") || normalized.includes("timed out") || normalized.includes("timeout")) {
+    return t.pairingErrors.connectionTimeout;
   }
   return message.replace(/^Error:\s*/, "");
 }
@@ -96,9 +110,9 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
   const [taskName, setTaskName] = useState("");
   const [role, setRole] = useState<"Primary" | "Secondary">("Primary");
   const [pendingInvite, setPendingInvite] = useState<TaskInviteProgress | null>(null);
-  const [incomingInvites, setIncomingInvites] = useState<IncomingTaskInviteInfo[]>([]);
-  const [invitePaths, setInvitePaths] = useState<Record<string, string>>({});
+  const discoveryDisabled = discoveryStatus?.enabled === false;
   const carouselRef = useRef<HTMLDivElement | null>(null);
+  const mountedRef = useRef(true);
   const dragState = useRef<{
     x: number;
     left: number;
@@ -110,50 +124,44 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
 
   const refreshDiscovery = useCallback(async () => {
     const [online, status] = await Promise.all([listOnlineDevices(), getDiscoveryStatus()]);
+    if (!mountedRef.current) return;
     setDevices(online);
     setDiscoveryStatus(status);
   }, []);
 
-  const refreshInvites = useCallback(async () => {
-    try {
-      const invites = await listTaskInvites();
-      const pending = invites.filter((invite) => invite.status === "Pending");
-      setIncomingInvites(pending);
-      setInvitePaths((prev) => {
-        const next = { ...prev };
-        for (const invite of pending) {
-          if (!next[invite.invite_id]) next[invite.invite_id] = invite.local_path || "";
-        }
-        return next;
-      });
-    } catch {
-      // The discovery screen should stay usable even if invite polling fails.
-    }
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
 
   useEffect(() => {
-    getLocalNetworkInfo().then(setLocalNetwork).catch(() => {});
+    getLocalNetworkInfo().then((info) => {
+      if (mountedRef.current) setLocalNetwork(info);
+    }).catch(() => {});
     refreshDiscovery();
-    refreshInvites();
     const id = window.setInterval(() => {
       refreshDiscovery().catch(() => {});
-      refreshInvites();
     }, 2500);
     return () => window.clearInterval(id);
-  }, [refreshDiscovery, refreshInvites]);
+  }, [refreshDiscovery]);
 
   useEffect(() => {
     if (refreshToken === 0) return;
-    getLocalNetworkInfo().then(setLocalNetwork).catch(() => {});
+    getLocalNetworkInfo().then((info) => {
+      if (mountedRef.current) setLocalNetwork(info);
+    }).catch(() => {});
     refreshDiscovery().catch(() => {});
-    refreshInvites();
-  }, [refreshDiscovery, refreshInvites, refreshToken]);
+  }, [refreshDiscovery, refreshToken]);
 
   useEffect(() => {
     if (!pendingInvite || pendingInvite.status !== "Pending") return;
+    let disposed = false;
     const poll = async () => {
       try {
         const progress = await pollTaskInvite(pendingInvite.invite_id);
+        if (disposed) return;
         if (progress.status === "Accepted" && progress.task) {
           setPendingInvite(null);
           await runInitialSyncIfPrimary(progress.task);
@@ -167,12 +175,15 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
         }
         setPendingInvite(progress);
       } catch (e) {
-        setError(String(e));
+        if (!disposed) setError(String(e));
       }
     };
     poll();
     const id = window.setInterval(poll, 1800);
-    return () => window.clearInterval(id);
+    return () => {
+      disposed = true;
+      window.clearInterval(id);
+    };
   }, [
     onComplete,
     pendingInvite?.invite_id,
@@ -182,13 +193,13 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
 
   const ensureFolderAllowed = async (path: string, nextRole: string) => {
     const inspection = await inspectTaskFolder(path, nextRole);
-    if (!inspection.exists) throw new Error("文件夹不存在");
-    if (!inspection.is_dir) throw new Error("请选择文件夹");
+    if (!inspection.exists) throw new Error("invite local path must exist");
+    if (!inspection.is_dir) throw new Error("invite local path must be a directory");
     if (nextRole === "Secondary" && !inspection.is_empty) {
-      throw new Error("请选择一个空文件夹");
+      throw new Error("must be empty");
     }
     if (nextRole === "Primary" && inspection.over_limit) {
-      throw new Error("文件夹超过 2GB，请选择更小的文件夹");
+      throw new Error("exceeds primary folder size limit");
     }
   };
 
@@ -197,11 +208,15 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
     try {
       await syncNow(nextTask.id);
     } catch (e) {
-      setError(formatPairingError(e));
+      setError(formatPairingError(e, t));
     }
   };
 
   const handleSelectDevice = async (device: OnlineDevice) => {
+    if (!device.compatible) {
+      setError(device.compatibility_reason || t.pairing.versionIncompatible);
+      return;
+    }
     setConnecting(true);
     setError(null);
     try {
@@ -213,7 +228,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
       });
       setStep("role");
     } catch (e) {
-      setError(formatPairingError(e));
+      setError(formatPairingError(e, t));
     } finally {
       setConnecting(false);
     }
@@ -233,7 +248,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
       setPanel("none");
       setStep("role");
     } catch (e) {
-      setError(formatPairingError(e));
+      setError(formatPairingError(e, t));
     } finally {
       setConnecting(false);
     }
@@ -250,7 +265,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
     try {
       setNetworkReport(await checkNetworkEnvironment());
     } catch (e) {
-      setError(formatPairingError(e));
+      setError(formatPairingError(e, t));
     } finally {
       setCheckingNetwork(false);
     }
@@ -266,7 +281,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
       if (!taskName.trim()) setTaskName(folderName(folder));
       setStep("invite");
     } catch (e) {
-      setError(formatPairingError(e));
+      setError(formatPairingError(e, t));
     }
   };
 
@@ -288,47 +303,13 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
       }
       setPendingInvite(progress);
     } catch (e) {
-      setError(formatPairingError(e));
-    }
-  };
-
-  const handlePickInviteFolder = async (invite: IncomingTaskInviteInfo) => {
-    setError(null);
-    try {
-      const folder = await pickFolder(t.dashboard.chooseFolder);
-      if (folder) {
-        await ensureFolderAllowed(folder, invite.proposed_role);
-        setInvitePaths((prev) => ({ ...prev, [invite.invite_id]: folder }));
-      }
-    } catch (e) {
-      setError(formatPairingError(e));
-    }
-  };
-
-  const handleAcceptInvite = async (invite: IncomingTaskInviteInfo) => {
-    const path = invitePaths[invite.invite_id]?.trim();
-    if (!path) {
-      setToast(t.dashboard.invitePathRequired);
-      return;
-    }
-    try {
-      await ensureFolderAllowed(path, invite.proposed_role);
-      const task = await acceptTaskInvite(invite.invite_id, path);
-      await runInitialSyncIfPrimary(task);
-      await refreshInvites();
-      onComplete();
-    } catch (e) {
-      const message = formatPairingError(e);
-      if (message === "请选择一个空文件夹") {
-        setToast(message);
-      } else {
-        setError(message);
-      }
+      setError(formatPairingError(e, t));
     }
   };
 
   const stepIndex =
     step === "role" ? 1 : step === "folder" ? 2 : step === "invite" ? 3 : 0;
+  const isConnectionStep = step === "role" || step === "folder" || step === "invite";
   const springTransition = reduceMotion
     ? { duration: 0 }
     : { type: "spring" as const, stiffness: 520, damping: 34 };
@@ -346,7 +327,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
       ? [{
           id: "waiting-invite",
           tone: "info" as const,
-          title: "等待对方接受",
+          title: t.pairing.waitingPeerAccept,
           detail: selectedPeer.displayName,
           className: "invite-wait-message",
           action: (
@@ -373,6 +354,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
     targetSelector: ".stage-folder",
   });
   const folderTransitionTarget = useFolderTransitionTarget("discover");
+  const preferredLocalInterface = localNetwork?.preferred_interface || localNetwork?.interfaces?.[0] || null;
 
   const onWheel = (event: React.WheelEvent<HTMLDivElement>) => {
     if (!carouselRef.current) return;
@@ -424,24 +406,8 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
   };
 
   return (
-    <section className={`discover-stage step-${step}`}>
+    <section className={`discover-stage step-${step} ${isConnectionStep ? "connection-step-active" : ""}`}>
       <TopMessageList messages={topMessages} />
-
-      {incomingInvites[0] && (
-        <IncomingInviteCard
-          invite={incomingInvites[0]}
-          path={invitePaths[incomingInvites[0].invite_id] || ""}
-          onPathChange={(value) =>
-            setInvitePaths((prev) => ({ ...prev, [incomingInvites[0].invite_id]: value }))
-          }
-          onPick={() => handlePickInviteFolder(incomingInvites[0])}
-          onAccept={() => handleAcceptInvite(incomingInvites[0])}
-          onReject={async () => {
-            await rejectTaskInvite(incomingInvites[0].invite_id, "rejected by peer");
-            await refreshInvites();
-          }}
-        />
-      )}
 
       <div className="discover-tools">
         <div className="discover-tool-anchor">
@@ -454,13 +420,13 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
           </button>
           {panel === "address" && (
             <div className="utility-popover address">
-              <span className="stage-section-label">本机地址</span>
+              <span className="stage-section-label">{t.pairing.localAddress}</span>
               <div className="info-popover-grid compact">
-                <span>设备</span>
-                <strong>{localNetwork?.interfaces[0]?.name || "LanBridge"}</strong>
+                <span>{t.pairing.device}</span>
+                <strong>{preferredLocalInterface?.name || "LanBridge"}</strong>
                 <span>IP</span>
-                <strong>{localNetwork?.interfaces[0]?.ip || "-"}</strong>
-                <span>端口</span>
+                <strong>{preferredLocalInterface?.ip || "-"}</strong>
+                <span>{t.pairing.port}</span>
                 <strong>{localNetwork?.tcp_port || "-"}</strong>
               </div>
             </div>
@@ -473,7 +439,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
             setStep(step === "manual" ? "discover" : "manual");
           }}
         >
-          手动输入
+          {t.pairing.manualInput}
         </button>
         <div className="discover-tool-anchor network-anchor">
           <button className={`mini-pill-btn ${panel === "network" ? "active" : ""}`} onClick={handleCheckNetwork}>
@@ -482,7 +448,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
           {panel === "network" && (
             <div className="utility-popover network">
               <div className="network-report">
-                <h3>{networkReport?.ok ? "网络检查通过" : "网络检查"}</h3>
+                <h3>{networkReport?.ok ? t.pairing.networkOk : t.pairing.networkTitle}</h3>
                 {networkReport?.checks.map((check) => (
                   <div key={`${check.label}-${check.detail}`} className={`network-line ${check.status}`}>
                     <span />
@@ -498,7 +464,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
         </div>
       </div>
 
-      <div className="discover-center">
+      <div className={`discover-center ${isConnectionStep ? "connection-step-active" : ""}`}>
         <div
           className={`folder-shadow-host discover-folder-host ${folderTransitionTarget.hidden ? "folder-transition-hidden" : ""}`}
           ref={(element) => {
@@ -512,76 +478,15 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
               status={pendingInvite ? "syncing" : "idle"}
               size="clamp(300px, 34vw, 330px)"
               externalShadow
+              decorative
               className="stage-folder"
             />
           </div>
         </div>
 
-        <div className="discover-below-stage">
-          <AnimatePresence mode="wait" initial={false}>
-            {step === "discover" && (
-              <motion.div
-                key="discover-copy"
-                className="discover-copy"
-                initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
-                transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
-              >
-                <strong>自动发现中<LoadingDots /></strong>
-                <span>
-                  正在监听 {discoveryStatus?.multicast_addr || "239.10.10.10"}:
-                  {discoveryStatus?.multicast_port || 53530}
-                </span>
-              </motion.div>
-            )}
-
-            {step === "manual" && (
-              <motion.div
-                key="manual-flow"
-                className="manual-flow"
-                initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
-                transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
-              >
-                <button className="manual-flow-title" onClick={() => setStep("discover")}>
-                  <ChevronLeftIcon size={18} />
-                  手动输入
-                </button>
-
-                <div className="manual-flow-form">
-                  <label className="manual-field manual-ip-field">
-                    <span>对端IP</span>
-                    <input
-                      value={address}
-                      onChange={(e) => setAddress(e.target.value)}
-                      placeholder="请输入对端IP"
-                    />
-                  </label>
-                  <label className="manual-field manual-port-field">
-                    <span>端口</span>
-                    <input
-                      value={port}
-                      onChange={(e) => setPort(e.target.value)}
-                      placeholder="9527"
-                    />
-                  </label>
-                  <button
-                    className="manual-connect-btn"
-                    onClick={handleManualConnect}
-                    disabled={connecting || !address.trim()}
-                  >
-                    {connecting ? t.pairing.connecting : t.pairing.connect}
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-
-        {step !== "discover" && step !== "manual" && (
-          <div className={`connection-flow ${step === "invite" ? "invite-flow" : ""}`}>
+        {isConnectionStep ? (
+          <div className="pairing-workflow-slot">
+            <div className={`connection-flow ${step === "invite" ? "invite-flow" : ""}`}>
             {step === "invite" && (
               <div className="invite-project-name-zone">
                 <input
@@ -589,13 +494,13 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
                   value={taskName}
                   onChange={(e) => setTaskName(e.target.value)}
                   placeholder={folderName(localPath)}
-                  aria-label="项目名称"
+                  aria-label={t.pairing.taskName}
                 />
               </div>
             )}
 
             <div className="stage-stepper">
-              {["选择角色", "选择目标文件夹", "发送邀请"].map((label, index) => {
+              {[t.pairing.stepRole, t.pairing.stepFolder, t.pairing.stepInvite].map((label, index) => {
                 const stepNumber = index + 1;
                 const enabled = stepNumber <= stepIndex;
                 return (
@@ -637,14 +542,14 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
             {step === "role" && (
               <div className="role-choice-grid">
                 <button className={role === "Primary" ? "active" : ""} onClick={() => { setRole("Primary"); setStep("folder"); }}>
-                  <span />
-                  <strong>主机</strong>
-                  <small>自动同步</small>
+                  <img className="role-choice-icon" src={primaryRoleIcon} alt="" aria-hidden="true" />
+                  <strong>{t.role.primary}</strong>
+                  <small>{t.pairing.autoSync}</small>
                 </button>
                 <button className={role === "Secondary" ? "active" : ""} onClick={() => { setRole("Secondary"); setStep("folder"); }}>
-                  <span />
-                  <strong>副机</strong>
-                  <small>手动同步</small>
+                  <img className="role-choice-icon" src={secondaryRoleIcon} alt="" aria-hidden="true" />
+                  <strong>{t.role.secondary}</strong>
+                  <small>{t.pairing.manualSync}</small>
                 </button>
               </div>
             )}
@@ -654,7 +559,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
                 <input
                   value={localPath}
                   onChange={(e) => setLocalPath(e.target.value)}
-                  placeholder="请选择一个空文件夹"
+                  placeholder={role === "Primary" ? t.pairing.syncFolderPlaceholder : t.pairing.emptyFolderPlaceholder}
                 />
                 <button onClick={handlePickFolder}>{t.pairing.chooseFolder}</button>
               </div>
@@ -667,10 +572,83 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
                   onClick={handleSendInvite}
                   disabled={pendingInvite?.status === "Pending" || !selectedPeer}
                 >
-                  {pendingInvite?.status === "Pending" ? t.pairing.inviteSent : "发送邀请"}
+                  {pendingInvite?.status === "Pending" ? t.pairing.inviteSent : t.pairing.sendInvite}
                 </button>
               </div>
             )}
+            </div>
+          </div>
+        ) : (
+          <div className="discover-below-stage">
+            <AnimatePresence mode="wait" initial={false}>
+              {step === "discover" && (
+                <motion.div
+                  key="discover-copy"
+                  className="discover-copy"
+                  initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
+                  transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
+                >
+                  <strong>
+                    {discoveryDisabled ? t.pairing.discoveryDisabled : <>{t.pairing.discovering}<LoadingDots /></>}
+                  </strong>
+                  <span>
+                    {discoveryDisabled
+                      ? t.pairing.manualStillAvailable
+                      : t.pairing.discoverySummary
+                          .replace("{addr}", discoveryStatus?.multicast_addr || "239.10.10.10")
+                          .replace("{port}", String(discoveryStatus?.multicast_port || 53530))}
+                  </span>
+                </motion.div>
+              )}
+
+              {step === "manual" && (
+                <motion.div
+                  key="manual-flow"
+                  className="manual-flow"
+                  initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
+                  transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
+                >
+                  <button
+                    className="manual-flow-title"
+                    type="button"
+                    onClick={() => setStep("discover")}
+                  >
+                    <ChevronLeftIcon size={18} />
+                    {t.pairing.manualInput}
+                  </button>
+
+                  <div className="manual-flow-form">
+                    <label className="manual-field manual-ip-field">
+                      <span>{t.pairing.peerIpShort}</span>
+                      <input
+                        value={address}
+                        onChange={(e) => setAddress(e.target.value)}
+                        placeholder={t.pairing.peerIpPlaceholder}
+                      />
+                    </label>
+                    <label className="manual-field manual-port-field">
+                      <span>{t.pairing.port}</span>
+                      <input
+                        value={port}
+                        onChange={(e) => setPort(e.target.value)}
+                        placeholder="9527"
+                      />
+                    </label>
+                    <button
+                      className="manual-connect-btn"
+                      onClick={handleManualConnect}
+                      disabled={connecting || !address.trim()}
+                    >
+                      {connecting ? t.pairing.connecting : t.pairing.connect}
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         )}
       </div>
@@ -678,7 +656,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
       {step === "discover" && (
         <div className="device-carousel-wrap">
           <div
-            className="device-carousel"
+            className={`device-carousel ${devices.length === 0 ? "is-empty" : ""}`}
             ref={carouselRef}
             onWheel={onWheel}
             onPointerDown={onPointerDown}
@@ -688,20 +666,24 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
           >
             {devices.length === 0 ? (
               <div className="device-card ghost">
-                <strong>{t.pairing.noDevices}</strong>
-                <span>{t.pairing.noDevicesDesc}</span>
+                <strong>{discoveryDisabled ? t.pairing.discoveryDisabled : t.pairing.noDevices}</strong>
+                <span>{discoveryDisabled ? t.pairing.discoveryDisabledDesc : t.pairing.noDevicesDesc}</span>
               </div>
             ) : (
               devices.map((device) => (
                 <button
                   key={device.device_id}
-                  className="device-card"
+                  className={`device-card ${device.compatible ? "" : "incompatible"}`}
                   onClick={(event) => handleDeviceCardClick(event, device)}
-                  disabled={connecting}
+                  disabled={connecting || !device.compatible}
                 >
                   <strong>{device.display_name}</strong>
                   <span>{device.ip}:{device.port}</span>
-                  <em className="online-dot">{t.pairing.online}</em>
+                  <em className={device.compatible ? "online-dot" : "compatibility-dot"}>
+                    {device.compatible
+                      ? t.pairing.online
+                      : device.compatibility_reason || t.pairing.versionIncompatibleShort}
+                  </em>
                 </button>
               ))
             )}
@@ -719,51 +701,5 @@ function LoadingDots() {
       <i />
       <i />
     </span>
-  );
-}
-
-function IncomingInviteCard({
-  invite,
-  path,
-  onPathChange,
-  onPick,
-  onAccept,
-  onReject,
-}: {
-  invite: IncomingTaskInviteInfo;
-  path: string;
-  onPathChange: (value: string) => void;
-  onPick: () => void;
-  onAccept: () => void;
-  onReject: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className={`incoming-invite-card ${open ? "open" : ""}`}>
-      <button className="incoming-invite-head" onClick={() => setOpen((value) => !value)}>
-        <div>
-          <strong>{invite.task_name || "对方项目名"}</strong>
-          <span>对方请求连接</span>
-        </div>
-        <span className="incoming-invite-chevron">
-          {open
-            ? <ChevronUpIcon size={18} isAnimated={false} />
-            : <ChevronDownIcon size={18} isAnimated={false} />}
-        </span>
-      </button>
-      {open && (
-        <div className="incoming-invite-body">
-          <label>选择目标文件夹</label>
-          <div className="folder-input-row compact">
-            <input value={path} onChange={(e) => onPathChange(e.target.value)} placeholder="请选择空文件夹" />
-            <button onClick={onPick}>选择</button>
-          </div>
-          <div className="incoming-actions">
-            <button className="mini-dark-btn" onClick={onAccept}>接受</button>
-            <button className="mini-danger-btn" onClick={onReject}>⊘</button>
-          </div>
-        </div>
-      )}
-    </div>
   );
 }

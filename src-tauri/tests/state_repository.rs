@@ -3,6 +3,7 @@ use lanbridge::state::db;
 use lanbridge::state::repository::*;
 use rusqlite::{params, Connection};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 use uuid::Uuid;
 
 fn now_ms() -> i64 {
@@ -21,6 +22,57 @@ fn setup_db() -> Connection {
 }
 
 #[test]
+fn peer_connection_state_persists_and_rejects_stale_revisions() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+    {
+        let conn = db::open_db(&path).unwrap();
+        db::migrate(&conn).unwrap();
+        PairedDeviceRepository::new(&conn)
+            .upsert(&PairedDevice {
+                device_id: "peer-a".to_string(),
+                display_name: "Peer A".to_string(),
+                public_key: vec![1, 2, 3],
+                last_seen_unix_ms: 1,
+                trusted: true,
+                last_address: Some("192.168.1.5:9527".to_string()),
+            })
+            .unwrap();
+        let repo = PeerConnectionStateRepository::new(&conn);
+        let disconnected = repo.set_local_disconnected("peer-a", true, 10).unwrap();
+        assert!(disconnected.local_disconnected);
+        assert_eq!(disconnected.local_revision, 1);
+
+        let duplicate = repo.set_local_disconnected("peer-a", true, 11).unwrap();
+        assert_eq!(duplicate.local_revision, 1);
+
+        assert!(repo
+            .apply_remote_disconnected("peer-a", true, 5, 12)
+            .unwrap());
+        assert!(!repo
+            .apply_remote_disconnected("peer-a", false, 4, 13)
+            .unwrap());
+    }
+
+    let conn = db::open_db(&path).unwrap();
+    db::migrate(&conn).unwrap();
+    let restored = PeerConnectionStateRepository::new(&conn)
+        .get("peer-a")
+        .unwrap()
+        .unwrap();
+    assert!(restored.local_disconnected);
+    assert_eq!(restored.local_revision, 1);
+    assert!(restored.remote_disconnected);
+    assert_eq!(restored.remote_revision, Some(5));
+
+    let reconnected = PeerConnectionStateRepository::new(&conn)
+        .set_local_disconnected("peer-a", false, 14)
+        .unwrap();
+    assert!(!reconnected.local_disconnected);
+    assert_eq!(reconnected.local_revision, 2);
+}
+
+#[test]
 fn test_sync_task_crud() {
     let conn = setup_db();
     let repo = SyncTaskRepository::new(&conn);
@@ -36,6 +88,7 @@ fn test_sync_task_crud() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
 
     repo.insert(&task).unwrap();
@@ -51,6 +104,12 @@ fn test_sync_task_crud() {
     repo.update_enabled(&task.id, false, now_ms()).unwrap();
     let updated = repo.get(&task.id).unwrap().unwrap();
     assert!(!updated.enabled);
+    assert_eq!(updated.last_transfer_activity_unix_ms, 0);
+
+    repo.mark_transfer_activity(&task.id, 123).unwrap();
+    repo.mark_transfer_activity(&task.id, 100).unwrap();
+    let active = repo.get(&task.id).unwrap().unwrap();
+    assert_eq!(active.last_transfer_activity_unix_ms, 123);
 }
 
 #[test]
@@ -95,6 +154,7 @@ fn test_file_snapshot_upsert() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     task_repo.insert(&task).unwrap();
 
@@ -146,6 +206,7 @@ fn test_file_snapshot_replace_for_task_removes_stale_paths() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     task_repo.insert(&task).unwrap();
 
@@ -196,6 +257,7 @@ fn test_file_snapshot_replace_for_task_rolls_back_on_failure() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     task_repo.insert(&task).unwrap();
 
@@ -245,6 +307,7 @@ fn test_sync_baseline_list_by_task_includes_paths_without_snapshots() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     task_repo.insert(&task).unwrap();
 
@@ -286,6 +349,7 @@ fn test_pending_return_operations() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     task_repo.insert(&task).unwrap();
 
@@ -313,6 +377,112 @@ fn test_pending_return_operations() {
 }
 
 #[test]
+fn test_remove_tree_escapes_like_wildcards() {
+    let conn = setup_db();
+    let task_repo = SyncTaskRepository::new(&conn);
+    let task = SyncTask {
+        id: Uuid::new_v4(),
+        name: "LIKE escaping".to_string(),
+        primary_device_id: "a".to_string(),
+        secondary_device_id: "b".to_string(),
+        local_path: "/tmp/a".to_string(),
+        remote_path: "/tmp/b".to_string(),
+        local_role: DeviceRole::Secondary,
+        enabled: true,
+        created_unix_ms: now_ms(),
+        updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
+    };
+    task_repo.insert(&task).unwrap();
+
+    let snapshot_repo = FileSnapshotRepository::new(&conn);
+    let baseline_repo = SyncBaselineRepository::new(&conn);
+    let pending_repo = PendingReturnRepository::new(&conn);
+    for path in ["a%b/child.txt", "aXb/child.txt", "a_b/child.txt"] {
+        snapshot_repo
+            .upsert(&FileSnapshot {
+                task_id: task.id,
+                relative_path: path.to_string(),
+                kind: EntryKind::File,
+                size: 1,
+                modified_unix_ms: 1,
+                blake3_hash: Some("hash".to_string()),
+                hash_status: HashStatus::Verified,
+                deleted: false,
+                is_symlink: false,
+            })
+            .unwrap();
+        baseline_repo
+            .upsert(&SyncBaseline {
+                task_id: task.id,
+                relative_path: path.to_string(),
+                primary_hash: Some("hash".to_string()),
+                primary_hash_status: HashStatus::Verified,
+                primary_size: 1,
+                secondary_size: 1,
+                primary_modified_unix_ms: 1,
+                secondary_hash: Some("hash".to_string()),
+                secondary_hash_status: HashStatus::Verified,
+                secondary_modified_unix_ms: 1,
+                last_synced_unix_ms: 1,
+            })
+            .unwrap();
+        pending_repo
+            .upsert(&PendingReturnChange {
+                task_id: task.id,
+                relative_path: path.to_string(),
+                change_kind: ChangeKind::Modified,
+                secondary_hash: Some("hash".to_string()),
+                secondary_hash_status: HashStatus::Verified,
+                secondary_modified_unix_ms: 1,
+                created_unix_ms: 1,
+            })
+            .unwrap();
+    }
+
+    snapshot_repo.remove_tree(&task.id, "a%b").unwrap();
+    baseline_repo.remove_tree(&task.id, "a%b").unwrap();
+    pending_repo.remove_tree(&task.id, "a%b").unwrap();
+
+    assert!(snapshot_repo
+        .get(&task.id, "a%b/child.txt")
+        .unwrap()
+        .is_none());
+    assert!(baseline_repo
+        .get(&task.id, "a%b/child.txt")
+        .unwrap()
+        .is_none());
+    assert!(pending_repo
+        .get(&task.id, "a%b/child.txt")
+        .unwrap()
+        .is_none());
+    assert!(snapshot_repo
+        .get(&task.id, "aXb/child.txt")
+        .unwrap()
+        .is_some());
+    assert!(baseline_repo
+        .get(&task.id, "aXb/child.txt")
+        .unwrap()
+        .is_some());
+    assert!(pending_repo
+        .get(&task.id, "aXb/child.txt")
+        .unwrap()
+        .is_some());
+
+    snapshot_repo.remove_tree(&task.id, "a_b").unwrap();
+    baseline_repo.remove_tree(&task.id, "a_b").unwrap();
+    pending_repo.remove_tree(&task.id, "a_b").unwrap();
+    assert!(snapshot_repo
+        .get(&task.id, "a_b/child.txt")
+        .unwrap()
+        .is_none());
+    assert!(snapshot_repo
+        .get(&task.id, "aXb/child.txt")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn test_history_operations() {
     let conn = setup_db();
     let task_repo = SyncTaskRepository::new(&conn);
@@ -329,6 +499,7 @@ fn test_history_operations() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     task_repo.insert(&task).unwrap();
 
@@ -368,6 +539,7 @@ fn test_deferred_transfer_operations() {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     task_repo.insert(&task).unwrap();
 

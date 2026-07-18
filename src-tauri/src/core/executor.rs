@@ -15,6 +15,19 @@ pub struct ExecutionResult {
     pub retryable: bool,
 }
 
+fn db_state_failure(
+    relative_path: impl Into<String>,
+    operation: &str,
+    error: impl std::fmt::Display,
+) -> ExecutionResult {
+    ExecutionResult {
+        relative_path: relative_path.into(),
+        success: false,
+        error: Some(format!("{} failed: {}", operation, error)),
+        retryable: true,
+    }
+}
+
 /// Execute a list of planned sync actions.
 ///
 /// P0: Serial execution per task. Each file succeeds or fails independently.
@@ -182,11 +195,15 @@ fn execute_move_to_history(
         Ok(mut entry) => {
             entry.task_id = task.id;
             let history_repo = HistoryRepository::new(conn);
-            let _ = history_repo.insert(&entry);
+            if let Err(e) = history_repo.insert(&entry) {
+                return db_state_failure(action.relative_path.clone(), "history record insert", e);
+            }
 
             // Update snapshot as deleted
             let snap_repo = FileSnapshotRepository::new(conn);
-            let _ = snap_repo.mark_deleted(&task.id, &action.relative_path);
+            if let Err(e) = snap_repo.mark_deleted(&task.id, &action.relative_path) {
+                return db_state_failure(action.relative_path.clone(), "snapshot mark deleted", e);
+            }
 
             ExecutionResult {
                 relative_path: action.relative_path.clone(),
@@ -428,7 +445,14 @@ pub fn execute_return_sync(
                         match history.move_to_trash(&target, path, now) {
                             Ok(mut entry) => {
                                 entry.task_id = task.id;
-                                let _ = HistoryRepository::new(conn).insert(&entry);
+                                if let Err(e) = HistoryRepository::new(conn).insert(&entry) {
+                                    results.push(db_state_failure(
+                                        path.clone(),
+                                        "return-delete history record insert",
+                                        e,
+                                    ));
+                                    continue;
+                                }
                             }
                             Err(e) => {
                                 results.push(ExecutionResult {
@@ -444,8 +468,22 @@ pub fn execute_return_sync(
                             }
                         }
                     }
-                    let _ = baseline_repo.remove(&task.id, path);
-                    let _ = pending_repo.remove(&task.id, path);
+                    if let Err(e) = baseline_repo.remove(&task.id, path) {
+                        results.push(db_state_failure(
+                            path.clone(),
+                            "return-delete baseline cleanup",
+                            e,
+                        ));
+                        continue;
+                    }
+                    if let Err(e) = pending_repo.remove(&task.id, path) {
+                        results.push(db_state_failure(
+                            path.clone(),
+                            "return-delete pending cleanup",
+                            e,
+                        ));
+                        continue;
+                    }
                     results.push(ExecutionResult {
                         relative_path: path.clone(),
                         success: true,
@@ -500,7 +538,14 @@ pub fn execute_return_sync(
 
                 match baseline_repo.upsert(&baseline) {
                     Ok(_) => {
-                        let _ = pending_repo.remove(&task.id, path);
+                        if let Err(e) = pending_repo.remove(&task.id, path) {
+                            results.push(db_state_failure(
+                                path.clone(),
+                                "return-sync pending cleanup",
+                                e,
+                            ));
+                            continue;
+                        }
                         results.push(ExecutionResult {
                             relative_path: path.clone(),
                             success: true,
@@ -583,7 +628,13 @@ pub fn execute_confirmed_overwrite(
             Ok(mut entry) => {
                 entry.task_id = task.id;
                 let history_repo = HistoryRepository::new(conn);
-                let _ = history_repo.insert(&entry);
+                if let Err(e) = history_repo.insert(&entry) {
+                    return db_state_failure(
+                        relative_path.to_string(),
+                        "overwrite backup history record insert",
+                        e,
+                    );
+                }
             }
             Err(e) => {
                 return ExecutionResult {
@@ -632,7 +683,9 @@ pub fn execute_confirmed_overwrite(
     match baseline_repo.upsert(&baseline) {
         Ok(_) => {
             // Remove pending return
-            let _ = pending_repo.remove(&task.id, relative_path);
+            if let Err(e) = pending_repo.remove(&task.id, relative_path) {
+                return db_state_failure(relative_path.to_string(), "overwrite pending cleanup", e);
+            }
 
             ExecutionResult {
                 relative_path: relative_path.to_string(),
@@ -720,7 +773,9 @@ pub fn execute_conflict_keep_both(
     match baseline_repo.upsert(&baseline) {
         Ok(_) => {
             // Remove pending return
-            let _ = pending_repo.remove(&task.id, relative_path);
+            if let Err(e) = pending_repo.remove(&task.id, relative_path) {
+                return db_state_failure(relative_path.to_string(), "keep-both pending cleanup", e);
+            }
 
             ExecutionResult {
                 relative_path: conflict_name,
@@ -843,4 +898,151 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::db;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        db::migrate(&conn).unwrap();
+        conn
+    }
+
+    fn test_task(conn: &Connection, remote_path: String) -> SyncTask {
+        let task = SyncTask {
+            id: uuid::Uuid::new_v4(),
+            name: "Executor test".to_string(),
+            primary_device_id: "primary".to_string(),
+            secondary_device_id: "secondary".to_string(),
+            local_path: "/tmp/primary".to_string(),
+            remote_path,
+            local_role: DeviceRole::Primary,
+            enabled: true,
+            created_unix_ms: now_ms(),
+            updated_unix_ms: now_ms(),
+            last_transfer_activity_unix_ms: 0,
+        };
+        SyncTaskRepository::new(conn).insert(&task).unwrap();
+        task
+    }
+
+    #[test]
+    fn move_to_history_reports_history_insert_failure() {
+        let conn = setup_db();
+        let dir = TempDir::new().unwrap();
+        let task = test_task(
+            &conn,
+            dir.path().join("secondary").to_string_lossy().to_string(),
+        );
+        std::fs::write(dir.path().join("deleted.txt"), "to history").unwrap();
+
+        conn.execute_batch("DROP TABLE history_entries").unwrap();
+
+        let action = PlannedAction {
+            relative_path: "deleted.txt".to_string(),
+            decision: SyncDecision::MoveSecondaryToHistory,
+            snapshot: None,
+            baseline: None,
+        };
+        let results = execute_actions(&[action], &task, dir.path(), &conn);
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("history record insert failed"));
+    }
+
+    #[test]
+    fn return_sync_reports_pending_cleanup_failure() {
+        let conn = setup_db();
+        let dir = TempDir::new().unwrap();
+        let remote_dir = dir.path().join("secondary");
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("file.txt"), "secondary update").unwrap();
+        let secondary_hash = blake3::hash(b"secondary update").to_hex().to_string();
+        let task = test_task(&conn, remote_dir.to_string_lossy().to_string());
+
+        let mut current_primary = HashMap::new();
+        current_primary.insert(
+            "file.txt".to_string(),
+            FileSnapshot {
+                task_id: task.id,
+                relative_path: "file.txt".to_string(),
+                kind: EntryKind::File,
+                size: 8,
+                modified_unix_ms: 1000,
+                blake3_hash: Some("same_hash".to_string()),
+                hash_status: HashStatus::Verified,
+                deleted: false,
+                is_symlink: false,
+            },
+        );
+
+        let mut baselines = HashMap::new();
+        baselines.insert(
+            "file.txt".to_string(),
+            SyncBaseline {
+                task_id: task.id,
+                relative_path: "file.txt".to_string(),
+                primary_hash: Some("same_hash".to_string()),
+                primary_hash_status: HashStatus::Verified,
+                primary_size: 8,
+                secondary_size: 8,
+                primary_modified_unix_ms: 1000,
+                secondary_hash: Some("same_hash".to_string()),
+                secondary_hash_status: HashStatus::Verified,
+                secondary_modified_unix_ms: 1000,
+                last_synced_unix_ms: 1000,
+            },
+        );
+
+        let pending_repo = PendingReturnRepository::new(&conn);
+        pending_repo
+            .upsert(&PendingReturnChange {
+                task_id: task.id,
+                relative_path: "file.txt".to_string(),
+                change_kind: ChangeKind::Modified,
+                secondary_hash: Some(secondary_hash),
+                secondary_hash_status: HashStatus::Verified,
+                secondary_modified_unix_ms: now_ms(),
+                created_unix_ms: now_ms(),
+            })
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_pending_delete
+             BEFORE DELETE ON pending_return_changes
+             BEGIN
+                SELECT RAISE(FAIL, 'forced pending cleanup failure');
+             END;",
+        )
+        .unwrap();
+
+        let results = execute_return_sync(
+            &task,
+            &["file.txt".to_string()],
+            &current_primary,
+            &baselines,
+            dir.path(),
+            &conn,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("return-sync pending cleanup failed"));
+        assert_eq!(pending_repo.count_by_task(&task.id).unwrap(), 1);
+    }
 }

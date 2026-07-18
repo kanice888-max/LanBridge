@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -12,6 +13,7 @@ import {
 import { motion, useReducedMotion, type Transition } from "motion/react";
 import { AnimatedFolder } from "./AnimatedFolder";
 import { AppOverlayLayer } from "./OverlayPortal";
+import { startShadowSyncBurst } from "./ShadowLayer";
 
 type FolderTransitionKind = "sync" | "discover";
 
@@ -150,15 +152,21 @@ export function FolderTransitionProvider({ children }: { children: ReactNode }) 
     setSuppressRealShadows(false);
   }, []);
 
-  const showFoldersThenShadows = useCallback(() => {
+  const finishFlight = useCallback(() => {
     setHiddenKinds(new Set());
     setHoldFrame(null);
     window.requestAnimationFrame(() => {
-      setSuppressRealShadows(false);
+      startShadowSyncBurst(220);
+      window.requestAnimationFrame(() => {
+        setSuppressRealShadows(false);
+        window.requestAnimationFrame(() => {
+          setFlight(null);
+        });
+      });
     });
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const active = suppressRealShadows || hiddenKinds.size > 0 || Boolean(holdFrame) || Boolean(flight);
     if (active) {
       document.documentElement.dataset.folderTransitionActive = "true";
@@ -271,8 +279,7 @@ export function FolderTransitionProvider({ children }: { children: ReactNode }) 
     <FolderTransitionContext.Provider value={value}>
       {children}
       <FolderTransitionOverlay holdFrame={holdFrame} flight={flight} onDone={() => {
-        setFlight(null);
-        showFoldersThenShadows();
+        finishFlight();
       }} />
     </FolderTransitionContext.Provider>
   );

@@ -142,6 +142,7 @@ export function useShadowTarget<T extends HTMLElement>({
   const reactId = useId();
   const id = reactId.replace(/:/g, "");
   const ref = useRef<T | null>(null);
+  const lastVisibleItemRef = useRef<ShadowItem | null>(null);
 
   const sync = useCallback(() => {
     if (!context || !enabled || !ref.current) {
@@ -161,7 +162,7 @@ export function useShadowTarget<T extends HTMLElement>({
       style.visibility !== "hidden" &&
       style.opacity !== "0";
 
-    context.update({
+    const item: ShadowItem = {
       id,
       type,
       variant,
@@ -173,7 +174,26 @@ export function useShadowTarget<T extends HTMLElement>({
       },
       borderRadius: style.borderRadius || "0px",
       visible,
-    });
+    };
+
+    const hiddenByFolderTransition =
+      type === "folder" &&
+      !visible &&
+      document.documentElement.dataset.folderTransitionActive === "true" &&
+      Boolean(measured.closest(".folder-transition-hidden"));
+
+    if (hiddenByFolderTransition) {
+      if (lastVisibleItemRef.current) {
+        context.update(lastVisibleItemRef.current);
+      }
+      return;
+    }
+
+    if (visible) {
+      lastVisibleItemRef.current = item;
+    }
+
+    context.update(item);
   }, [context, enabled, id, targetSelector, type, variant]);
 
   useEffect(() => {
@@ -183,12 +203,13 @@ export function useShadowTarget<T extends HTMLElement>({
     }
 
     let frame = window.requestAnimationFrame(sync);
-    const resizeObserver = new ResizeObserver(sync);
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(sync);
     if (ref.current) {
-      resizeObserver.observe(ref.current);
+      resizeObserver?.observe(ref.current);
       if (targetSelector) {
         const measured = ref.current.querySelector<HTMLElement>(targetSelector);
-        if (measured) resizeObserver.observe(measured);
+        if (measured) resizeObserver?.observe(measured);
       }
     }
 
@@ -216,7 +237,7 @@ export function useShadowTarget<T extends HTMLElement>({
 
     return () => {
       window.cancelAnimationFrame(frame);
-      resizeObserver.disconnect();
+      resizeObserver?.disconnect();
       window.removeEventListener("resize", onWindowChange);
       window.removeEventListener("scroll", onWindowChange, true);
       burstListeners.delete(runBurst);

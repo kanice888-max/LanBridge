@@ -27,6 +27,8 @@ These rules protect user data. Do not weaken them without updating the PRD and t
 - File receive must write to a temporary path, verify, then atomically rename where possible.
 - Large files must use chunked/streaming transfer rather than single JSON payloads.
 - Receiver state should be updated after successful receive/ACK where supported.
+- File hashing and scanning must be streaming/heap-buffered, not backed by large stack arrays. A stack overflow can crash packaged Windows builds without reaching the Rust panic hook.
+- LanBridge runtime files and folders must not enter the sync model. At minimum, `.lanbridge-history`, `.lanbridge-temp`, partial files, `lanbridge.log`, `startup-crash.log`, and `crash-diagnostics.log` must be ignored by scanner, watcher, transfer, and pending-return flows.
 - A remote task registration may only confirm an already approved `(task, peer, root)` tuple; it must never create an arbitrary remote-selected root.
 - Incoming paths may not address `.lanbridge-history`, ordinary `.lanbridge-temp`, diagnostics, logs, or the partial suffix. Conflict staging is a separate restricted operation.
 - One `(task, relative path)` may have only one incoming writer. Append, finish, cancel, and disconnect cleanup are scoped to the owning connection.
@@ -52,3 +54,4 @@ These rules protect user data. Do not weaken them without updating the PRD and t
 - The sender should not require users to type the peer machine's absolute path.
 - Pairing and task creation must surface waiting, rejected, and error states.
 - Conflict, history, overwrite backup, and retryable error states must be visible.
+- Preview Tauri commands must use the same argument shape as real commands and return explicit values for pairing confirmation.

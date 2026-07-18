@@ -927,6 +927,7 @@ mod tests {
             enabled: true,
             created_unix_ms: now_ms(),
             updated_unix_ms: now_ms(),
+            last_transfer_activity_unix_ms: 0,
         };
         SyncTaskRepository::new(conn).insert(&task).unwrap();
         task

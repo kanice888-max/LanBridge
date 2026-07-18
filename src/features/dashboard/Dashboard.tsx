@@ -1,17 +1,12 @@
 import { useEffect, useState, useCallback } from "react";
 import {
-  acceptTaskInvite,
   getPendingCount,
   detectConflicts,
-  listTaskInvites,
-  rejectTaskInvite,
   deleteSyncTask,
-  type IncomingTaskInviteInfo,
   type IdentityInfo,
   type SyncTask,
   type SyncActionResult,
 } from "../../lib/tauriApi";
-import { pickFolder } from "../../lib/folderPicker";
 import { useTranslation } from "../../lib/i18n/context";
 import { DeleteTaskConfirmDialog } from "../../components/DeleteTaskConfirmDialog";
 
@@ -46,26 +41,9 @@ export function Dashboard({
 }: DashboardProps) {
   const { t } = useTranslation();
   const [taskStatuses, setTaskStatuses] = useState<Record<string, TaskStatus>>({});
-  const [incomingInvites, setIncomingInvites] = useState<IncomingTaskInviteInfo[]>([]);
-  const [invitePaths, setInvitePaths] = useState<Record<string, string>>({});
-  const [inviteError, setInviteError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [deleteTaskTarget, setDeleteTaskTarget] = useState<DeleteTaskTarget | null>(null);
   const [deleteTaskBusy, setDeleteTaskBusy] = useState(false);
-
-  const refreshInvites = useCallback(async () => {
-    try {
-      const invites = await listTaskInvites();
-      const pending = invites.filter((invite) => invite.status === "Pending");
-      setIncomingInvites(pending);
-      setInvitePaths((prev) => {
-        const next = { ...prev };
-        for (const invite of pending) {
-          if (!next[invite.invite_id]) next[invite.invite_id] = invite.local_path || "";
-        }
-        return next;
-      });
-    } catch { /* silent */ }
-  }, []);
 
   const refreshStatuses = useCallback(async () => {
     const statuses: Record<string, Omit<TaskStatus, "lastResults">> = {};
@@ -90,30 +68,6 @@ export function Dashboard({
   }, [tasks]);
 
   useEffect(() => { refreshStatuses(); }, [refreshStatuses]);
-  useEffect(() => {
-    refreshInvites();
-    const id = window.setInterval(() => refreshInvites(), 3000);
-    return () => window.clearInterval(id);
-  }, [refreshInvites]);
-
-  const handleAcceptInvite = async (invite: IncomingTaskInviteInfo) => {
-    const localPath = invitePaths[invite.invite_id]?.trim();
-    if (!localPath) { setInviteError(t.dashboard.invitePathRequired); return; }
-    setInviteError(null);
-    try {
-      await acceptTaskInvite(invite.invite_id, localPath);
-      await refreshInvites();
-      onRefresh();
-    } catch (e) { setInviteError(String(e)); }
-  };
-
-  const handlePickInviteFolder = async (invite: IncomingTaskInviteInfo) => {
-    setInviteError(null);
-    try {
-      const folder = await pickFolder(t.dashboard.chooseFolder);
-      if (folder) setInvitePaths((prev) => ({ ...prev, [invite.invite_id]: folder }));
-    } catch (e) { setInviteError(String(e)); }
-  };
 
   const handleDeleteTask = async (e: React.MouseEvent, taskId: string, taskName: string) => {
     e.stopPropagation();
@@ -128,18 +82,10 @@ export function Dashboard({
       setDeleteTaskTarget(null);
       onRefresh();
     } catch (err) {
-      setInviteError(String(err));
+      setActionError(String(err));
     } finally {
       setDeleteTaskBusy(false);
     }
-  };
-
-  const handleRejectInvite = async (invite: IncomingTaskInviteInfo) => {
-    setInviteError(null);
-    try {
-      await rejectTaskInvite(invite.invite_id, "rejected by peer");
-      await refreshInvites();
-    } catch { /* silent */ }
   };
 
   const formatTime = (unixMs: number) => {
@@ -158,47 +104,13 @@ export function Dashboard({
     <aside className="task-list-panel">
       <div className="task-list-header">
         <h2>{t.dashboard.title} · {tasks.length}</h2>
-        <button className="btn btn-ghost btn-small" onClick={() => { onRefresh(); refreshInvites(); }}>
+        <button className="btn btn-ghost btn-small" onClick={onRefresh}>
           {t.dashboard.refresh}
         </button>
       </div>
 
       <div className="task-list-scroll">
-        {inviteError && <div className="error-message">{inviteError}</div>}
-
-        {incomingInvites.length > 0 && (
-          <div className="invite-section">
-            <div className="invite-section-header">{t.dashboard.incomingInvites} · {incomingInvites.length}</div>
-            {incomingInvites.map((invite) => (
-              <div key={invite.invite_id} className="invite-item">
-                <div className="invite-item-header">
-                  <strong>{invite.task_name}</strong>
-                  <span>{invite.requester_device_id.slice(0, 12)}...</span>
-                </div>
-                {invite.requester_path && (
-                  <div className="invite-item-path">{invite.requester_path}</div>
-                )}
-                <div className="invite-item-actions">
-                  <input
-                    type="text"
-                    placeholder={t.dashboard.invitePathPlaceholder}
-                    value={invitePaths[invite.invite_id] || ""}
-                    onChange={(e) => setInvitePaths((prev) => ({ ...prev, [invite.invite_id]: e.target.value }))}
-                  />
-                  <button className="btn btn-ghost btn-small" onClick={() => handlePickInviteFolder(invite)}>
-                    {t.dashboard.chooseFolder}
-                  </button>
-                  <button className="btn btn-primary btn-small" onClick={() => handleAcceptInvite(invite)}>
-                    {t.dashboard.acceptInvite}
-                  </button>
-                  <button className="btn btn-ghost btn-small" onClick={() => handleRejectInvite(invite)}>
-                    {t.dashboard.rejectInvite}
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+        {actionError && <div className="error-message">{actionError}</div>}
 
         {tasks.length === 0 ? (
           <div className="empty-state" style={{ padding: "var(--space-10) var(--space-4)" }}>

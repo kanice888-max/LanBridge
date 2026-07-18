@@ -488,8 +488,6 @@ impl ConnectionManager {
     }
     /// Register a connected peer.
     pub fn register_connection(&self, conn: PeerConnection) {
-        let mut manual = self.manually_disconnected.lock().unwrap();
-        manual.remove(&conn.device_id);
         let mut peers = self.peers.lock().unwrap();
         peers.insert(conn.device_id.clone(), conn);
     }
@@ -505,6 +503,19 @@ impl ConnectionManager {
         self.disconnect(device_id);
         let mut manual = self.manually_disconnected.lock().unwrap();
         manual.insert(device_id.to_string());
+    }
+    /// Clear a local manual disconnect so the next status check may reconnect.
+    pub fn clear_manual_disconnect(&self, device_id: &str) {
+        let mut manual = self.manually_disconnected.lock().unwrap();
+        manual.remove(device_id);
+    }
+
+    pub fn set_manual_disconnect_state(&self, device_id: &str, disconnected: bool) {
+        if disconnected {
+            self.manual_disconnect(device_id);
+        } else {
+            self.clear_manual_disconnect(device_id);
+        }
     }
     /// Check whether a peer was intentionally disconnected by the local user.
     pub fn is_manually_disconnected(&self, device_id: &str) -> bool {
@@ -528,8 +539,6 @@ impl ConnectionManager {
     }
 
     pub fn mark_connected(&self, device_id: &str) {
-        let mut manual = self.manually_disconnected.lock().unwrap();
-        manual.remove(device_id);
         let mut peers = self.peers.lock().unwrap();
         if let Some(peer) = peers.get_mut(device_id) {
             peer.connected = true;
@@ -545,6 +554,55 @@ pub async fn connect_to_peer(address: &str, port: u16) -> Result<TcpStream> {
     let stream = TcpStream::connect(&addr).await?;
     Ok(stream)
 }
+
+pub fn friendly_peer_connection_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    let normalized = message.to_lowercase();
+
+    if message.contains("对端版本不兼容") {
+        return "对端版本不兼容，请升级两端应用".to_string();
+    }
+    if message.contains("不能连接本机") {
+        return "不能连接本机".to_string();
+    }
+    if message.contains("对端身份已变化") {
+        return "对端身份已变化，请重新发现设备。".to_string();
+    }
+    if normalized.contains("no route to host")
+        || normalized.contains("network is unreachable")
+        || normalized.contains("host is down")
+        || normalized.contains("os error 65")
+        || normalized.contains("os error 51")
+        || normalized.contains("os error 113")
+        || normalized.contains("os error 10051")
+        || normalized.contains("os error 10065")
+    {
+        return "无法连接对端，请检查 IP、防火墙或 VPN/虚拟网卡。".to_string();
+    }
+    if normalized.contains("connection refused")
+        || normalized.contains("actively refused")
+        || normalized.contains("os error 61")
+        || normalized.contains("os error 111")
+        || normalized.contains("os error 10061")
+    {
+        return "对端未监听当前端口，请确认 LanBridge 已启动。".to_string();
+    }
+    if normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("peer ping timed out")
+        || normalized.contains("peer identity request timed out")
+    {
+        return "对端未响应，请检查防火墙或网络。".to_string();
+    }
+    if normalized.contains("peer is not connected")
+        || normalized.contains("peer has no known address")
+    {
+        return "对端没有可用地址，请重新连接。".to_string();
+    }
+
+    message
+}
+
 pub async fn ping_peer_address(address: &str, port: u16) -> Result<()> {
     tokio::time::timeout(Duration::from_millis(PEER_PING_TIMEOUT_MS), async {
         let mut stream = connect_to_peer(address, port).await?;
@@ -560,15 +618,18 @@ pub async fn ping_peer_address(address: &str, port: u16) -> Result<()> {
     .map_err(|_| anyhow::anyhow!("peer ping timed out"))?
 }
 
+fn split_peer_address(peer_address: &str) -> Result<(&str, u16)> {
+    let (address, port) = peer_address
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid peer address"))?;
+    Ok((address, port.parse::<u16>()?))
+}
+
 pub async fn ping_known_peer(manager: &ConnectionManager, device_id: &str) -> Result<()> {
     let peer = manager
         .get_peer(device_id)
         .ok_or_else(|| anyhow::anyhow!("peer is not connected"))?;
-    let (address, port) = peer
-        .address
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("invalid peer address"))?;
-    let port = port.parse::<u16>()?;
+    let (address, port) = split_peer_address(&peer.address)?;
     match ping_peer_address(address, port).await {
         Ok(()) => {
             manager.mark_connected(device_id);
@@ -580,7 +641,38 @@ pub async fn ping_known_peer(manager: &ConnectionManager, device_id: &str) -> Re
         }
     }
 }
+
+pub async fn verify_known_peer_protocol(
+    manager: &ConnectionManager,
+    device_id: &str,
+) -> Result<()> {
+    let peer = manager
+        .get_peer(device_id)
+        .ok_or_else(|| anyhow::anyhow!("peer is not connected"))?;
+    let (address, port) = split_peer_address(&peer.address)?;
+    let identity = request_peer_identity(address, port).await?;
+    if identity.device_id != device_id {
+        anyhow::bail!("对端身份已变化，请重新发现设备。");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerIdentityDetails {
+    pub identity: PublicIdentity,
+    pub app_version: Option<String>,
+    pub protocol_version: u16,
+    pub min_protocol_version: u16,
+}
+
 pub async fn request_peer_identity(address: &str, port: u16) -> Result<PublicIdentity> {
+    Ok(request_peer_identity_details(address, port).await?.identity)
+}
+
+pub async fn request_peer_identity_details(
+    address: &str,
+    port: u16,
+) -> Result<PeerIdentityDetails> {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut stream = connect_to_peer(address, port).await?;
         stream
@@ -590,16 +682,24 @@ pub async fn request_peer_identity(address: &str, port: u16) -> Result<PublicIde
             SyncMessage::IdentityResponse {
                 device_id,
                 public_key,
+                app_version,
                 protocol_version,
                 min_protocol_version,
-                ..
             } if !device_id.is_empty() && !public_key.is_empty() => {
-                if protocol_version < 2 || min_protocol_version > 2 {
+                if protocol_version == 0
+                    || min_protocol_version > 2
+                    || protocol_version < min_protocol_version
+                {
                     anyhow::bail!("对端版本不兼容，请升级两端应用");
                 }
-                Ok(PublicIdentity {
-                    device_id,
-                    public_key,
+                Ok(PeerIdentityDetails {
+                    identity: PublicIdentity {
+                        device_id,
+                        public_key,
+                    },
+                    app_version: app_version.filter(|version| !version.is_empty()),
+                    protocol_version,
+                    min_protocol_version,
                 })
             }
             SyncMessage::AuthReject { reason } => anyhow::bail!(reason),
@@ -608,6 +708,20 @@ pub async fn request_peer_identity(address: &str, port: u16) -> Result<PublicIde
     })
     .await
     .map_err(|_| anyhow::anyhow!("peer identity request timed out"))?
+}
+
+pub async fn authenticate_peer_address(
+    address: &str,
+    port: u16,
+    local_identity: &DeviceIdentity,
+    _expected_peer_device_id: &str,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = connect_to_peer(address, port).await?;
+        authenticate_stream(&mut stream, local_identity).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("peer authentication timed out"))?
 }
 pub async fn send_message_to_peer(
     manager: &ConnectionManager,
@@ -637,6 +751,192 @@ pub async fn send_authenticated_message_to_peer(
     let mut stream = open_authenticated_stream(manager, local_identity, device_id).await?;
     stream.write_all(&encode_message(&message)?).await?;
     read_message(&mut stream).await
+}
+
+async fn send_authenticated_control_message_to_peer(
+    manager: &ConnectionManager,
+    local_identity: &DeviceIdentity,
+    device_id: &str,
+    message: SyncMessage,
+) -> Result<SyncMessage> {
+    let mut stream = open_authenticated_control_stream(manager, local_identity, device_id).await?;
+    stream.write_all(&encode_message(&message)?).await?;
+    read_message(&mut stream).await
+}
+
+pub async fn notify_peer_manual_disconnect(
+    manager: &ConnectionManager,
+    local_identity: &DeviceIdentity,
+    peer_device_id: &str,
+    state_revision: u64,
+) -> Result<()> {
+    match send_authenticated_control_message_to_peer(
+        manager,
+        local_identity,
+        peer_device_id,
+        SyncMessage::PeerDisconnect {
+            device_id: local_identity.public().device_id,
+            state_revision: Some(state_revision),
+        },
+    )
+    .await?
+    {
+        SyncMessage::PeerDisconnectAck {
+            state_revision: Some(ack_revision),
+            ..
+        } if ack_revision != state_revision => anyhow::bail!(
+            "peer acknowledged disconnect revision {ack_revision}, expected {state_revision}"
+        ),
+        SyncMessage::PeerDisconnectAck { .. } => Ok(()),
+        other => anyhow::bail!("unexpected peer disconnect response: {:?}", other),
+    }
+}
+
+pub async fn notify_peer_manual_reconnect(
+    manager: &ConnectionManager,
+    local_identity: &DeviceIdentity,
+    peer_device_id: &str,
+    state_revision: u64,
+) -> Result<()> {
+    match send_authenticated_control_message_to_peer(
+        manager,
+        local_identity,
+        peer_device_id,
+        SyncMessage::PeerReconnect {
+            device_id: local_identity.public().device_id,
+            state_revision: Some(state_revision),
+        },
+    )
+    .await?
+    {
+        SyncMessage::PeerReconnectAck {
+            state_revision: Some(ack_revision),
+            ..
+        } if ack_revision != state_revision => anyhow::bail!(
+            "peer acknowledged reconnect revision {ack_revision}, expected {state_revision}"
+        ),
+        SyncMessage::PeerReconnectAck { .. } => Ok(()),
+        other => anyhow::bail!("unexpected peer reconnect response: {:?}", other),
+    }
+}
+
+pub async fn publish_peer_connection_state(
+    manager: &ConnectionManager,
+    local_identity: &DeviceIdentity,
+    peer_device_id: &str,
+    disconnected: bool,
+    state_revision: u64,
+) -> Result<()> {
+    if disconnected {
+        notify_peer_manual_disconnect(manager, local_identity, peer_device_id, state_revision).await
+    } else {
+        notify_peer_manual_reconnect(manager, local_identity, peer_device_id, state_revision).await
+    }
+}
+
+enum PeerConnectionStatePublishCommand {
+    Publish {
+        peer_device_id: String,
+        disconnected: bool,
+        state_revision: u64,
+    },
+    Shutdown,
+}
+
+/// A single process-wide publisher. Each peer keeps only its newest revision.
+pub struct PeerConnectionStatePublisher {
+    sender: mpsc::UnboundedSender<PeerConnectionStatePublishCommand>,
+}
+
+impl PeerConnectionStatePublisher {
+    pub fn new(manager: ConnectionManager, local_identity: DeviceIdentity) -> Self {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    crate::diagnostics::record_operation(
+                        "peer_connection_state_publish_runtime_failed",
+                        format!("error={error}"),
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+            let mut tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    PeerConnectionStatePublishCommand::Publish { peer_device_id, disconnected, state_revision } => {
+                        if let Some(previous) = tasks.remove(&peer_device_id) {
+                            previous.abort();
+                        }
+                        let task_manager = manager.clone();
+                        let task_identity = local_identity.clone();
+                        let task_peer_id = peer_device_id.clone();
+                        tasks.insert(peer_device_id, tokio::spawn(async move {
+                            let retry_delays = [0_u64, 1, 5, 15, 60];
+                            let mut attempt = 0_usize;
+                            loop {
+                                let delay = retry_delays[attempt.min(retry_delays.len() - 1)];
+                                if delay > 0 {
+                                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                                }
+                                match publish_peer_connection_state(
+                                    &task_manager,
+                                    &task_identity,
+                                    &task_peer_id,
+                                    disconnected,
+                                    state_revision,
+                                ).await {
+                                    Ok(()) => {
+                                        crate::diagnostics::record_operation(
+                                            "peer_connection_state_published",
+                                            format!("peer_device_id={task_peer_id} disconnected={disconnected} revision={state_revision} attempts={}", attempt + 1),
+                                        );
+                                        return;
+                                    }
+                                    Err(error) => crate::diagnostics::record_operation(
+                                        "peer_connection_state_publish_retry",
+                                        format!("peer_device_id={task_peer_id} disconnected={disconnected} revision={state_revision} attempt={} error={error}", attempt + 1),
+                                    ),
+                                }
+                                attempt = attempt.saturating_add(1);
+                            }
+                        }));
+                    }
+                    PeerConnectionStatePublishCommand::Shutdown => {
+                        for (_, task) in tasks.drain() {
+                            task.abort();
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        });
+        Self { sender }
+    }
+
+    pub fn publish(&self, peer_device_id: String, disconnected: bool, state_revision: u64) {
+        let _ = self
+            .sender
+            .send(PeerConnectionStatePublishCommand::Publish {
+                peer_device_id,
+                disconnected,
+                state_revision,
+            });
+    }
+}
+
+impl Drop for PeerConnectionStatePublisher {
+    fn drop(&mut self) {
+        let _ = self
+            .sender
+            .send(PeerConnectionStatePublishCommand::Shutdown);
+    }
 }
 /// Try to negotiate V2 transfer protocol on an open authenticated stream.
 /// Returns `true` if V2 was negotiated, `false` if the peer explicitly selected V1.
@@ -679,6 +979,7 @@ async fn send_file_v2(
     file_path: &Path,
     total_bytes: u64,
     before_hash: &SourceFileState,
+    expected_target_hash: Option<String>,
 ) -> Result<FileTransferOutcome> {
     let transfer_start = Instant::now();
     let mut timing = V2TransferTiming::default();
@@ -690,6 +991,7 @@ async fn send_file_v2(
         file_path,
         total_bytes,
         before_hash,
+        expected_target_hash,
         &mut timing,
         transfer_start,
     )
@@ -721,6 +1023,7 @@ async fn send_file_v2_inner(
     file_path: &Path,
     total_bytes: u64,
     before_hash: &SourceFileState,
+    expected_target_hash: Option<String>,
     timing: &mut V2TransferTiming,
     first_byte: Instant,
 ) -> Result<FileTransferOutcome> {
@@ -730,6 +1033,7 @@ async fn send_file_v2_inner(
             task_id: task_id.to_string(),
             relative_path: relative_path.to_string(),
             total_bytes,
+            expected_target_hash,
         })?)
         .await?;
     timing.socket_write_ms += elapsed_ms(write_start);
@@ -879,6 +1183,27 @@ pub async fn send_authenticated_file_to_peer(
     relative_path: impl Into<String>,
     file_path: &Path,
 ) -> Result<FileTransferOutcome> {
+    send_authenticated_file_to_peer_with_precondition(
+        manager,
+        local_identity,
+        device_id,
+        task_id,
+        relative_path,
+        file_path,
+        None,
+    )
+    .await
+}
+
+pub async fn send_authenticated_file_to_peer_with_precondition(
+    manager: &ConnectionManager,
+    local_identity: &DeviceIdentity,
+    device_id: &str,
+    task_id: impl Into<String>,
+    relative_path: impl Into<String>,
+    file_path: &Path,
+    expected_target_hash: Option<String>,
+) -> Result<FileTransferOutcome> {
     let task_id = task_id.into();
     let relative_path = relative_path.into();
     clear_transfer_cancel(&task_id, &relative_path, Some("upload"));
@@ -932,6 +1257,7 @@ pub async fn send_authenticated_file_to_peer(
                 }
                 cache_v1 = true;
                 tracing::info!(
+                    event = "LegacyProtocolFallback",
                     selected_protocol = "v1_json",
                     fallback_reason = "peer_v2_unsupported",
                     "peer does not support V2, using V1"
@@ -947,6 +1273,7 @@ pub async fn send_authenticated_file_to_peer(
                     );
                 }
                 tracing::info!(
+                    event = "LegacyProtocolFallback",
                     selected_protocol = "v1_json",
                     fallback_reason = format_args!("negotiation_error: {}", e),
                     "V2 negotiation failed, reopening stream for V1"
@@ -967,6 +1294,7 @@ pub async fn send_authenticated_file_to_peer(
             file_path,
             total_bytes,
             &before_hash,
+            expected_target_hash.clone(),
         )
         .await;
         if result.is_err() {
@@ -1050,6 +1378,7 @@ pub async fn send_authenticated_file_to_peer(
             relative_path: relative_path.clone(),
             file_hash: legacy_file_hash.clone().unwrap_or_default(),
             total_bytes,
+            expected_target_hash,
         },
     )
     .await?;
@@ -1215,6 +1544,110 @@ pub(crate) fn source_file_state(file_path: &Path) -> Result<SourceFileState> {
         modified: metadata.modified().ok(),
     })
 }
+
+pub(crate) fn target_precondition(target_path: &Path) -> Result<Option<String>> {
+    match std::fs::symlink_metadata(target_path) {
+        Ok(metadata) if metadata.is_file() => {
+            Ok(Some(crate::core::scanner::hash_file(target_path)?))
+        }
+        Ok(_) => Ok(Some("<non-file>".to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(String::new())),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn ensure_target_precondition(
+    target_path: &Path,
+    expected_target_hash: Option<&str>,
+) -> Result<()> {
+    let Some(expected) = expected_target_hash else {
+        return Ok(());
+    };
+    let current = target_precondition(target_path)?;
+    if expected.is_empty() {
+        if current.as_deref() != Some("") {
+            anyhow::bail!("TargetChanged");
+        }
+    } else if current.as_deref() != Some(expected) {
+        anyhow::bail!("TargetChanged");
+    }
+    Ok(())
+}
+
+pub(crate) fn replace_partial_file(partial_path: &Path, target_path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            REPLACEFILE_WRITE_THROUGH,
+        };
+
+        let target = target_path
+            .as_os_str()
+            .encode_wide()
+            .chain(once(0))
+            .collect::<Vec<_>>();
+        let partial = partial_path
+            .as_os_str()
+            .encode_wide()
+            .chain(once(0))
+            .collect::<Vec<_>>();
+        const RETRY_DELAYS_MS: [u64; 5] = [50, 100, 200, 400, 800];
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        const ERROR_USER_MAPPED_FILE: i32 = 1224;
+        for attempt in 0..=RETRY_DELAYS_MS.len() {
+            let result = if std::fs::symlink_metadata(target_path).is_ok() {
+                unsafe {
+                    ReplaceFileW(
+                        target.as_ptr(),
+                        partial.as_ptr(),
+                        std::ptr::null(),
+                        REPLACEFILE_WRITE_THROUGH,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                }
+            } else {
+                unsafe {
+                    MoveFileExW(
+                        partial.as_ptr(),
+                        target.as_ptr(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                    )
+                }
+            };
+            if result != 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            let os_code = error.raw_os_error().unwrap_or_default();
+            let retryable = matches!(
+                os_code,
+                ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_USER_MAPPED_FILE
+            );
+            if retryable && attempt < RETRY_DELAYS_MS.len() {
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAYS_MS[attempt]));
+                continue;
+            }
+            anyhow::bail!(
+                "AtomicReplaceFailed {{ retryable: {}, os_code: {}, error: {} }}",
+                retryable,
+                os_code,
+                error
+            );
+        }
+        unreachable!("replace retry loop always returns");
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(partial_path, target_path)?;
+        Ok(())
+    }
+}
 pub(crate) fn ensure_source_file_unchanged(
     file_path: &Path,
     expected: &SourceFileState,
@@ -1284,6 +1717,7 @@ pub async fn request_authenticated_file_from_peer(
     let relative_path = relative_path.into();
     clear_transfer_cancel(&task_id, &relative_path, Some("download"));
     let total_start = Instant::now();
+    let expected_target_hash = target_precondition(target_path)?;
     let stream_start = Instant::now();
     let mut stream = open_authenticated_stream(manager, local_identity, device_id).await?;
     let stream_elapsed_ms = stream_start.elapsed().as_millis() as u64;
@@ -1314,6 +1748,7 @@ pub async fn request_authenticated_file_from_peer(
                 }
                 cache_v1 = true;
                 tracing::info!(
+                    event = "LegacyProtocolFallback",
                     selected_protocol = "v1_json",
                     fallback_reason = "peer_v2_unsupported",
                     "peer does not support V2, using V1"
@@ -1329,6 +1764,7 @@ pub async fn request_authenticated_file_from_peer(
                     );
                 }
                 tracing::info!(
+                    event = "LegacyProtocolFallback",
                     selected_protocol = "v1_json",
                     fallback_reason = format_args!("negotiation_error: {}", e),
                     "V2 negotiation failed, reopening stream for V1"
@@ -1347,6 +1783,7 @@ pub async fn request_authenticated_file_from_peer(
             &relative_path,
             target_path,
             total_start,
+            expected_target_hash.clone(),
         )
         .await;
         if result.is_err() {
@@ -1374,6 +1811,7 @@ pub async fn request_authenticated_file_from_peer(
             relative_path: ack_path,
             file_hash,
             total_bytes,
+            ..
         } if ack_task == task_id && ack_path == relative_path => (file_hash, total_bytes),
         SyncMessage::FileAck { error, .. } => {
             anyhow::bail!(error.unwrap_or_else(|| "peer rejected file download".to_string()))
@@ -1399,6 +1837,7 @@ pub async fn request_authenticated_file_from_peer(
         std::fs::create_dir_all(parent)?;
     }
     let partial_path = partial_path(target_path);
+    let mut partial_cleanup = PartialFileCleanup::new(partial_path.clone());
     let mut file = std::fs::File::create(&partial_path)?;
     let mut hasher = blake3::Hasher::new();
     let mut written = 0u64;
@@ -1498,7 +1937,9 @@ pub async fn request_authenticated_file_from_peer(
         let _ = std::fs::remove_file(&partial_path);
         anyhow::bail!("download hash mismatch");
     }
-    std::fs::rename(partial_path, target_path)?;
+    ensure_target_precondition(target_path, expected_target_hash.as_deref())?;
+    replace_partial_file(&partial_path, target_path)?;
+    partial_cleanup.commit();
     let total_elapsed_ms = total_start.elapsed().as_millis() as u64;
     let total_mbps = if total_elapsed_ms > 0 {
         (total_bytes as f64 / (1024.0 * 1024.0)) / (total_elapsed_ms as f64 / 1000.0)
@@ -1537,6 +1978,7 @@ async fn request_file_v2(
     relative_path: &str,
     target_path: &Path,
     total_start: Instant,
+    expected_target_hash: Option<String>,
 ) -> Result<FileTransferOutcome> {
     stream
         .write_all(&encode_message(&SyncMessage::FileDownloadRequestV2 {
@@ -1550,6 +1992,7 @@ async fn request_file_v2(
             task_id: ack_task,
             relative_path: ack_path,
             total_bytes,
+            ..
         } if ack_task == task_id && ack_path == relative_path => total_bytes,
         SyncMessage::FileAck { error, .. } => {
             anyhow::bail!(error.unwrap_or_else(|| "peer rejected v2 file download".to_string()))
@@ -1575,6 +2018,7 @@ async fn request_file_v2(
         std::fs::create_dir_all(parent)?;
     }
     let partial_path = partial_path(target_path);
+    let mut partial_cleanup = PartialFileCleanup::new(partial_path.clone());
     let mut file = std::fs::File::create(&partial_path)?;
     let mut hasher = blake3::Hasher::new();
     let mut written = 0u64;
@@ -1711,7 +2155,9 @@ async fn request_file_v2(
         .await?;
         anyhow::bail!("download hash mismatch");
     }
-    std::fs::rename(partial_path, target_path)?;
+    ensure_target_precondition(target_path, expected_target_hash.as_deref())?;
+    replace_partial_file(&partial_path, target_path)?;
+    partial_cleanup.commit();
     send_v2_download_ack(stream, task_id, relative_path, written, true, None).await?;
     let total_elapsed_ms = total_start.elapsed().as_millis() as u64;
     let total_mbps = if total_elapsed_ms > 0 {
@@ -1818,6 +2264,24 @@ async fn open_authenticated_stream(
     authenticate_stream(&mut stream, local_identity).await?;
     Ok(stream)
 }
+
+async fn open_authenticated_control_stream(
+    manager: &ConnectionManager,
+    local_identity: &DeviceIdentity,
+    device_id: &str,
+) -> Result<TcpStream> {
+    let peer = manager
+        .get_peer(device_id)
+        .ok_or_else(|| anyhow::anyhow!("peer has no known address"))?;
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(&peer.address),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting to peer control channel"))??;
+    authenticate_stream(&mut stream, local_identity).await?;
+    Ok(stream)
+}
 async fn authenticate_stream(
     stream: &mut TcpStream,
     local_identity: &DeviceIdentity,
@@ -1849,6 +2313,7 @@ async fn authenticate_stream(
         other => anyhow::bail!("unexpected auth proof response: {:?}", other),
     }
 }
+
 async fn send_and_expect_file_ack(stream: &mut TcpStream, msg: SyncMessage) -> Result<()> {
     stream.write_all(&encode_message(&msg)?).await?;
     match read_message(stream).await? {
@@ -1877,6 +2342,41 @@ fn partial_path(target_path: &Path) -> std::path::PathBuf {
         .unwrap_or("download");
     target_path.with_file_name(format!("{}.lanbridge-partial", file_name))
 }
+
+struct PartialFileCleanup {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PartialFileCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PartialFileCleanup {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        event = "PartialCleanupFailed",
+                        partial_path = %self.path.display(),
+                        error = %error,
+                        "failed to remove download partial file"
+                    );
+                }
+            }
+        }
+    }
+}
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1895,6 +2395,58 @@ mod tests {
         let before = source_file_state(&path).unwrap();
         std::fs::write(&path, "first plus more").unwrap();
         assert!(ensure_source_file_unchanged(&path, &before).is_err());
+    }
+
+    #[test]
+    fn target_precondition_detects_concurrent_change() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "before").unwrap();
+        let expected = target_precondition(&target).unwrap().unwrap();
+        std::fs::write(&target, "after").unwrap();
+        assert!(ensure_target_precondition(&target, Some(&expected)).is_err());
+    }
+
+    #[test]
+    fn replace_partial_file_replaces_existing_target() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.txt");
+        let partial = dir.path().join("target.txt.lanbridge-partial");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::write(&partial, "new").unwrap();
+
+        replace_partial_file(&partial, &target).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn friendly_error_hides_platform_network_details() {
+        assert_eq!(
+            friendly_peer_connection_error("No route to host (os error 65)"),
+            "无法连接对端，请检查 IP、防火墙或 VPN/虚拟网卡。"
+        );
+        assert_eq!(
+            friendly_peer_connection_error("对端版本不兼容，请升级两端应用"),
+            "对端版本不兼容，请升级两端应用"
+        );
+    }
+
+    #[test]
+    fn discovery_updates_do_not_clear_manual_disconnect_intent() {
+        let manager = ConnectionManager::new();
+        manager.manual_disconnect("peer-a");
+
+        manager.register_connection(PeerConnection {
+            device_id: "peer-a".to_string(),
+            address: "192.168.1.5:9527".to_string(),
+            connected: true,
+            last_seen_unix_ms: 1,
+        });
+        manager.mark_connected("peer-a");
+
+        assert!(manager.is_manually_disconnected("peer-a"));
     }
 
     #[test]

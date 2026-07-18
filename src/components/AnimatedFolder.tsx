@@ -23,6 +23,8 @@ type AnimatedFolderProps = {
   onClick?: () => void;
   autoPreview?: boolean;
   externalShadow?: boolean;
+  /** Renders the folder as artwork only, without a focusable or clickable button. */
+  decorative?: boolean;
   className?: string;
 };
 
@@ -308,6 +310,7 @@ export function AnimatedFolder({
   onClick,
   autoPreview = false,
   externalShadow = false,
+  decorative = false,
   className,
 }: AnimatedFolderProps) {
   const gradientId = useId().replace(/:/g, "");
@@ -373,29 +376,25 @@ export function AnimatedFolder({
   const paperMidOpacity = useTransform(progress, [0, 1], [0.58, 0.42]);
   const paperTopOpacity = useTransform(progress, [0, 1], [0.5, 0.42]);
 
-  return (
-    <button
-      type="button"
-      onClick={handleClick}
-      className={className}
-      style={{
-        width: size,
-        height: numericSize ? numericSize * (443 / 424) : undefined,
-        aspectRatio: "424 / 443",
-        display: "grid",
-        placeItems: "center",
-        position: "relative",
-        padding: 0,
-        border: 0,
-        background: "transparent",
-        outline: "none",
-        overflow: "visible",
-        isolation: "isolate",
-        cursor: onClick || !isControlled ? "pointer" : "default",
-        WebkitTapHighlightColor: "transparent",
-      }}
-      aria-label={currentOpen ? "Close folder" : "Open folder"}
-    >
+  const folderStyle = {
+    width: size,
+    height: numericSize ? numericSize * (443 / 424) : undefined,
+    aspectRatio: "424 / 443",
+    display: "grid",
+    placeItems: "center",
+    position: "relative" as const,
+    padding: 0,
+    border: 0,
+    background: "transparent",
+    outline: "none",
+    overflow: "visible",
+    isolation: "isolate" as const,
+    cursor: onClick || !isControlled ? "pointer" : "default",
+    WebkitTapHighlightColor: "transparent",
+  };
+
+  const artwork = (
+    <>
       <svg
         viewBox="60 50 304 315"
         width="100%"
@@ -643,7 +642,26 @@ export function AnimatedFolder({
           <StatusBadge key={status} status={status} />
         </AnimatePresence>
       </svg>
+    </>
+  );
+
+  if (decorative) {
+    return (
+      <div className={className} style={folderStyle} aria-hidden="true">
+        {artwork}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      className={className}
+      style={folderStyle}
+      aria-label={currentOpen ? "Close folder" : "Open folder"}
+    >
+      {artwork}
     </button>
   );
 }
-

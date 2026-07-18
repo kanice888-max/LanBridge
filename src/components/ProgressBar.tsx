@@ -104,24 +104,17 @@ function TransferCard({
         </span>
       )}
       {item.cancellable && (
-        <span
+        <button
           className="transfer-cancel"
-          role="button"
-          tabIndex={0}
+          type="button"
           title="中断传输"
           onClick={(event) => {
             event.stopPropagation();
             onCancel(item);
           }}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter" && event.key !== " ") return;
-            event.preventDefault();
-            event.stopPropagation();
-            onCancel(item);
-          }}
         >
           <XIcon size={17} />
-        </span>
+        </button>
       )}
       <span className="transfer-track">
         <span
@@ -176,12 +169,14 @@ export function ProgressBar() {
   const percentRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
+    let disposed = false;
     const poll = async () => {
       try {
         const [transfers, deferredTransfers] = await Promise.all([
           getTransferProgress(),
           listDeferredTransfers(),
         ]);
+        if (disposed) return;
         const now = Date.now();
         setDeferred(deferredTransfers);
 
@@ -251,12 +246,16 @@ export function ProgressBar() {
 
         setItems([...active, ...transferred.sort((a, b) => a.key.localeCompare(b.key))]);
       } catch {
-        setItems([]);
+        if (!disposed) setItems([]);
       }
     };
 
+    void poll();
     const id = window.setInterval(poll, 600);
-    return () => window.clearInterval(id);
+    return () => {
+      disposed = true;
+      window.clearInterval(id);
+    };
   }, []);
 
   const handleCancel = async (item: DisplayItem) => {

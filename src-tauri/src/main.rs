@@ -13,9 +13,11 @@ mod pairing;
 mod platform;
 mod state;
 mod transport;
+mod update;
 
 use anyhow::{Context, Result};
 use platform::traits::Platform;
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{
@@ -27,6 +29,18 @@ const TRAY_OPEN_ID: &str = "open";
 const TRAY_QUIT_ID: &str = "quit";
 const DESIGN_ASPECT_RATIO: f64 = 863.0 / 561.0;
 static WINDOW_RATIO_RESIZE_GUARD: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Serialize)]
+struct TaskFilesChangedEvent {
+    task_id: String,
+    revision: u64,
+    reason: String,
+}
+
+#[derive(Clone, Serialize)]
+struct TaskTransferActivityEvent {
+    task_id: String,
+}
 
 #[cfg(target_os = "macos")]
 fn create_platform() -> Result<Box<dyn Platform>> {
@@ -152,6 +166,7 @@ fn run_app() -> Result<()> {
             commands::get_sync_task,
             commands::toggle_task_enabled,
             commands::list_ready_auto_sync_tasks,
+            commands::list_task_access_issues,
             commands::get_task_file_list_refresh_hint,
             commands::scan_task,
             commands::sync_now,
@@ -166,10 +181,14 @@ fn run_app() -> Result<()> {
             commands::restore_history_entry,
             commands::cleanup_history,
             commands::list_logs,
+            commands::get_diagnostic_report,
             commands::write_log,
             commands::get_settings,
             commands::get_app_settings,
             commands::set_discovery_enabled,
+            commands::check_for_updates,
+            commands::open_project_github,
+            commands::open_available_update_release,
             commands::hide_main_window_to_tray,
             commands::show_main_window,
             commands::quit_app,
@@ -186,7 +205,9 @@ fn run_app() -> Result<()> {
             commands::list_deferred_transfers,
             commands::resume_transfer,
             commands::get_task_peer_status,
+            commands::open_local_network_settings,
             commands::disconnect_task_peer,
+            commands::reconnect_task_peer,
             commands::get_window_cursor_position,
             commands::cancel_transfer,
         ])
@@ -212,8 +233,42 @@ fn run_app() -> Result<()> {
             }
             _ => {}
         })
-        .setup(|_| {
+        .setup(|app| {
             diagnostics::record_operation("tauri_setup", "setup hook entered");
+            let app_handle = app.handle();
+            let state = app.state::<app_state::AppState>();
+            let transfer_activity = state.transfer_activity.clone();
+            let activity_app_handle = app_handle.clone();
+            transfer_activity.set_callback(move |task_id| {
+                let payload = TaskTransferActivityEvent { task_id };
+                if let Err(error) = activity_app_handle.emit_all("lanbridge://task-transfer-activity", payload) {
+                    tracing::warn!(error = %error, "failed to publish task transfer activity to UI");
+                }
+            });
+            if let Some(server) = &state._server {
+                let server_activity = state.transfer_activity.clone();
+                server.set_transfer_activity_notifier(move |task_id| {
+                    if let Ok(task_id) = uuid::Uuid::parse_str(&task_id) {
+                        server_activity.publish(task_id);
+                    }
+                });
+                let refresh_tracker = state.file_list_refresh.clone();
+                server.set_receive_commit_notifier(move |task_id, kind| {
+                    let Ok(parsed_task_id) = uuid::Uuid::parse_str(&task_id) else {
+                        tracing::warn!(task_id = %task_id, "ignored receive refresh for invalid task id");
+                        return;
+                    };
+                    let revision = refresh_tracker.mark(parsed_task_id, "receive_committed");
+                    let payload = TaskFilesChangedEvent {
+                        task_id,
+                        revision,
+                        reason: kind.event_reason().to_string(),
+                    };
+                    if let Err(error) = app_handle.emit_all("lanbridge://task-files-changed", payload) {
+                        tracing::warn!(error = %error, "failed to publish received file change to UI");
+                    }
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -258,7 +313,21 @@ fn build_system_tray() -> SystemTray {
         .add_item(CustomMenuItem::new(TRAY_QUIT_ID, "退出"));
     SystemTray::new()
         .with_menu(menu)
-        .with_icon(Icon::Raw(include_bytes!("../icons/32x32.png").to_vec()))
+        .with_icon(Icon::Raw(tray_icon_bytes().to_vec()))
+}
+
+fn tray_icon_bytes() -> &'static [u8] {
+    include_bytes!("../icons/32x32.png")
+}
+
+#[cfg(test)]
+mod tray_tests {
+    #[test]
+    fn embedded_tray_icon_is_a_non_empty_png() {
+        let icon = super::tray_icon_bytes();
+        assert!(icon.len() > 8);
+        assert_eq!(&icon[..8], b"\x89PNG\r\n\x1a\n");
+    }
 }
 
 fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {

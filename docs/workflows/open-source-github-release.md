@@ -6,18 +6,15 @@
 
 ## 推荐发布方式
 
-优先发布一个干净的应用源码根目录，而不是直接把当前协调仓库的全部内容原样公开。
+优先发布一个已通过验证的 integration 候选源码快照，而不是直接把当前协调仓库或任一开发 worktree 的全部内容原样公开。
 
 推荐来源：
-- `worktrees/macos`：当前 macOS-first 共享前端和 Tauri 实现源。
-- `worktrees/windows`：Windows 平台对应实现源。
-- `worktrees/integration`：如果后续已经完成平台合并，优先从 integration 发布。
+- `worktrees/integration`：两个平台分支完成必要验证并合并后，在干净环境完成发布检查的唯一正式候选来源。
+- `worktrees/macos`、`worktrees/windows`：仅用于各自平台的开发和本地验证；未完成 integration 合并与验证前，不能直接作为正式发布来源。
 
-不建议把顶层 `worktrees/` 整个目录作为 GitHub 仓库内容上传。顶层仓库更像开发协调仓库，里面会混有多平台 worktree、本地构建产物和临时文件。
+根目录 `main` 是产品文档、架构、计划和工作流的协调分支；其内容不能仅因位于 `main` 就视为发布就绪。只有 integration 候选经过有意提升和验证后，才可成为公开 GitHub 的默认分支内容。无论如何都不要把顶层 `worktrees/` 整个目录作为 GitHub 仓库内容上传。
 
 ## 应该上传
-
-这些文件是开源仓库可构建、可审查所必需的内容。
 
 - 应用源码：`src/`
 - Tauri / Rust 源码：`src-tauri/src/`
@@ -29,12 +26,10 @@
 - 前端配置：`package.json`、`package-lock.json`、`vite.config.ts`、`tsconfig.json`、`tsconfig.node.json`、`index.html`
 - 项目脚本：`scripts/`
 - 样式和静态资源：项目实际引用的 `src/assets/`、`public/` 等目录，如果存在。
-- 基础文档：`README.md`、`LICENSE`、`docs/architecture/`、`docs/rules/`、`docs/validation/`、`docs/workflows/`
+- 基础文档：`README.md` 及其语言版本、`LICENSE`、`SECURITY.md`、`docs/architecture/`、`docs/rules/`、`docs/security/`、`docs/validation/`、`docs/workflows/`
 - 当前给 agent/协作者用的必要说明：`AGENTS.md`
 
 ## 可以上传，但发布前建议整理
-
-这些内容可以公开，但建议确认是否仍准确、是否包含内部讨论或过期计划。
 
 - `plans/active/`：如果希望公开开发路线，可以上传；如果包含内部草稿，建议删减。
 - `docs/quality/debt-log.md`：可以公开技术债，但发布前建议确认措辞。
@@ -44,8 +39,6 @@
 
 ## 不应该上传
 
-这些文件不应进入 GitHub。它们要么体积大、可再生成，要么包含本地状态、日志、密钥或临时内容。
-
 - 依赖目录：`node_modules/`
 - 前端构建产物：`dist/`
 - Rust 构建产物：`target/`、`src-tauri/target/`
@@ -54,44 +47,36 @@
 - 本地身份密钥：`identity.key`、任何设备私钥或配对密钥。
 - 运行日志和崩溃日志：`lanbridge.log`、`startup-crash.log`、`crash-diagnostics.log`
 - 系统垃圾文件：`.DS_Store`、`Thumbs.db`
-- 编辑器和本机配置：`.idea/`、`.vscode/`（除非只保留通用推荐配置）、`.claude/`
+- 编辑器和本机配置：`.idea/`、`.vscode/`、`.claude/`
 - 本地测试文件夹、用户同步样本文件、真实个人文件。
 - 临时视频工程：`remotion-promo/`
 - Remotion 生成的视频、截图、缓存和导出素材，除非明确要作为宣传素材单独发布。
 - 下载来的第三方源码整包或大型参考项目，除非许可证允许且确实是项目依赖的一部分。
 
-## remotion-promo 处理
-
-`worktrees/macos/remotion-promo/` 是本地制作 Remotion 宣传视频用的临时工程，不属于 LanBridge 应用源码。
-
-处理规则：
-- 不上传到 GitHub 主仓库。
-- 不复制到 integration / release 分支。
-- 如果需要公开宣传视频，只上传最终压缩后的视频成品到 release assets 或单独的宣传仓库，不上传整个 Remotion 工程。
-
 ## 发布前检查清单
 
-上传前建议执行以下检查。
-
 ```bash
+cd worktrees/integration
+npm ci
 git status --short
 git diff --check
 npm run lint:names
 npm run build
+npm test
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+除上述通用检查外，正式发布仍须满足 `docs/validation/checks.md` 规定的原生 Windows 和 macOS 发布门禁。
 
 还需要人工确认：
 - `git status --short` 中没有 `node_modules/`、`dist/`、`target/`、`remotion-promo/`。
 - 没有 `.dmg/.app/.msi/.exe` 等打包产物。
 - 没有 `lanbridge.log`、`startup-crash.log`、`crash-diagnostics.log`。
 - 没有 `identity.key`、数据库、真实同步文件夹内容。
-- 没有私人路径、内网 IP、账号、token、证书、签名密钥。
+- 没有私人路径、内网 IP、账号、token、`.env` 环境变量文件、证书或签名密钥。
 - README 中清楚说明 LanBridge 是 Primary/Secondary + 显式回传模型，不描述为“完全双向同步”。
 
 ## 建议的 .gitignore 补充
-
-如果发布根目录还没有忽略这些规则，建议补充：
 
 ```gitignore
 node_modules/
@@ -116,15 +101,22 @@ crash-diagnostics.log
 identity.key
 *.sqlite
 *.db
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.keystore
+*.key
 ```
 
 ## 最小推荐开源包结构
 
-如果要整理一个干净的 GitHub 仓库，建议至少包含：
-
 ```text
 AGENTS.md
 README.md
+README.en.md
 LICENSE
 package.json
 package-lock.json

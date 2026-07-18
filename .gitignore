@@ -1,3 +1,5 @@
+.worktrees/
+worktrees/
 node_modules/
 dist/
 target/
@@ -5,14 +7,12 @@ src-tauri/target/
 src-tauri/target/release/bundle/
 
 # Local worktrees and agent/tool state
-.worktrees/
-worktrees/
-.claude/
 .codex/
 
 # Local OS/editor files
 .DS_Store
 Thumbs.db
+.claude/
 .vscode/
 .idea/
 
@@ -38,3 +38,13 @@ crash-diagnostics-*.log
 identity.key
 *.sqlite
 *.db
+
+# Local environment and signing credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.keystore
+*.key

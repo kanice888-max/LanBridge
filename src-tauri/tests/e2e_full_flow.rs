@@ -202,6 +202,7 @@ fn insert_paired_command_task(
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
     secondary.insert_task(SyncTask {
         id: task_id,
@@ -214,6 +215,7 @@ fn insert_paired_command_task(
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 }
 
@@ -324,6 +326,7 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     };
     let secondary_task = SyncTask {
         id: task_id,
@@ -336,6 +339,7 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     };
     primary.insert_task(&primary_task);
     secondary.insert_task(&secondary_task);
@@ -478,11 +482,11 @@ async fn test_two_node_discovery_pair_invite_plan_transfer_retry_delete_and_db_s
         SyncMessage::FileDelete {
             task_id: task_id.to_string(),
             relative_path: "docs/report.txt".to_string(),
-            expected_kind: None,
-            expected_hash: None,
-            expected_hash_status: None,
-            expected_size: None,
-            expected_modified_unix_ms: None,
+            expected_kind: Some(EntryKind::File),
+            expected_hash: local_snapshots[0].blake3_hash.clone(),
+            expected_hash_status: Some(local_snapshots[0].hash_status),
+            expected_size: Some(local_snapshots[0].size),
+            expected_modified_unix_ms: Some(local_snapshots[0].modified_unix_ms),
             delete_batch_id: None,
         },
     )
@@ -532,6 +536,7 @@ async fn test_secondary_sync_now_returns_new_file_to_primary() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
     secondary.insert_task(SyncTask {
         id: task_id,
@@ -544,6 +549,7 @@ async fn test_secondary_sync_now_returns_new_file_to_primary() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 
     std::fs::create_dir_all(secondary.sync_dir.join("from-secondary")).unwrap();
@@ -758,6 +764,7 @@ fn test_refresh_pending_returns_discovers_secondary_new_file_without_network() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 
     std::fs::write(
@@ -800,6 +807,7 @@ async fn test_secondary_delete_requires_explicit_return_delete() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
     secondary.insert_task(SyncTask {
         id: task_id,
@@ -812,6 +820,7 @@ async fn test_secondary_delete_requires_explicit_return_delete() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 
     std::fs::write(primary.sync_dir.join("shared.txt"), "same").unwrap();
@@ -888,6 +897,7 @@ async fn test_secondary_sync_now_keeps_pending_when_primary_has_unbaselined_file
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
     secondary.insert_task(SyncTask {
         id: task_id,
@@ -900,6 +910,7 @@ async fn test_secondary_sync_now_keeps_pending_when_primary_has_unbaselined_file
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 
     std::fs::write(primary.sync_dir.join("same-name.txt"), "primary version").unwrap();
@@ -984,6 +995,7 @@ async fn test_secondary_sync_now_reports_remote_scan_failure_and_keeps_pending()
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 
     std::fs::write(secondary.sync_dir.join("offline.txt"), "pending only").unwrap();
@@ -1032,6 +1044,7 @@ async fn test_primary_recreates_same_content_after_delete_syncs_again() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
     secondary.insert_task(SyncTask {
         id: task_id,
@@ -1044,6 +1057,7 @@ async fn test_primary_recreates_same_content_after_delete_syncs_again() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 
     let primary_file = primary.sync_dir.join("again.txt");
@@ -1104,6 +1118,7 @@ async fn test_primary_sync_now_creates_empty_directory_on_secondary() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
     secondary.insert_task(SyncTask {
         id: task_id,
@@ -1116,6 +1131,7 @@ async fn test_primary_sync_now_creates_empty_directory_on_secondary() {
         enabled: true,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
 
     std::fs::create_dir_all(primary.sync_dir.join("empty-dir")).unwrap();
@@ -1418,6 +1434,7 @@ async fn test_sync_now_rejects_paused_task() {
         enabled: false,
         created_unix_ms: 1,
         updated_unix_ms: 1,
+        last_transfer_activity_unix_ms: 0,
     });
     std::fs::write(primary.sync_dir.join("paused.txt"), "do not sync").unwrap();
 

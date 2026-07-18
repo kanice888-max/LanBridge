@@ -1,8 +1,10 @@
 use anyhow::Result;
 use rusqlite::Connection;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current schema version. Increment when adding new migrations.
-const CURRENT_VERSION: u32 = 5;
+const CURRENT_VERSION: u32 = 8;
 
 /// Run all pending migrations.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -11,27 +13,66 @@ pub fn run(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    backup_database_before_migration(conn, version)?;
+    let tx = conn.unchecked_transaction()?;
+
     if version < 1 {
-        migrate_v1(conn)?;
+        migrate_v1(&tx)?;
     }
 
     if version < 2 {
-        migrate_v2(conn)?;
+        migrate_v2(&tx)?;
     }
 
     if version < 3 {
-        migrate_v3(conn)?;
+        migrate_v3(&tx)?;
     }
 
     if version < 4 {
-        migrate_v4(conn)?;
+        migrate_v4(&tx)?;
     }
 
     if version < 5 {
-        migrate_v5(conn)?;
+        migrate_v5(&tx)?;
     }
 
-    conn.pragma_update(None, "user_version", CURRENT_VERSION)?;
+    if version < 6 {
+        migrate_v6(&tx)?;
+    }
+
+    if version < 7 {
+        migrate_v7(&tx)?;
+    }
+
+    if version < 8 {
+        migrate_v8(&tx)?;
+    }
+
+    tx.pragma_update(None, "user_version", CURRENT_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn backup_database_before_migration(conn: &Connection, version: u32) -> Result<()> {
+    if version == 0 {
+        return Ok(());
+    }
+    let Some(path) = conn.path().map(Path::new) else {
+        return Ok(());
+    };
+    if !path.exists() || path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let backup = path.with_extension(format!(
+        "pre-v{}-{}-{}.bak",
+        CURRENT_VERSION, version, timestamp
+    ));
+    std::fs::copy(path, backup)?;
     Ok(())
 }
 
@@ -201,6 +242,83 @@ fn migrate_v5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Durable receive and conflict-resolution recovery state.
+fn migrate_v6(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS transfer_commit_journal (
+            commit_id           TEXT PRIMARY KEY,
+            task_id             TEXT NOT NULL,
+            relative_path       TEXT NOT NULL,
+            expected_target_hash TEXT,
+            incoming_hash       TEXT NOT NULL,
+            partial_path        TEXT NOT NULL,
+            history_path        TEXT,
+            state               TEXT NOT NULL CHECK (state IN ('Prepared', 'FilesystemCommitted', 'MetadataCommitted')),
+            created_unix_ms      INTEGER NOT NULL,
+            updated_unix_ms      INTEGER NOT NULL,
+            UNIQUE(task_id, relative_path, incoming_hash)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_transfer_commit_state
+            ON transfer_commit_journal(state);
+
+        CREATE TABLE IF NOT EXISTS conflict_resolution_journal (
+            resolution_id       TEXT PRIMARY KEY,
+            task_id             TEXT NOT NULL,
+            relative_path       TEXT NOT NULL,
+            mode                TEXT NOT NULL,
+            conflict_path       TEXT,
+            primary_hash        TEXT,
+            secondary_hash      TEXT,
+            state               TEXT NOT NULL CHECK (state IN ('Prepared', 'RemoteApplied', 'LocalCommitted')),
+            created_unix_ms      INTEGER NOT NULL,
+            updated_unix_ms      INTEGER NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Persist local and remote peer disconnect intent across application restarts.
+fn migrate_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS peer_connection_state (
+            peer_device_id      TEXT PRIMARY KEY,
+            local_disconnected  INTEGER NOT NULL DEFAULT 0,
+            local_revision      INTEGER NOT NULL DEFAULT 0,
+            remote_disconnected INTEGER NOT NULL DEFAULT 0,
+            remote_revision     INTEGER,
+            updated_unix_ms     INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (peer_device_id) REFERENCES paired_devices(device_id) ON DELETE CASCADE
+        );
+
+        INSERT OR IGNORE INTO peer_connection_state (
+            peer_device_id,
+            local_disconnected,
+            local_revision,
+            remote_disconnected,
+            remote_revision,
+            updated_unix_ms
+        )
+        SELECT device_id, 0, 0, 0, NULL, last_seen_unix_ms
+        FROM paired_devices;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Track real transfer activity separately from task configuration updates.
+fn migrate_v8(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "sync_tasks", "last_transfer_activity_unix_ms")? {
+        conn.execute_batch(
+            "ALTER TABLE sync_tasks ADD COLUMN last_transfer_activity_unix_ms INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let mut rows = stmt.query([])?;
@@ -242,6 +360,28 @@ mod tests {
         assert!(column_exists(&conn, "paired_devices", "last_address").unwrap());
         assert!(table_exists(&conn, "pending_outgoing_task_invites").unwrap());
         assert!(table_exists(&conn, "deferred_transfers").unwrap());
+        assert!(table_exists(&conn, "transfer_commit_journal").unwrap());
+        assert!(table_exists(&conn, "conflict_resolution_journal").unwrap());
+        assert!(table_exists(&conn, "peer_connection_state").unwrap());
+        assert!(column_exists(&conn, "sync_tasks", "last_transfer_activity_unix_ms").unwrap());
+    }
+
+    #[test]
+    fn file_database_is_backed_up_before_upgrading_existing_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_v1(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+
+        run(&conn).unwrap();
+
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("bak"))
+            .count();
+        assert_eq!(backups, 1);
     }
 
     fn table_exists(conn: &Connection, table: &str) -> Result<bool> {

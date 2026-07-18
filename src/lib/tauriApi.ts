@@ -1,6 +1,30 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { isTauriBridgeAvailable } from "./runtime";
 
+export function formatSyncOperationError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (message.includes("TargetChanged") || message.includes("TargetPreconditionFailed")) {
+    return "目标文件已变化。请重新扫描并处理冲突后重试。";
+  }
+  if (message.includes("TransferAlreadyInProgress")) {
+    return "该文件已有传输正在进行。请等待完成，或取消原传输后重试。";
+  }
+  if (message.includes("AtomicReplaceFailed")) {
+    return "无法替换目标文件。请关闭正在占用该文件的程序并重试。";
+  }
+  if (
+    message.includes("UnsafePath") ||
+    message.includes("SymlinkNotAllowed") ||
+    message.includes("PathEscapesTaskRoot")
+  ) {
+    return "路径安全检查未通过。请移除符号链接/Junction，或重新选择同步目录。";
+  }
+  if (message.toLowerCase().includes("recover")) {
+    return "文件提交正在恢复中。请等待恢复完成后重新扫描。";
+  }
+  return message.replace(/^Error:\s*/, "") || "操作失败，请重试。";
+}
+
 // ─── Types ───
 
 export interface IdentityInfo {
@@ -28,6 +52,14 @@ export interface SyncTask {
   enabled: boolean;
   created_unix_ms: number;
   updated_unix_ms: number;
+  last_transfer_activity_unix_ms: number;
+}
+
+export interface TaskAccessIssue {
+  task_id: string;
+  task_name: string;
+  local_path: string;
+  message: string;
 }
 
 export interface FileSnapshot {
@@ -114,6 +146,23 @@ export interface AppSettings {
   history_retention_days: number;
   history_size_limit_mb: number;
   discovery_enabled: boolean;
+  update_check: UpdateCheckResult;
+}
+
+export type UpdateCheckStatus = "not_checked" | "update_available" | "up_to_date" | "no_release";
+
+export interface UpdateRelease {
+  version: string;
+  tag_name: string;
+  name: string | null;
+  published_at: string | null;
+}
+
+export interface UpdateCheckResult {
+  current_version: string;
+  status: UpdateCheckStatus;
+  release: UpdateRelease | null;
+  checked_at_unix_ms: number | null;
 }
 
 export interface CreateTaskRequest {
@@ -237,6 +286,7 @@ const previewTasks: SyncTask[] = [
     enabled: true,
     created_unix_ms: previewNow - 86400000,
     updated_unix_ms: previewNow,
+  last_transfer_activity_unix_ms: 0,
   },
   {
     id: previewSecondaryTaskId,
@@ -249,6 +299,7 @@ const previewTasks: SyncTask[] = [
     enabled: true,
     created_unix_ms: previewNow - 172800000,
     updated_unix_ms: previewNow - 60000,
+  last_transfer_activity_unix_ms: 0,
   },
   {
     id: "preview-project-3",
@@ -261,6 +312,7 @@ const previewTasks: SyncTask[] = [
     enabled: true,
     created_unix_ms: previewNow - 180000,
     updated_unix_ms: previewNow - 120000,
+  last_transfer_activity_unix_ms: 0,
   },
   {
     id: "preview-project-4",
@@ -273,6 +325,7 @@ const previewTasks: SyncTask[] = [
     enabled: true,
     created_unix_ms: previewNow - 280000,
     updated_unix_ms: previewNow - 220000,
+  last_transfer_activity_unix_ms: 0,
   },
   {
     id: "preview-project-5",
@@ -285,6 +338,7 @@ const previewTasks: SyncTask[] = [
     enabled: true,
     created_unix_ms: previewNow - 380000,
     updated_unix_ms: previewNow - 320000,
+  last_transfer_activity_unix_ms: 0,
   },
 ];
 
@@ -381,6 +435,8 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
       return previewTask(args?.taskId as string | undefined);
     case "list_ready_auto_sync_tasks":
       return [];
+    case "list_task_access_issues":
+      return [];
     case "get_task_file_list_refresh_hint":
       return { revision: 0, should_refresh: false, quiet_ms: 0, reason: "none" };
     case "scan_task":
@@ -431,6 +487,10 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
         connected: true,
         last_seen_unix_ms: previewNow,
         error: null,
+        status_reason: "online",
+        error_code: null,
+        error_detail: null,
+        peer_app_version: "0.1.4",
       };
     case "get_transfer_progress":
       return previewShowTransfers
@@ -481,9 +541,45 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
         message: "received delete from peer",
         created_unix_ms: previewNow,
       }));
+    case "get_diagnostic_report":
+      return [
+        "LanBridge 诊断摘要",
+        "应用版本: preview",
+        "已自动隐藏本机目录、任务根目录与完整设备标识。",
+        "",
+        "[运行诊断（最近 200 条）]",
+        "暂无记录",
+      ].join("\n");
     case "get_settings":
     case "get_app_settings":
-      return { history_retention_days: 30, history_size_limit_mb: 1024, discovery_enabled: true };
+      return {
+        history_retention_days: 30,
+        history_size_limit_mb: 1024,
+        discovery_enabled: true,
+        update_check: {
+          current_version: __APP_VERSION__,
+          status: "up_to_date",
+          release: {
+            version: __APP_VERSION__,
+            tag_name: `v${__APP_VERSION__}`,
+            name: null,
+            published_at: null,
+          },
+          checked_at_unix_ms: previewNow,
+        },
+      };
+    case "check_for_updates":
+      return {
+        current_version: __APP_VERSION__,
+        status: "update_available",
+        release: {
+          version: "0.2.0-beta.1",
+          tag_name: "v0.2.0-beta.1",
+          name: "Preview update",
+          published_at: "2026-07-19T00:00:00Z",
+        },
+        checked_at_unix_ms: previewNow,
+      };
     case "set_discovery_enabled":
       return {
         enabled: args?.enabled ?? true,
@@ -523,7 +619,11 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
         multicast_port: 53530,
       };
     case "get_local_network_info":
-      return { interfaces: [{ name: "Wi-Fi", ip: "192.168.1.5" }], tcp_port: 9527 };
+      return {
+        interfaces: [{ name: "Wi-Fi", ip: "192.168.1.5" }],
+        preferred_interface: { name: "Wi-Fi", ip: "192.168.1.5" },
+        tcp_port: 9527,
+      };
     case "disconnect_task_peer":
       return {
         task_id: args?.taskId,
@@ -532,7 +632,26 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
         connected: false,
         last_seen_unix_ms: previewNow,
         error: "manually disconnected",
+        status_reason: "local_manual_disconnect",
+        error_code: null,
+        error_detail: null,
+        peer_app_version: "0.1.4",
       };
+    case "reconnect_task_peer":
+      return {
+        task_id: args?.taskId,
+        peer_device_id: "preview-peer",
+        address: "192.168.1.5:9527",
+        connected: true,
+        last_seen_unix_ms: previewNow,
+        error: null,
+        status_reason: "online",
+        error_code: null,
+        error_detail: null,
+        peer_app_version: "0.1.4",
+      };
+    case "open_local_network_settings":
+      return null;
     case "check_network_environment":
       return {
         ok: true,
@@ -546,6 +665,10 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
     case "connect_peer":
     case "connect_discovered_peer":
       return "preview-peer";
+    case "confirm_pairing_code":
+      return "preview-pairing-session";
+    case "approve_pairing":
+      return undefined;
     case "send_task_invite":
       return { invite_id: "preview-invite", task_id: previewPrimaryTaskId, status: "Pending", task: null, error: null };
     case "poll_task_invite":
@@ -555,6 +678,8 @@ function previewCommand(command: string, args?: Record<string, unknown>): unknow
     case "accept_task_invite":
       return previewTasks[0];
     case "open_in_file_manager":
+    case "open_project_github":
+    case "open_available_update_release":
     case "delete_sync_task":
     case "cancel_transfer":
       previewShowTransfers = false;
@@ -577,7 +702,7 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   if (!isTauriBridgeAvailable()) {
     return previewCommand(command, args) as T;
   }
-  return invoke<T>(command, args);
+  return args === undefined ? invoke<T>(command) : invoke<T>(command, args);
 }
 
 // ─── API Functions ───
@@ -714,6 +839,10 @@ export async function listReadyAutoSyncTasks(): Promise<string[]> {
   return call("list_ready_auto_sync_tasks");
 }
 
+export async function listTaskAccessIssues(): Promise<TaskAccessIssue[]> {
+  return call("list_task_access_issues");
+}
+
 export async function getTaskFileListRefreshHint(
   taskId: string
 ): Promise<TaskFileListRefreshHint> {
@@ -804,6 +933,23 @@ export async function listLogs(limit?: number): Promise<LogEntry[]> {
   return call("list_logs", { limit });
 }
 
+export async function getDiagnosticReport(): Promise<string> {
+  return call("get_diagnostic_report");
+}
+
+export async function copyTextToClipboard(text: string): Promise<void> {
+  if (isTauriBridgeAvailable()) {
+    const { writeText } = await import("@tauri-apps/api/clipboard");
+    await writeText(text);
+    return;
+  }
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  throw new Error("Clipboard is unavailable");
+}
+
 export async function writeLog(
   level: string,
   message: string,
@@ -830,6 +976,18 @@ export async function setDiscoveryEnabled(enabled: boolean): Promise<DiscoverySt
   return call("set_discovery_enabled", { enabled });
 }
 
+export async function checkForUpdates(force: boolean): Promise<UpdateCheckResult> {
+  return call("check_for_updates", { force });
+}
+
+export async function openProjectGithub(): Promise<void> {
+  return call("open_project_github");
+}
+
+export async function openAvailableUpdateRelease(): Promise<void> {
+  return call("open_available_update_release");
+}
+
 export async function hideMainWindowToTray(): Promise<void> {
   return call("hide_main_window_to_tray");
 }
@@ -849,6 +1007,7 @@ export interface InterfaceInfo {
 
 export interface LocalNetworkInfo {
   interfaces: InterfaceInfo[];
+  preferred_interface: InterfaceInfo | null;
   tcp_port: number;
 }
 
@@ -919,6 +1078,10 @@ export interface TaskPeerStatus {
   connected: boolean;
   last_seen_unix_ms: number;
   error: string | null;
+  status_reason?: "online" | "local_manual_disconnect" | "remote_manual_disconnect" | "offline" | null;
+  error_code?: "no_route" | "local_network_unavailable" | "refused" | "timeout" | "identity_mismatch" | "authentication_rejected" | "protocol_mismatch" | "unknown" | null;
+  error_detail?: string | null;
+  peer_app_version?: string | null;
 }
 
 export interface TaskFileListRefreshHint {
@@ -966,4 +1129,12 @@ export async function getTaskPeerStatus(taskId: string): Promise<TaskPeerStatus>
 
 export async function disconnectTaskPeer(taskId: string): Promise<TaskPeerStatus> {
   return call("disconnect_task_peer", { taskId });
+}
+
+export async function reconnectTaskPeer(taskId: string): Promise<TaskPeerStatus> {
+  return call("reconnect_task_peer", { taskId });
+}
+
+export async function openLocalNetworkSettings(): Promise<void> {
+  return call("open_local_network_settings");
 }

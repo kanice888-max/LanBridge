@@ -6,13 +6,12 @@
 
 ## 基准来源
 
-- 正式发布源码基准：优先使用 `worktrees/integration`。
-- macOS 或 Windows 分支仍在单独开发时，可以从对应 worktree 同步实现，但不要上传整个 `worktrees/` 目录。
-- 根目录 `main` 应作为公开应用源码仓库维护，而不是开发机上的协调工作区快照。
+- 正式发布源码基准：使用已完成干净发布检查的 `worktrees/integration` 提交。
+- macOS 或 Windows 分支仍在单独开发时，可以从对应 worktree 同步实现；在两个平台分支完成必要验证前，不把任一平台 worktree 直接当作正式发布源码。
+- 根目录 `main` 是产品文档、架构、计划和工作流的协调分支，不自动等同于可发布的应用源码快照。只有 integration 候选内容经过有意提升并完成验证后，才可以发布到公开 GitHub 的默认分支。
+- 无论从哪个 worktree 取发布候选，都不要上传整个 `worktrees/` 目录或开发机根目录快照。
 
 ## 必须上传
-
-这些内容是开源仓库可构建、可审查所需内容。
 
 - 应用源码：`src/`
 - Tauri / Rust 源码：`src-tauri/src/`
@@ -23,14 +22,12 @@
 - 前端入口和配置：`index.html`、`package.json`、`package-lock.json`、`vite.config.ts`、`tsconfig.json`、`tsconfig.node.json`
 - 项目脚本：`scripts/`
 - 应用实际引用的静态资源：`src/assets/`、`public/`，如果存在且被源码引用。
-- 公开基础文档：`README.md`、`LICENSE`、`SECURITY.md`、`AGENTS.md`
-- 必要 docs：`docs/architecture/`、`docs/rules/`、`docs/validation/`、`docs/workflows/`、`docs/testing/`
+- 公开基础文档：`README.md` 及其语言版本、`LICENSE`、`SECURITY.md`、`AGENTS.md`
+- 必要 docs：`docs/architecture/`、`docs/rules/`、`docs/security/`、`docs/validation/`、`docs/workflows/`、`docs/testing/`
 - 公开质量记录：`docs/quality/debt-log.md`
 - 设计规范：`redesign/design.md`
 
 ## 可以上传，但发布前需要审查
-
-这些内容可以公开，但必须确认不包含内部草稿、私人路径、账号、token、证书、签名密钥、真实同步文件或未授权素材。
 
 - 公开开发路线或执行计划。
 - 通用测试说明和复现文档。
@@ -39,8 +36,6 @@
 - 宣传用最终成品，例如压缩后的视频或截图；优先放到 GitHub Release assets 或单独宣传仓库。
 
 ## 禁止上传
-
-这些内容不应进入 GitHub 主仓库。
 
 - 本地 worktree：`worktrees/`、`.worktrees/`
 - 依赖目录：`node_modules/`
@@ -69,20 +64,25 @@
 
 ## 发布前检查命令
 
-上传或推送前先运行：
-
 ```bash
+cd worktrees/integration
+npm ci
 git status --short
 git diff --check
 npm run lint:names
 npm run build
+npm test
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+上述检查应在干净的 integration 候选环境执行；正式发布还必须满足 `docs/validation/checks.md` 中要求的原生 Windows 与 macOS 发布门禁。
 
 检查是否误跟踪禁止上传内容：
 
 ```bash
-git ls-files | rg '(^|/)(worktrees|node_modules|dist|target|remotion-promo)(/|$)|\.DS_Store|Thumbs\.db|\.dmg$|\.app$|\.msi$|\.exe$|lanbridge\.log|startup-crash\.log|crash-diagnostics.*\.log|identity\.key|\.sqlite$|\.db$'
+git ls-files \
+  | rg '(^|/)(worktrees|node_modules|dist|target|remotion-promo)(/|$)|(^|/)\.env(\.[^/]+)?$|\.DS_Store|Thumbs\.db|\.dmg$|\.app$|\.msi$|\.exe$|\.(pem|p12|pfx|keystore|key)$|lanbridge\.log|startup-crash\.log|crash-diagnostics.*\.log|\.sqlite$|\.db$' \
+  | rg -v '(^|/)\.env\.example$'
 ```
 
 期望没有命中。若命中的是文档中的示例路径，需要人工确认；若命中真实文件，应从 Git 跟踪中移除。
@@ -93,13 +93,14 @@ git ls-files | rg '(^|/)(worktrees|node_modules|dist|target|remotion-promo)(/|$)
 - README 说明 LanBridge 是 Primary/Secondary + 显式回传模型，不描述为完全双向同步。
 - `SECURITY.md` 可从 README 进入。
 - docs 中没有本机绝对路径、私人账号、token、证书、签名密钥或真实同步文件。
-- `.gitignore` 覆盖本文禁止上传的主要类别。
+- `.gitignore` 覆盖本文禁止上传的主要类别，以及常见的环境变量和证书/签名凭证文件。
 
 ## 最小推荐仓库结构
 
 ```text
 AGENTS.md
 README.md
+README.en.md
 LICENSE
 SECURITY.md
 package.json

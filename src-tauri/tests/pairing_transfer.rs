@@ -383,6 +383,7 @@ async fn test_sync_server_rejects_unauthenticated_file_transfer() {
             relative_path,
             success,
             error,
+            ..
         } => {
             assert_eq!(ack_task, task_id);
             assert_eq!(relative_path, "docs/readme.txt");
@@ -476,6 +477,7 @@ async fn test_sync_server_keeps_legacy_v1_chunk_ack_contract() {
                 relative_path: "legacy.txt".to_string(),
                 file_hash,
                 total_bytes: data.len() as u64,
+                expected_target_hash: None,
             })
             .unwrap(),
         )
@@ -546,6 +548,7 @@ async fn test_sync_server_v1_streaming_uses_checkpoint_acks() {
                 relative_path: "checkpoint.bin".to_string(),
                 file_hash: String::new(),
                 total_bytes,
+                expected_target_hash: None,
             })
             .unwrap(),
         )
@@ -707,6 +710,13 @@ async fn test_task_register_message_enables_later_file_transfer() {
     server.register_trusted_peer(local_identity.public());
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-003";
+    server
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id.clone(),
+        )
+        .unwrap();
     let manager = ConnectionManager::new();
     manager.register_connection(lanbridge::transport::PeerConnection {
         device_id: "peer-002".to_string(),
@@ -731,6 +741,26 @@ async fn test_task_register_message_enables_later_file_transfer() {
             assert!(success, "unexpected task ack error: {:?}", error);
         }
         other => panic!("expected TaskAck, got {:?}", other),
+    }
+
+    let unauthorized_dir = TempDir::new().unwrap();
+    let rejected = lanbridge::transport::connection::send_authenticated_message_to_peer(
+        &manager,
+        &local_identity,
+        "peer-002",
+        SyncMessage::TaskRegister {
+            task_id: task_id.to_string(),
+            root_path: unauthorized_dir.path().to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    match rejected {
+        SyncMessage::TaskAck { success, error, .. } => {
+            assert!(!success);
+            assert_eq!(error.as_deref(), Some("TaskRootMismatch"));
+        }
+        other => panic!("expected rejected TaskAck, got {:?}", other),
     }
 
     let data = b"after task register".to_vec();
@@ -1469,6 +1499,7 @@ async fn test_v2_upload_rejects_bad_offset_and_cleans_partial() {
             task_id: task_id.to_string(),
             relative_path: relative_path.to_string(),
             total_bytes: 4,
+            expected_target_hash: None,
         },
     )
     .await;
@@ -1536,6 +1567,7 @@ async fn test_v2_upload_returns_error_when_checkpoint_ack_fails() {
                 task_id,
                 relative_path,
                 total_bytes,
+                ..
             } => {
                 assert_eq!(total_bytes, 17 * 1024 * 1024);
                 (task_id, relative_path)
@@ -1636,6 +1668,7 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                 relative_path: start_path,
                 file_hash,
                 total_bytes,
+                ..
             } => {
                 assert_eq!(start_task, task_id);
                 assert_eq!(start_path, "fallback.txt");
@@ -1651,6 +1684,10 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                         relative_path: start_path.clone(),
                         success: true,
                         error: None,
+                        resolution: None,
+                        conflict_path: None,
+                        primary_hash: None,
+                        secondary_hash: None,
                     },
                 )
                 .await;
@@ -1678,6 +1715,10 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                             relative_path: chunk_path,
                             success: true,
                             error: None,
+                            resolution: None,
+                            conflict_path: None,
+                            primary_hash: None,
+                            secondary_hash: None,
                         },
                     )
                     .await;
@@ -1697,6 +1738,10 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                             relative_path: end_path,
                             success: true,
                             error: None,
+                            resolution: None,
+                            conflict_path: None,
+                            primary_hash: None,
+                            secondary_hash: None,
                         },
                     )
                     .await;
@@ -1900,6 +1945,7 @@ async fn test_server_updates_db_after_authenticated_chunked_receive() {
             enabled: true,
             created_unix_ms: 1,
             updated_unix_ms: 1,
+            last_transfer_activity_unix_ms: 0,
         })
         .unwrap();
     server
@@ -1965,6 +2011,13 @@ async fn test_task_register_persists_across_server_restart() {
         let server = SyncServer::start_in_background(0).unwrap();
         server.set_task_roots_persistence_path(&roots_path).unwrap();
         server.register_trusted_peer(local_identity.public());
+        server
+            .register_task_root(
+                task_id,
+                remote_dir.path(),
+                local_identity.public().device_id.clone(),
+            )
+            .unwrap();
         let manager = ConnectionManager::new();
         manager.register_connection(lanbridge::transport::PeerConnection {
             device_id: "persist-peer".to_string(),
@@ -2088,6 +2141,13 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
             secondary_public.device_id.clone(),
         )
         .unwrap();
+    secondary_server
+        .register_task_root(
+            task_id.to_string(),
+            secondary_dir.path(),
+            primary_public.device_id.clone(),
+        )
+        .unwrap();
 
     let register_response = lanbridge::transport::connection::send_authenticated_message_to_peer(
         &primary_manager,
@@ -2183,6 +2243,7 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
             enabled: true,
             created_unix_ms: 1,
             updated_unix_ms: 1,
+            last_transfer_activity_unix_ms: 0,
         })
         .unwrap();
     let baseline_repo = SyncBaselineRepository::new(&conn);

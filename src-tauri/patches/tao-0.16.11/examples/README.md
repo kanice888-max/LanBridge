@@ -32,5 +32,5 @@ Run the `cargo run --example <file_name>` to see how each example works.
 - `video_modes`: example that lists all video modes of primary monitor
 - `window_icon`: add window icon.
 - `window`: example that makes a window.
-- `system_tray`: add icon to your system tray, click icon to start. 
-- `system_tray_no_menu`: like system_tray, but no menu when right click icon. 
+- `system_tray`: add icon to your system tray, click icon to start.
+- `system_tray_no_menu`: like system_tray, but no menu when right click icon.

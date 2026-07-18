@@ -38,6 +38,7 @@ fn create_task(conn: &Connection) -> SyncTask {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     let repo = SyncTaskRepository::new(conn);
     repo.insert(&task).unwrap();

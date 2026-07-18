@@ -2625,6 +2625,15 @@ button {
   user-select: none;
 }
 
+.device-carousel.is-empty {
+  justify-content: center;
+  overflow: visible;
+  padding-right: 24px;
+  padding-left: 24px;
+  cursor: default;
+  scroll-snap-type: none;
+}
+
 .device-carousel:active {
   cursor: grabbing;
 }
@@ -2735,15 +2744,6 @@ button {
   gap: 20px;
   width: min(620px, 92%);
   margin-top: -8px;
-}
-
-.discover-stage.step-role .stage-folder,
-.discover-stage.step-folder .stage-folder,
-.discover-stage.step-invite .stage-folder,
-.discover-stage.step-role .connection-flow,
-.discover-stage.step-folder .connection-flow,
-.discover-stage.step-invite .connection-flow {
-  transform: translateY(28px);
 }
 
 .stage-stepper {
@@ -3267,6 +3267,21 @@ button {
   box-shadow: var(--stage-shadow-1);
 }
 
+.stage-empty-card {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  padding: 0 22px;
+  overflow: hidden;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: var(--stage-row-shadow);
+  color: var(--text);
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .stage-file-row {
   grid-template-columns: minmax(0, 1fr) auto 24px;
   gap: 14px;
@@ -3409,6 +3424,57 @@ button {
 .settings-stage-row strong,
 .settings-stage-row select {
   font-weight: 520;
+}
+
+.settings-action-button {
+  min-height: 30px;
+  border: 0;
+  border-radius: 9px;
+  color: #fff;
+  background: #000;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.settings-action-button:disabled {
+  cursor: default;
+  opacity: .45;
+}
+
+.settings-repository-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-github-link {
+  border: 0;
+  background: transparent;
+  color: #1677ff;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.settings-github-link:hover {
+  color: #0958d9;
+}
+
+.settings-github-link:focus-visible,
+.settings-action-button:focus-visible {
+  outline: 2px solid #1677ff;
+  outline-offset: 2px;
+}
+
+.settings-update-available-button {
+  background: #16a34a;
+}
+
+.settings-update-available-button:hover {
+  background: #15803d;
 }
 
 .settings-select-wrap {
@@ -4432,23 +4498,40 @@ button {
 
 .task-bubble-menu {
   position: absolute;
-  top: 42%;
+  top: 54%;
   left: 50%;
-  z-index: 30;
+  z-index: 90;
   display: block;
   width: 0;
   height: 0;
   pointer-events: none;
 }
 
-.task-bubble-menu button {
+.task-bubble-anchor {
   position: absolute;
+  width: 0;
+  height: 39px;
+  transform-origin: 0 50%;
+  pointer-events: none;
+}
+
+.task-bubble-center {
+  display: flex;
+  width: max-content;
+  height: 39px;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.task-bubble-menu button {
+  position: relative;
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: center;
   gap: 7px;
-  min-width: 76px;
-  max-width: 136px;
+  min-width: 72px;
+  max-width: 118px;
   height: 39px;
   border: 0;
   border-radius: 999px;
@@ -4456,7 +4539,7 @@ button {
   background: #000;
   box-shadow: 0 10px 24px rgba(0, 0, 0, .10);
   padding: 0 13px;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 520;
   overflow: hidden;
   white-space: nowrap;
@@ -4478,7 +4561,7 @@ button {
 
 .task-bubble-name {
   min-width: 0;
-  max-width: 94px;
+  max-width: 76px;
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4488,6 +4571,93 @@ button {
 .task-bubble-menu button.active {
   color: #fff;
   background: #000;
+}
+
+.task-bubble-more-anchor {
+  z-index: 24;
+}
+
+.task-bubble-menu .task-bubble-more-trigger {
+  min-width: 122px;
+}
+
+.task-bubble-more-count {
+  display: inline-grid;
+  min-width: 24px;
+  height: 20px;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .2);
+  padding: 0 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-bubble-more-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 50%;
+  z-index: 100;
+  display: grid;
+  width: min(248px, calc(100vw - 40px));
+  max-height: min(280px, calc(100vh - 210px));
+  gap: 8px;
+  overflow-y: auto;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: var(--stage-row-shadow);
+  padding: 10px;
+  pointer-events: auto;
+  transform: translateX(-50%);
+  scrollbar-width: thin;
+}
+
+.task-bubble-more-title {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: .04em;
+  padding: 2px 4px 0;
+}
+
+.task-bubble-more-list {
+  display: grid;
+  gap: 5px;
+}
+
+.task-bubble-more-panel .task-bubble-more-item {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  height: 40px;
+  justify-content: flex-start;
+  border-radius: 11px;
+  background: #f4f4f5;
+  box-shadow: none;
+  color: #111;
+  padding: 0 11px;
+}
+
+.task-bubble-more-panel .task-bubble-more-item:hover,
+.task-bubble-more-panel .task-bubble-more-item.active {
+  color: #fff;
+  background: #000;
+}
+
+.task-bubble-more-panel .task-bubble-name {
+  flex: 1;
+  max-width: none;
+  text-align: left;
+}
+
+.task-bubble-more-item small {
+  color: #8c94a3;
+  font-size: 11px;
+}
+
+.task-bubble-more-item.active small,
+.task-bubble-more-item:hover small {
+  color: rgba(255, 255, 255, .68);
 }
 
 .settings-language-trigger {
@@ -4521,6 +4691,25 @@ button {
 
 .logs-toolbar {
   margin-bottom: 16px;
+}
+
+.logs-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.diagnostic-copy-status {
+  min-width: 96px;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-align: right;
+}
+
+.diagnostic-copy-note {
+  margin: -8px 0 16px;
+  color: var(--muted);
+  font-size: var(--text-2xs);
 }
 
 .logs-toolbar .btn {
@@ -5509,20 +5698,68 @@ body,
   overflow-wrap: anywhere;
 }
 
-.discover-stage.step-role .stage-folder,
-.discover-stage.step-folder .stage-folder,
-.discover-stage.step-invite .stage-folder {
-  transform: translateY(12px);
+.discover-stage.connection-step-active {
+  /* Let the pairing stage shrink with a short window so its own scroller owns overflow. */
+  min-height: 0;
 }
 
-.discover-stage.step-role .connection-flow,
-.discover-stage.step-folder .connection-flow,
-.discover-stage.step-invite .connection-flow {
-  transform: translateY(14px);
+.discover-stage.connection-step-active .discover-center {
+  inset: 54px 0 28px;
+  display: grid;
+  grid-template-rows: auto auto;
+  align-content: center;
+  justify-items: center;
+  gap: 24px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 24px 34px;
+  overscroll-behavior: contain;
+  scroll-padding-block: 24px 48px;
+  scrollbar-width: none;
+}
+
+.discover-stage.connection-step-active .discover-center::-webkit-scrollbar {
+  display: none;
+}
+
+.discover-stage.connection-step-active .discover-folder-host {
+  z-index: 0;
+  margin: 0;
+  padding: 0;
+  pointer-events: none;
+}
+
+.discover-stage.connection-step-active .discover-folder-hitbox,
+.discover-stage.connection-step-active .discover-folder-host .stage-folder {
+  pointer-events: none;
+}
+
+.discover-stage.connection-step-active .pairing-workflow-slot {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 100%;
+  justify-items: center;
+  /* Match the manual-entry visual gap while the decorative folder stays non-interactive. */
+  margin-top: -60px;
+}
+
+.discover-stage.connection-step-active .connection-flow {
+  margin: 0;
+  transform: none;
+}
+
+@media (max-height: 820px) {
+  .discover-stage.connection-step-active .discover-center {
+    inset: 36px 0 16px;
+    align-content: start;
+    padding: 16px 34px 48px;
+  }
 }
 
 .connection-flow {
-  gap: 22px;
+  gap: 18px;
   margin-top: 0;
 }
 
@@ -5684,6 +5921,32 @@ body,
 
 .incoming-actions .mini-dark-btn {
   min-width: 70px;
+}
+
+/* Pending task invitations are app-wide: keep the prompt above page content,
+   but outside the navigation and top-message stack. */
+.incoming-invite-overlay-layer {
+  z-index: 530;
+}
+
+.global-incoming-invite {
+  position: absolute;
+  top: clamp(112px, 15vh, 176px);
+  right: max(24px, env(safe-area-inset-right));
+  left: auto;
+  width: min(var(--stage-floating-width), calc(100vw - 48px));
+  max-height: calc(100vh - 136px);
+  overflow-y: auto;
+  transform: none;
+  pointer-events: auto;
+}
+
+@media (max-width: 760px) {
+  .global-incoming-invite {
+    right: 50%;
+    width: min(var(--stage-floating-width), calc(100vw - 32px));
+    transform: translateX(50%);
+  }
 }
 
 .incoming-actions .mini-danger-btn {
@@ -5948,8 +6211,23 @@ body,
   line-height: 1.15;
 }
 
+.role-choice-grid button > .role-choice-icon {
+  grid-row: 1 / 3;
+  align-self: center;
+  justify-self: center;
+  display: block;
+  width: 32px;
+  height: 32px;
+  filter: brightness(0);
+}
+
+.role-choice-grid button.active > .role-choice-icon {
+  filter: none;
+}
+
 .connection-flow.invite-flow {
-  gap: 14px;
+  gap: 8px;
+  transform: translateY(2px);
 }
 
 .invite-project-name-zone,
@@ -5959,12 +6237,12 @@ body,
 }
 
 .invite-project-name-zone {
-  margin-bottom: 2px;
+  margin-bottom: -2px;
 }
 
 .invite-project-name-zone .project-name-input {
   width: min(360px, 82vw);
-  height: 44px;
+  height: 36px;
   border-radius: 0;
   background: transparent;
   color: #111;
@@ -5976,12 +6254,12 @@ body,
 }
 
 .invite-action-zone {
-  margin-top: 4px;
+  margin-top: 0;
 }
 
 .invite-action-zone .stage-primary-btn {
   min-width: 264px;
-  height: 54px;
+  height: 50px;
   font-size: 16px;
 }
 
@@ -6058,6 +6336,88 @@ body,
 
 .transfer-card.has-action .transfer-track {
   right: 62px;
+}
+
+/* Keep sparse states and compact controls aligned with their surrounding cards. */
+.empty-file-row {
+  padding-inline: 20px;
+}
+
+.transfer-cancel {
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  align-self: center;
+  justify-self: center;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  line-height: 0;
+}
+
+.manual-flow {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+}
+
+.manual-flow-title {
+  min-height: 40px;
+  padding: 8px 12px;
+}
+
+.settings-language-popover {
+  width: min(112px, var(--radix-popper-available-width, calc(100vw - 32px)));
+  max-width: calc(100vw - 32px);
+}
+
+/* Final visual and hit-testing guards for compact stage controls. */
+.transfer-card {
+  grid-template-columns: minmax(0, 1fr) max-content 36px;
+}
+
+.transfer-cancel > .animate-icon {
+  display: flex;
+  width: 17px;
+  height: 17px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 17px;
+  line-height: 0;
+}
+
+.transfer-cancel > .animate-icon svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
+.discover-stage.step-manual .discover-below-stage,
+.discover-stage.step-manual .manual-flow {
+  position: relative;
+  z-index: 4;
+  pointer-events: auto;
+}
+
+.discover-stage.step-manual .discover-folder-host,
+.discover-stage.step-manual .discover-folder-hitbox,
+.discover-stage.step-manual .discover-folder-host .stage-folder {
+  pointer-events: none;
+}
+
+.settings-language-popover {
+  box-sizing: border-box;
+  position: absolute !important;
+  top: calc(100% + 8px) !important;
+  right: 0 !important;
+  left: auto !important;
+  transform: none !important;
+  width: min(118px, calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
+}
+
+.settings-language-control {
+  position: relative;
+  justify-self: end;
 }
 
 /* Window chrome, tray dialog, context menu, and scrollbar polish */

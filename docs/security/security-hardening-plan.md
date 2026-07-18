@@ -99,6 +99,11 @@ Commands such as delete, restore, import, history, logging, and file-manager act
 
 LanBridge needs a retention strategy for logs, diagnostics, history entries, and database growth. This requires UX design for maximum size, retention time, manual cleanup, and restore expectations.
 
+Crash diagnostics are bounded to 8 MiB with one rotated file; startup diagnostics are bounded to
+1 MiB. Grossly oversized legacy diagnostics are discarded on the next write so an old unbounded
+log does not remain on disk. Normal per-file and per-directory scan progress is not written to the
+crash diagnostics channel.
+
 ### Public Network Detection
 
 The app should eventually warn when discovery appears to run on a public or untrusted network. This needs careful tuning to avoid noisy false positives and should be paired with discovery privacy mode.
@@ -114,3 +119,22 @@ Before release:
 - Packaged CSP does not include broad localhost or WebSocket wildcards.
 - README links to `SECURITY.md`.
 - No private keys, databases, logs, crash reports, or installers are tracked by Git.
+
+## Transfer And Path Hardening (2026-07)
+
+- `TaskRegister` 只接受本地已批准且 peer/root 完全匹配的任务。
+- 普通网络传输拒绝 LanBridge 内部命名空间；冲突 staging 使用受限入口。
+- 路径组件拒绝 symlink 与 Windows reparse point，并在创建父目录及最终 mutation 前重新核验边界。
+- incoming 使用连接级状态、目标 lease 和 UUID partial；所有失败/断线/注销路径统一清理。
+- legacy V1 不得覆盖或删除已有目标；V2 CAS 失败返回 `TargetChanged`。
+- 接收提交使用持久化 journal，数据库迁移前为已有数据库创建备份。
+- 运行日志使用 `UnsafePath`、`TransferAlreadyInProgress`、`TargetChanged`、`AtomicReplaceFailed`、`PartialCleanupFailed` 和 `LegacyProtocolFallback` 作为可检索事件名。
+
+发布前仍必须在真实 Windows NTFS 验证 Junction/reparse point、文件锁重试与 `ReplaceFileW`，并在真实 macOS APFS 验证 symlink、替换、重启恢复和打包首次运行。本机或交叉编译不能替代这些结果。
+
+## Peer Connection Intent (2026-07)
+
+- 手动断开状态按可信设备持久化，本机与对端意图分别保存。
+- 状态控制消息必须先完成可信设备认证，并使用单调 revision 防止延迟消息回滚。
+- 断开期间仅保留 Ping、身份验证和状态控制通道；文件、目录、删除、扫描和冲突操作统一拒绝。
+- 旧版无 revision 消息只按会话兼容，不得覆盖持久化的新状态。

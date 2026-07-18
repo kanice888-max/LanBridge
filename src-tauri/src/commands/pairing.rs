@@ -111,11 +111,11 @@ pub async fn connect_peer(
 ) -> Result<String, String> {
     connection::ping_peer_address(&address, port)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(connection::friendly_peer_connection_error)?;
 
     let peer_identity = connection::request_peer_identity(&address, port)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(connection::friendly_peer_connection_error)?;
     ensure_not_local_device(&state.identity.public().device_id, &peer_identity.device_id)?;
     let peer = Some(peer_identity);
     crate::transport::connection::pin_connected_peer(&state.connections, &address, port, peer)
@@ -144,15 +144,21 @@ pub async fn connect_discovered_peer(
         }
     }
 
-    let (reachable_address, reachable_port) =
+    let (reachable_address, reachable_port, peer_identity) =
         connect_first_reachable_address(&state, &peer_device_id, &address, port).await?;
+    ensure_not_local_device(&state.identity.public().device_id, &peer_identity.device_id)?;
+    if peer_identity.device_id != peer_device_id {
+        return Err("对端身份已变化，请重新发现设备。".to_string());
+    }
+    if !peer_public_key.is_empty() && peer_identity.public_key != peer_public_key {
+        return Err("对端身份已变化，请重新发现设备。".to_string());
+    }
 
-    let peer = peer_identity_from_args(Some(peer_device_id), Some(peer_public_key));
     crate::transport::connection::pin_connected_peer(
         &state.connections,
         &reachable_address,
         reachable_port,
-        peer,
+        Some(peer_identity),
     )
     .map_err(|e| e.to_string())
 }
@@ -162,7 +168,7 @@ async fn connect_first_reachable_address(
     peer_device_id: &str,
     requested_address: &str,
     requested_port: u16,
-) -> Result<(String, u16), String> {
+) -> Result<(String, u16, pairing::PublicIdentity), String> {
     let mut candidates = vec![(requested_address.to_string(), requested_port)];
     if let Some(device) = state
         .discovery
@@ -181,27 +187,23 @@ async fn connect_first_reachable_address(
     let mut last_error = None;
     for (address, port) in candidates {
         match connection::ping_peer_address(&address, port).await {
-            Ok(()) => return Ok((address, port)),
+            Ok(()) => match connection::request_peer_identity(&address, port).await {
+                Ok(identity) => return Ok((address, port, identity)),
+                Err(e) => {
+                    let message = e.to_string();
+                    if message.contains("对端版本不兼容") {
+                        return Err(connection::friendly_peer_connection_error(message));
+                    }
+                    last_error = Some(message);
+                }
+            },
             Err(e) => last_error = Some(e.to_string()),
         }
     }
 
-    Err(last_error.unwrap_or_else(|| "peer is unreachable".to_string()))
-}
-
-fn peer_identity_from_args(
-    device_id: Option<String>,
-    public_key: Option<Vec<u8>>,
-) -> Option<pairing::PublicIdentity> {
-    match (device_id, public_key) {
-        (Some(device_id), Some(public_key)) if !device_id.is_empty() && !public_key.is_empty() => {
-            Some(pairing::PublicIdentity {
-                device_id,
-                public_key,
-            })
-        }
-        _ => None,
-    }
+    Err(connection::friendly_peer_connection_error(
+        last_error.unwrap_or_else(|| "peer is unreachable".to_string()),
+    ))
 }
 
 fn ensure_not_local_device(local_device_id: &str, peer_device_id: &str) -> Result<(), String> {
@@ -407,7 +409,7 @@ pub fn check_network_environment(
 }
 
 fn local_ipv4_interfaces() -> Vec<(String, Ipv4Addr)> {
-    local_ip_address::list_afinet_netifas()
+    let mut interfaces = local_ip_address::list_afinet_netifas()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(name, ip)| match ip {
@@ -416,7 +418,24 @@ fn local_ipv4_interfaces() -> Vec<(String, Ipv4Addr)> {
             }
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    interfaces.sort_by(|left, right| {
+        local_interface_score(right)
+            .cmp(&local_interface_score(left))
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    interfaces
+}
+
+fn local_interface_score((name, ip): &(String, Ipv4Addr)) -> i32 {
+    let ip_score = if ip.is_private() { 100 } else { 10 };
+    let virtual_penalty = if looks_like_virtual_or_vpn(name) {
+        -40
+    } else {
+        0
+    };
+    ip_score + virtual_penalty
 }
 
 fn looks_like_virtual_or_vpn(name: &str) -> bool {
@@ -427,8 +446,13 @@ fn looks_like_virtual_or_vpn(name: &str) -> bool {
         || lower.contains("utun")
         || lower.contains("virtual")
         || lower.contains("hyper-v")
+        || lower.contains("vethernet")
         || lower.contains("vmware")
+        || lower.contains("virtualbox")
         || lower.contains("wsl")
+        || lower.contains("radmin")
+        || lower.contains("zerotier")
+        || lower.contains("tailscale")
 }
 
 #[cfg(target_os = "macos")]
@@ -465,7 +489,8 @@ mod hex {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_not_local_device;
+    use super::{ensure_not_local_device, local_interface_score};
+    use std::net::Ipv4Addr;
 
     #[test]
     fn reject_local_device_connection() {
@@ -475,5 +500,18 @@ mod tests {
     #[test]
     fn allow_remote_device_connection() {
         assert!(ensure_not_local_device("local", "remote").is_ok());
+    }
+
+    #[test]
+    fn local_interface_score_prefers_physical_lan() {
+        let wifi = ("Wi-Fi".to_string(), Ipv4Addr::new(192, 168, 1, 5));
+        let radmin = ("Radmin VPN".to_string(), Ipv4Addr::new(26, 229, 189, 141));
+        let hyperv = (
+            "vEthernet (Default Switch)".to_string(),
+            Ipv4Addr::new(172, 20, 1, 1),
+        );
+
+        assert!(local_interface_score(&wifi) > local_interface_score(&radmin));
+        assert!(local_interface_score(&wifi) > local_interface_score(&hyperv));
     }
 }

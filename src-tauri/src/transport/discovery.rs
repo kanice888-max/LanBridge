@@ -13,7 +13,7 @@ const MULTICAST_PORT: u16 = 53530;
 const ANNOUNCE_INTERVAL_SECS: u64 = 5;
 const PEER_TIMEOUT_SECS: u64 = 15;
 const DISCOVERY_PROTOCOL_VERSION: u16 = 2;
-const MIN_SUPPORTED_DISCOVERY_PROTOCOL_VERSION: u16 = 2;
+const MIN_SUPPORTED_DISCOVERY_PROTOCOL_VERSION: u16 = 1;
 
 fn current_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -918,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_announce_without_version_is_visible_but_incompatible() {
+    fn legacy_announce_without_version_is_visible_and_compatible() {
         let json = serde_json::json!({
             "device_id": "old-dev",
             "display_name": "Old Mac",
@@ -927,17 +927,14 @@ mod tests {
         });
         let announce: Announce = serde_json::from_value(json).unwrap();
         assert_eq!(announce.protocol_version, 1);
-        assert!(!announce_is_compatible(&announce));
+        assert!(announce_is_compatible(&announce));
 
         let state = DiscoveryState::new();
         state.record_peer(announce, "192.168.1.8".to_string(), None);
         let devices = state.list_devices();
         assert_eq!(devices.len(), 1);
-        assert!(!devices[0].compatible);
-        assert_eq!(
-            devices[0].compatibility_reason.as_deref(),
-            Some("版本不兼容，请升级")
-        );
+        assert!(devices[0].compatible);
+        assert_eq!(devices[0].compatibility_reason, None);
     }
 
     #[test]

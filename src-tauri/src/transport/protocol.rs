@@ -156,6 +156,8 @@ pub enum SyncMessage {
         relative_path: String,
         file_hash: String,
         total_bytes: u64,
+        #[serde(default)]
+        expected_target_hash: Option<String>,
     },
 
     /// One chunk in a chunked file transfer.
@@ -212,6 +214,8 @@ pub enum SyncMessage {
         relative_path: String,
         staged_relative_path: String,
         mode: String,
+        #[serde(default)]
+        resolution_id: Option<String>,
     },
 
     /// Acknowledge successful file write.
@@ -220,6 +224,14 @@ pub enum SyncMessage {
         relative_path: String,
         success: bool,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secondary_hash: Option<String>,
     },
 
     /// Checkpoint ACK during chunked transfer. Sent every N bytes instead of every chunk.
@@ -246,6 +258,34 @@ pub enum SyncMessage {
 
     /// Heartbeat response.
     Pong,
+
+    /// Notify a trusted peer that this device intentionally disconnected.
+    PeerDisconnect {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
+
+    /// Acknowledge a peer disconnect notification.
+    PeerDisconnectAck {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
+
+    /// Notify a trusted peer that this device is available again after a manual disconnect.
+    PeerReconnect {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
+
+    /// Acknowledge a peer reconnect notification.
+    PeerReconnectAck {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
 
     /// Cancel an in-flight transfer and remove any receiver-side partial file.
     TransferCancel {
@@ -275,6 +315,8 @@ pub enum SyncMessage {
         task_id: String,
         relative_path: String,
         total_bytes: u64,
+        #[serde(default)]
+        expected_target_hash: Option<String>,
     },
 
     /// V2 binary chunk header. Raw payload of `bytes` length follows immediately after.
@@ -388,7 +430,7 @@ mod tests {
             public_key: vec![1, 2, 3, 4],
             app_version: Some("0.1.0".to_string()),
             protocol_version: 2,
-            min_protocol_version: 2,
+            min_protocol_version: 1,
         };
         let decoded = round_trip(&msg);
         match decoded {
@@ -403,7 +445,7 @@ mod tests {
                 assert_eq!(public_key, vec![1, 2, 3, 4]);
                 assert_eq!(app_version.as_deref(), Some("0.1.0"));
                 assert_eq!(protocol_version, 2);
-                assert_eq!(min_protocol_version, 2);
+                assert_eq!(min_protocol_version, 1);
             }
             other => panic!("unexpected variant: {:?}", other),
         }
@@ -431,6 +473,33 @@ mod tests {
             }
             other => panic!("unexpected variant: {:?}", other),
         }
+    }
+
+    #[test]
+    fn peer_connection_state_messages_accept_legacy_and_revisioned_payloads() {
+        let legacy: SyncMessage = serde_json::from_value(serde_json::json!({
+            "PeerDisconnect": { "device_id": "old-peer" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            SyncMessage::PeerDisconnect {
+                device_id,
+                state_revision: None
+            } if device_id == "old-peer"
+        ));
+
+        let revisioned = round_trip(&SyncMessage::PeerReconnect {
+            device_id: "new-peer".to_string(),
+            state_revision: Some(42),
+        });
+        assert!(matches!(
+            revisioned,
+            SyncMessage::PeerReconnect {
+                device_id,
+                state_revision: Some(42)
+            } if device_id == "new-peer"
+        ));
     }
 
     #[test]
@@ -478,6 +547,7 @@ mod tests {
             relative_path: "big.bin".to_string(),
             file_hash: "abc".to_string(),
             total_bytes: 1_048_576,
+            expected_target_hash: None,
         };
         match round_trip(&msg) {
             SyncMessage::FileChunkStart {
@@ -485,11 +555,13 @@ mod tests {
                 relative_path,
                 file_hash,
                 total_bytes,
+                expected_target_hash,
             } => {
                 assert_eq!(task_id, "t1");
                 assert_eq!(relative_path, "big.bin");
                 assert_eq!(file_hash, "abc");
                 assert_eq!(total_bytes, 1_048_576);
+                assert_eq!(expected_target_hash, None);
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -554,11 +626,23 @@ mod tests {
             relative_path: "p".to_string(),
             success: true,
             error: None,
+            resolution: Some("keep_both".to_string()),
+            conflict_path: Some("p (Secondary conflict).txt".to_string()),
+            primary_hash: Some("primary".to_string()),
+            secondary_hash: Some("secondary".to_string()),
         };
         match round_trip(&ok) {
-            SyncMessage::FileAck { success, error, .. } => {
+            SyncMessage::FileAck {
+                success,
+                error,
+                resolution,
+                conflict_path,
+                ..
+            } => {
                 assert!(success);
                 assert!(error.is_none());
+                assert_eq!(resolution.as_deref(), Some("keep_both"));
+                assert_eq!(conflict_path.as_deref(), Some("p (Secondary conflict).txt"));
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -568,6 +652,10 @@ mod tests {
             relative_path: "p".to_string(),
             success: false,
             error: Some("disk full".to_string()),
+            resolution: None,
+            conflict_path: None,
+            primary_hash: None,
+            secondary_hash: None,
         };
         match round_trip(&fail) {
             SyncMessage::FileAck { success, error, .. } => {
@@ -616,6 +704,7 @@ mod tests {
                 task_id: "task".to_string(),
                 relative_path: "file.bin".to_string(),
                 total_bytes: 123,
+                expected_target_hash: None,
             },
             SyncMessage::FileStreamEndV2 {
                 task_id: "task".to_string(),
@@ -738,6 +827,7 @@ mod tests {
             relative_path: "folder/file.txt".to_string(),
             staged_relative_path: ".lanbridge-temp/conflict-1/file.txt".to_string(),
             mode: "overwrite".to_string(),
+            resolution_id: Some("resolution-1".to_string()),
         };
         match round_trip(&msg) {
             SyncMessage::ConflictApply {
@@ -745,11 +835,13 @@ mod tests {
                 relative_path,
                 staged_relative_path,
                 mode,
+                resolution_id,
             } => {
                 assert_eq!(task_id, "task");
                 assert_eq!(relative_path, "folder/file.txt");
                 assert_eq!(staged_relative_path, ".lanbridge-temp/conflict-1/file.txt");
                 assert_eq!(mode, "overwrite");
+                assert_eq!(resolution_id.as_deref(), Some("resolution-1"));
             }
             other => panic!("unexpected conflict apply: {:?}", other),
         }

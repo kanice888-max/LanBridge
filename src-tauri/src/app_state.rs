@@ -1,6 +1,7 @@
 use anyhow::Result;
 use notify::RecommendedWatcher;
 use rusqlite::Connection;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -70,12 +71,16 @@ pub struct AppState {
     pub identity: DeviceIdentity,
     pub platform: Box<dyn Platform>,
     pub connections: ConnectionManager,
+    pub peer_state_publisher: crate::transport::connection::PeerConnectionStatePublisher,
     pub discovery: Arc<DiscoveryState>,
     pub _server: Option<SyncServer>,
     pub pending_outgoing_invites: Mutex<HashMap<String, PendingOutgoingTaskInvite>>,
     pub sync_runs: SyncRunCoordinator,
     pub dirty_tasks: TaskDirtyTracker,
     pub file_list_refresh: FileListRefreshTracker,
+    pub transfer_activity: TransferActivityPublisher,
+    pub auto_sync_sweeps: AutoSyncSweepTracker,
+    pub task_access_issues: TaskAccessIssueTracker,
     /// File watchers kept alive for the lifetime of the app.
     /// Each watcher monitors one task's sync root.
     /// Event receivers are consumed by background dirty-marker threads.
@@ -83,10 +88,30 @@ pub struct AppState {
 }
 
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(2_500);
+pub const AUTO_SYNC_FALLBACK_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct FileListRefreshTracker {
     tasks: Arc<Mutex<HashMap<Uuid, FileListRefreshState>>>,
+}
+
+type TransferActivityCallback = Arc<dyn Fn(String) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct TransferActivityPublisher {
+    callback: Arc<Mutex<Option<TransferActivityCallback>>>,
+}
+
+impl TransferActivityPublisher {
+    pub fn set_callback(&self, callback: impl Fn(String) + Send + Sync + 'static) {
+        *self.callback.lock().unwrap() = Some(Arc::new(callback));
+    }
+
+    pub fn publish(&self, task_id: Uuid) {
+        if let Some(callback) = self.callback.lock().unwrap().clone() {
+            callback(task_id.to_string());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +138,7 @@ impl Default for FileListRefreshTracker {
 }
 
 impl FileListRefreshTracker {
-    pub fn mark(&self, task_id: Uuid, reason: &'static str) {
+    pub fn mark(&self, task_id: Uuid, reason: &'static str) -> u64 {
         let mut tasks = self.tasks.lock().unwrap();
         let state = tasks
             .entry(task_id)
@@ -126,6 +151,7 @@ impl FileListRefreshTracker {
         state.revision = state.revision.saturating_add(1);
         state.last_changed_at = Some(Instant::now());
         state.reason = reason;
+        state.revision
     }
 
     pub fn snapshot(&self, task_id: Uuid) -> FileListRefreshSnapshot {
@@ -235,6 +261,92 @@ impl TaskDirtyTracker {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskAccessIssue {
+    pub task_id: String,
+    pub task_name: String,
+    pub local_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TaskAccessIssueTracker {
+    tasks: Arc<Mutex<HashMap<Uuid, TaskAccessIssue>>>,
+}
+
+impl TaskAccessIssueTracker {
+    pub fn mark(&self, task: &SyncTask, message: impl Into<String>) {
+        self.tasks.lock().unwrap().insert(
+            task.id,
+            TaskAccessIssue {
+                task_id: task.id.to_string(),
+                task_name: task.name.clone(),
+                local_path: task.local_path.clone(),
+                message: message.into(),
+            },
+        );
+    }
+
+    pub fn clear(&self, task_id: Uuid) {
+        self.tasks.lock().unwrap().remove(&task_id);
+    }
+
+    pub fn contains(&self, task_id: Uuid) -> bool {
+        self.tasks.lock().unwrap().contains_key(&task_id)
+    }
+
+    pub fn list(&self) -> Vec<TaskAccessIssue> {
+        let mut issues = self
+            .tasks
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        issues.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+        issues
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AutoSyncSweepTracker {
+    last_sweep_at: Arc<Mutex<HashMap<Uuid, Instant>>>,
+}
+
+impl AutoSyncSweepTracker {
+    pub fn should_sweep(&self, task_id: Uuid) -> bool {
+        self.should_sweep_at(task_id, Instant::now(), AUTO_SYNC_FALLBACK_SWEEP_INTERVAL)
+    }
+
+    fn should_sweep_at(&self, task_id: Uuid, now: Instant, interval: Duration) -> bool {
+        let mut sweeps = self.last_sweep_at.lock().unwrap();
+        let Some(last) = sweeps.get_mut(&task_id) else {
+            sweeps.insert(task_id, now);
+            return false;
+        };
+        if now.duration_since(*last) < interval {
+            return false;
+        }
+        *last = now;
+        true
+    }
+
+    pub fn clear(&self, task_id: Uuid) {
+        self.last_sweep_at.lock().unwrap().remove(&task_id);
+    }
+}
+
+pub fn is_permission_denied_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("permissiondenied")
+        || normalized.contains("permission denied")
+        || normalized.contains("operation not permitted")
+        || normalized.contains("access is denied")
+        || normalized.contains("os error 1")
+        || normalized.contains("os error 5")
+        || normalized.contains("os error 13")
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingOutgoingTaskInvite {
     pub task_id: Uuid,
@@ -332,6 +444,36 @@ mod tests {
         assert_eq!(snapshot.reason, "watcher_dirty");
         assert!(snapshot.last_changed_at.is_some());
     }
+
+    #[test]
+    fn fallback_sweep_waits_for_interval() {
+        let tracker = AutoSyncSweepTracker::default();
+        let task_id = Uuid::new_v4();
+        let now = Instant::now();
+
+        assert!(!tracker.should_sweep_at(task_id, now, Duration::from_secs(120)));
+        assert!(!tracker.should_sweep_at(
+            task_id,
+            now + Duration::from_secs(119),
+            Duration::from_secs(120)
+        ));
+        assert!(tracker.should_sweep_at(
+            task_id,
+            now + Duration::from_secs(120),
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn permission_error_classification_handles_macos_and_windows_messages() {
+        assert!(is_permission_denied_message(
+            "PermissionDenied: Operation not permitted (os error 1)"
+        ));
+        assert!(is_permission_denied_message(
+            "Access is denied. (os error 5)"
+        ));
+        assert!(!is_permission_denied_message("network timed out"));
+    }
 }
 
 impl AppState {
@@ -357,7 +499,15 @@ impl AppState {
                 task.id, task.name, task.local_path
             ),
         );
-        let (watcher, rx) = self.platform.start_watcher(Path::new(&task.local_path))?;
+        let (watcher, rx) = match self.platform.start_watcher(Path::new(&task.local_path)) {
+            Ok(started) => started,
+            Err(error) => {
+                if is_permission_denied_message(&error.to_string()) {
+                    self.task_access_issues.mark(task, error.to_string());
+                }
+                return Err(error);
+            }
+        };
         spawn_dirty_watcher_thread(
             task.id,
             task.name.clone(),
@@ -367,6 +517,7 @@ impl AppState {
             rx,
         );
         self._watchers.lock().unwrap().push((task_id, watcher));
+        self.task_access_issues.clear(task.id);
         crate::diagnostics::record_operation(
             "watcher_start_complete",
             format!(
@@ -375,6 +526,13 @@ impl AppState {
             ),
         );
         Ok(())
+    }
+
+    pub fn stop_task_watcher(&self, task_id: Uuid) {
+        self._watchers
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| id != &task_id.to_string());
     }
 
     pub fn new(
@@ -426,6 +584,48 @@ impl AppState {
                 }
             }
         }
+        let peer_state_publisher = crate::transport::connection::PeerConnectionStatePublisher::new(
+            connections.clone(),
+            identity.clone(),
+        );
+        let peer_connection_states =
+            crate::state::repository::PeerConnectionStateRepository::new(&conn).list_all()?;
+        for peer_state in peer_connection_states {
+            if !connections.is_pinned(&peer_state.peer_device_id) {
+                continue;
+            }
+            connections.set_manual_disconnect_state(
+                &peer_state.peer_device_id,
+                peer_state.local_disconnected,
+            );
+            if let Some(server) = &server {
+                server.set_local_peer_disconnected(
+                    &peer_state.peer_device_id,
+                    peer_state.local_disconnected,
+                );
+                server.load_peer_requested_disconnect(
+                    &peer_state.peer_device_id,
+                    peer_state.remote_disconnected,
+                    peer_state.remote_revision,
+                );
+            }
+            crate::diagnostics::record_operation(
+                "peer_connection_state_loaded",
+                format!(
+                    "peer_device_id={} local_disconnected={} local_revision={} remote_disconnected={} remote_revision={:?}",
+                    peer_state.peer_device_id,
+                    peer_state.local_disconnected,
+                    peer_state.local_revision,
+                    peer_state.remote_disconnected,
+                    peer_state.remote_revision
+                ),
+            );
+            peer_state_publisher.publish(
+                peer_state.peer_device_id,
+                peer_state.local_disconnected,
+                peer_state.local_revision,
+            );
+        }
         let deferred_repo = crate::state::repository::DeferredTransferRepository::new(&conn);
         for transfer in deferred_repo.list_all()? {
             crate::transport::connection::defer_transfer(
@@ -447,6 +647,8 @@ impl AppState {
         }
         let dirty_tasks = TaskDirtyTracker::default();
         let file_list_refresh = FileListRefreshTracker::default();
+        let auto_sync_sweeps = AutoSyncSweepTracker::default();
+        let task_access_issues = TaskAccessIssueTracker::default();
         let mut watchers: Vec<(String, RecommendedWatcher)> = Vec::new();
         for task in tasks {
             crate::diagnostics::record_operation(
@@ -456,6 +658,9 @@ impl AppState {
                     task.id, task.name, task.local_role, task.enabled, task.local_path
                 ),
             );
+            if !task.enabled {
+                continue;
+            }
             if let Err(error) = crate::core::transient::cleanup_lanbridge_transient_files(
                 std::path::Path::new(&task.local_path),
             ) {
@@ -471,19 +676,21 @@ impl AppState {
                     task.local_path,
                     error
                 );
-            }
-            if task.enabled {
-                if let Some(server) = &server {
-                    server.register_task_root(
-                        task.id.to_string(),
-                        &task.local_path,
-                        task.peer_device_id(),
-                    )?;
-                    crate::diagnostics::record_operation(
-                        "task_root_registered",
-                        format!("task_id={} path={}", task.id, task.local_path),
-                    );
+                if is_permission_denied_message(&error.to_string()) {
+                    task_access_issues.mark(&task, error.to_string());
+                    continue;
                 }
+            }
+            if let Some(server) = &server {
+                server.register_task_root(
+                    task.id.to_string(),
+                    &task.local_path,
+                    task.peer_device_id(),
+                )?;
+                crate::diagnostics::record_operation(
+                    "task_root_registered",
+                    format!("task_id={} path={}", task.id, task.local_path),
+                );
             }
             match platform.start_watcher(Path::new(&task.local_path)) {
                 Ok((w, rx)) => {
@@ -518,13 +725,26 @@ impl AppState {
                         ),
                     );
                     tracing::warn!("failed to start watcher for task '{}': {}", task.name, e);
+                    if is_permission_denied_message(&e.to_string()) {
+                        task_access_issues.mark(&task, e.to_string());
+                    }
                 }
             }
-            if task.enabled && task.local_role == DeviceRole::Primary {
+            if task.local_role == DeviceRole::Primary && !task_access_issues.contains(task.id) {
                 dirty_tasks.mark_task_dirty(task.id);
                 crate::diagnostics::record_operation(
                     "primary_task_marked_dirty_on_start",
                     format!("task_id={} task_name={}", task.id, task.name),
+                );
+            }
+        }
+
+        if let Some(server) = &server {
+            let recovered = server.recover_incomplete_commits()?;
+            if recovered > 0 {
+                crate::diagnostics::record_operation(
+                    "transfer_commit_recovered",
+                    format!("recovered_commits={recovered}"),
                 );
             }
         }
@@ -535,12 +755,16 @@ impl AppState {
             identity,
             platform,
             connections,
+            peer_state_publisher,
             discovery,
             _server: server,
             pending_outgoing_invites: Mutex::new(HashMap::new()),
             sync_runs: SyncRunCoordinator::default(),
             dirty_tasks,
             file_list_refresh,
+            transfer_activity: TransferActivityPublisher::default(),
+            auto_sync_sweeps,
+            task_access_issues,
             _watchers: Mutex::new(watchers),
         })
     }

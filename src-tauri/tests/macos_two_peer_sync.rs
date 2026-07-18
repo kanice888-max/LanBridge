@@ -1,10 +1,12 @@
+#![cfg(target_os = "macos")]
+
 use lanbridge::core::conflict;
 use lanbridge::core::executor;
 use lanbridge::core::model::*;
 use lanbridge::core::planner;
 use lanbridge::core::scanner::scan_root;
 use lanbridge::history::store::HistoryStore;
-use lanbridge::platform::windows::WinPlatform;
+use lanbridge::platform::macos::MacPlatform;
 use lanbridge::state::db;
 use lanbridge::state::repository::*;
 use rusqlite::Connection;
@@ -41,6 +43,7 @@ fn create_task(conn: &Connection, primary_dir: &Path, secondary_dir: &Path) -> S
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     let repo = SyncTaskRepository::new(conn);
     repo.insert(&task).unwrap();
@@ -52,7 +55,7 @@ fn scan_and_store(
     task: &SyncTask,
     sync_root: &Path,
     conn: &Connection,
-    platform: &WinPlatform,
+    platform: &MacPlatform,
 ) -> Vec<FileSnapshot> {
     let results = scan_root(sync_root, platform).unwrap();
     let snap_repo = FileSnapshotRepository::new(conn);
@@ -133,7 +136,7 @@ fn test_primary_create_syncs_to_secondary() {
     let conn = setup_db();
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
-    let platform = WinPlatform::with_data_dir(std::env::temp_dir().join("test_primary_create"));
+    let platform = MacPlatform::with_data_dir(std::env::temp_dir().join("test_primary_create"));
     let task = create_task(&conn, primary_dir.path(), secondary_dir.path());
 
     // Step 1: Create a file on primary
@@ -170,7 +173,7 @@ fn test_primary_update_syncs_to_secondary() {
     let conn = setup_db();
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
-    let platform = WinPlatform::with_data_dir(std::env::temp_dir().join("test_primary_update"));
+    let platform = MacPlatform::with_data_dir(std::env::temp_dir().join("test_primary_update"));
     let task = create_task(&conn, primary_dir.path(), secondary_dir.path());
 
     // Initial sync: create file
@@ -218,7 +221,7 @@ fn test_primary_delete_moves_secondary_to_history() {
     let conn = setup_db();
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
-    let platform = WinPlatform::with_data_dir(std::env::temp_dir().join("test_primary_delete"));
+    let platform = MacPlatform::with_data_dir(std::env::temp_dir().join("test_primary_delete"));
     let task = create_task(&conn, primary_dir.path(), secondary_dir.path());
 
     // Step 1: Create and sync
@@ -271,7 +274,7 @@ fn test_secondary_create_becomes_pending_return() {
     let conn = setup_db();
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
-    let platform = WinPlatform::with_data_dir(std::env::temp_dir().join("test_sec_create"));
+    let platform = MacPlatform::with_data_dir(std::env::temp_dir().join("test_sec_create"));
     let mut task = create_task(&conn, primary_dir.path(), secondary_dir.path());
     task.local_role = DeviceRole::Secondary;
 
@@ -311,7 +314,7 @@ fn test_secondary_delete_does_not_affect_primary() {
     let conn = setup_db();
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
-    let platform = WinPlatform::with_data_dir(std::env::temp_dir().join("test_sec_delete"));
+    let platform = MacPlatform::with_data_dir(std::env::temp_dir().join("test_sec_delete"));
     let mut task = create_task(&conn, primary_dir.path(), secondary_dir.path());
     task.local_role = DeviceRole::Secondary;
 
@@ -522,7 +525,7 @@ fn test_full_roundtrip_create_sync_delete_restore() {
     let conn = setup_db();
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
-    let platform = WinPlatform::with_data_dir(std::env::temp_dir().join("test_roundtrip"));
+    let platform = MacPlatform::with_data_dir(std::env::temp_dir().join("test_roundtrip"));
     let task = create_task(&conn, primary_dir.path(), secondary_dir.path());
 
     // 1. Create file on primary

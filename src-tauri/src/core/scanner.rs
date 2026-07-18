@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
@@ -74,35 +74,20 @@ fn walk_dir(
     mode: ScanMode<'_>,
     results: &mut Vec<ScanResult>,
 ) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("cannot read directory '{}': {}", dir.display(), e);
-            return Ok(());
-        }
-    };
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| scan_io_error("read directory", dir, error))?;
 
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("cannot read directory entry: {}", e);
-                continue;
-            }
-        };
+        let entry = entry.map_err(|error| scan_io_error("read directory entry", dir, error))?;
 
         let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
         let path = entry.path();
 
         // Check if symlink
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(e) => {
-                tracing::warn!("cannot get file type for '{}': {}", path.display(), e);
-                continue;
-            }
-        };
+        let file_type = entry
+            .file_type()
+            .map_err(|error| scan_io_error("read file type", &path, error))?;
 
         if file_type.is_symlink() {
             results.push(ScanResult {
@@ -136,10 +121,6 @@ fn walk_dir(
         let rel_path = relative_path(sync_root, &path);
 
         if is_dir {
-            crate::diagnostics::record_operation(
-                "scan_directory",
-                format!("path={} relative_path={}", path.display(), rel_path),
-            );
             results.push(ScanResult {
                 snapshot: FileSnapshot {
                     task_id: uuid::Uuid::nil(),
@@ -157,19 +138,8 @@ fn walk_dir(
             // Recurse into subdirectory
             walk_dir(&path, sync_root, platform, mode, results)?;
         } else {
-            if matches!(mode, ScanMode::Full { .. }) {
-                crate::diagnostics::record_operation(
-                    "scan_file_prepare",
-                    format!("path={} relative_path={}", path.display(), rel_path),
-                );
-            }
-            let metadata = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("cannot read metadata for '{}': {}", path.display(), e);
-                    continue;
-                }
-            };
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| scan_io_error("read metadata", &path, error))?;
 
             let size = metadata.len() as i64;
             let modified_unix_ms = metadata
@@ -223,12 +193,8 @@ fn walk_dir(
 }
 
 fn hash_small_file(path: &Path) -> (Option<String>, HashStatus) {
-    crate::diagnostics::record_operation("hash_file_start", path.display().to_string());
     match hash_file(path) {
-        Ok(h) => {
-            crate::diagnostics::record_operation("hash_file_complete", path.display().to_string());
-            (Some(h), HashStatus::Verified)
-        }
+        Ok(h) => (Some(h), HashStatus::Verified),
         Err(e) => {
             crate::diagnostics::record_operation(
                 "hash_file_failed",
@@ -237,6 +203,19 @@ fn hash_small_file(path: &Path) -> (Option<String>, HashStatus) {
             tracing::warn!("cannot hash '{}': {}", path.display(), e);
             (None, HashStatus::Unavailable)
         }
+    }
+}
+
+fn scan_io_error(action: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow!(
+            "PermissionDenied: cannot {} '{}': {}",
+            action,
+            path.display(),
+            error
+        )
+    } else {
+        anyhow!("cannot {} '{}': {}", action, path.display(), error)
     }
 }
 
@@ -261,4 +240,20 @@ fn relative_path(sync_root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_errors_are_structured_for_callers() {
+        let error = scan_io_error(
+            "read directory",
+            Path::new("/protected"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+
+        assert!(error.to_string().starts_with("PermissionDenied:"));
+    }
 }

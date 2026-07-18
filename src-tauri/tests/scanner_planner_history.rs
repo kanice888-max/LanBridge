@@ -4,7 +4,7 @@ use lanbridge::core::planner::plan_sync;
 use lanbridge::core::scanner::{scan_root, scan_root_with_cache};
 use lanbridge::core::transient::cleanup_lanbridge_transient_files;
 use lanbridge::history::store::HistoryStore;
-use lanbridge::platform::windows::WinPlatform;
+use lanbridge::platform::macos::MacPlatform;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -36,7 +36,7 @@ fn setup_test_dir() -> TempDir {
 #[test]
 fn test_scanner_finds_files() {
     let dir = setup_test_dir();
-    let platform = WinPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
 
     let paths: Vec<String> = results
@@ -50,9 +50,20 @@ fn test_scanner_finds_files() {
 }
 
 #[test]
+fn test_scanner_fails_closed_when_root_cannot_be_read() {
+    let dir = TempDir::new().unwrap();
+    let missing_root = dir.path().join("missing");
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+
+    let error = scan_root(&missing_root, &platform).unwrap_err();
+
+    assert!(error.to_string().contains("cannot read directory"));
+}
+
+#[test]
 fn test_scanner_skips_ignored() {
     let dir = setup_test_dir();
-    let platform = WinPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
 
     let paths: Vec<String> = results
@@ -83,7 +94,7 @@ fn test_scanner_skips_lanbridge_transient_files() {
     )
     .unwrap();
 
-    let platform = WinPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
     let paths: Vec<String> = results
         .iter()
@@ -126,7 +137,7 @@ fn test_cleanup_removes_only_lanbridge_transient_files() {
 #[test]
 fn test_scanner_hashes_small_files() {
     let dir = setup_test_dir();
-    let platform = WinPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
 
     let readme = results
@@ -143,7 +154,7 @@ fn test_scanner_hashes_small_files() {
 fn test_scanner_reuses_cached_verified_hash() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("cached.txt"), "stable").unwrap();
-    let platform = WinPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
 
     let first = scan_root(dir.path(), &platform).unwrap();
     let mut cached = first
@@ -670,6 +681,51 @@ fn test_history_move_to_overwritten() {
     assert!(
         entry.stored_path.contains("overwritten") || entry.stored_path.contains("overwritten\\")
     );
+}
+
+#[test]
+fn test_overwritten_backups_are_unique_for_same_timestamp_and_path() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("document.txt");
+    let store = HistoryStore::new(dir.path());
+    let timestamp = now_ms();
+    std::fs::write(&source, "version one").unwrap();
+    let first = store
+        .backup_to_overwritten(&source, "document.txt", timestamp)
+        .unwrap();
+    std::fs::write(&source, "version two").unwrap();
+    let second = store
+        .backup_to_overwritten(&source, "document.txt", timestamp)
+        .unwrap();
+
+    assert_ne!(first.stored_path, second.stored_path);
+    assert_eq!(
+        std::fs::read_to_string(first.stored_path).unwrap(),
+        "version one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.stored_path).unwrap(),
+        "version two"
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "version two");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_history_write_rejects_symlinked_internal_directory() {
+    let dir = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let source = dir.path().join("document.txt");
+    std::fs::write(&source, "protected").unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join(".lanbridge-history")).unwrap();
+
+    let error = HistoryStore::new(dir.path())
+        .backup_to_overwritten(&source, "document.txt", now_ms())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("SymlinkNotAllowed"));
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "protected");
 }
 
 #[test]

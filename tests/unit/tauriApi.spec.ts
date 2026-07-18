@@ -11,6 +11,7 @@ import {
   approvePairing,
   checkNetworkEnvironment,
   cleanupHistory,
+  checkForUpdates,
   confirmPairingCode,
   connectDiscoveredPeer,
   detectConflicts,
@@ -27,6 +28,8 @@ import {
   scanTask,
   syncNow,
   toggleTaskEnabled,
+  openAvailableUpdateRelease,
+  openProjectGithub,
   writeLog,
   type OnlineDevice,
 } from "../../src/lib/tauriApi";
@@ -68,6 +71,9 @@ describe("tauriApi command arguments", () => {
     await restoreHistoryEntry("task-1", "entry-1");
     await cleanupHistory("task-1");
     await writeLog("Info", "hello", "task-1", "a.txt");
+    await checkForUpdates(true);
+    await openProjectGithub();
+    await openAvailableUpdateRelease();
 
     expect(invokeMock).toHaveBeenCalledWith("confirm_pairing_code", {
       peerDeviceId: "peer-1",
@@ -146,5 +152,8 @@ describe("tauriApi command arguments", () => {
       taskId: "task-1",
       relativePath: "a.txt",
     });
+    expect(invokeMock).toHaveBeenCalledWith("check_for_updates", { force: true });
+    expect(invokeMock).toHaveBeenCalledWith("open_project_github");
+    expect(invokeMock).toHaveBeenCalledWith("open_available_update_release");
   });
 });

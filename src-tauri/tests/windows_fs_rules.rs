@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 use lanbridge::platform::traits::{IgnoreDecision, IgnoreReason, Platform};
 use lanbridge::platform::windows::fs_rules;
 use lanbridge::platform::windows::WinPlatform;

@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
-import { listLogs, type LogEntry } from "../../lib/tauriApi";
+import { copyTextToClipboard, getDiagnosticReport, listLogs, type LogEntry } from "../../lib/tauriApi";
 import { useTranslation } from "../../lib/i18n/context";
 import { isBrowserPreviewBridgeError } from "../../lib/runtime";
 import { AnimatedList } from "../../components/StagePrimitives";
+import { formatLogLevel, formatLogMessage } from "./logFormatting";
 
 export function LogsScreen({ refreshToken = 0 }: { refreshToken?: number }) {
   const { t } = useTranslation();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [copyState, setCopyState] = useState<"idle" | "copying" | "success">("idle");
 
   const loadLogs = async () => {
     setLoading(true);
@@ -34,12 +36,38 @@ export function LogsScreen({ refreshToken = 0 }: { refreshToken?: number }) {
     }
   };
 
+  const copyDiagnosticReport = async () => {
+    setCopyState("copying");
+    setError(null);
+    try {
+      await copyTextToClipboard(await getDiagnosticReport());
+      setCopyState("success");
+    } catch {
+      setCopyState("idle");
+      setError(t.logs.copyFailed);
+    }
+  };
+
   return (
     <div className="logs-screen">
       <div className="logs-toolbar">
         <h1>{t.logs.title}</h1>
-        <button className="btn btn-secondary btn-small" onClick={loadLogs}>{t.logs.refresh}</button>
+        <div className="logs-toolbar-actions">
+          <span className="diagnostic-copy-status" role="status">
+            {copyState === "success" ? t.logs.copySuccess : ""}
+          </span>
+          <button
+            className="btn btn-secondary btn-small"
+            onClick={copyDiagnosticReport}
+            disabled={copyState === "copying"}
+          >
+            {copyState === "copying" ? t.logs.copyingDiagnostics : t.logs.copyDiagnostics}
+          </button>
+          <button className="btn btn-secondary btn-small" onClick={loadLogs}>{t.logs.refresh}</button>
+        </div>
       </div>
+
+      <p className="diagnostic-copy-note">{t.logs.copyDiagnosticsDesc}</p>
 
       {error && <div className="error-message">{error}</div>}
 
@@ -62,8 +90,8 @@ export function LogsScreen({ refreshToken = 0 }: { refreshToken?: number }) {
             renderItem={(log) => (
               <div className={`log-entry level-${levelClass(log.level)}`}>
                 <span className="log-time">{formatTime(log.created_unix_ms)}</span>
-                <span className={`log-level ${levelClass(log.level)}`}>{log.level}</span>
-                <span className="log-message" title={log.message}>{log.message}</span>
+                <span className={`log-level ${levelClass(log.level)}`}>{formatLogLevel(log.level, t.logs)}</span>
+                <span className="log-message" title={formatLogMessage(log.message, t.logs)}>{formatLogMessage(log.message, t.logs)}</span>
                 <span className="log-path" title={log.relative_path || ""}>{log.relative_path || ""}</span>
               </div>
             )}

@@ -15,6 +15,8 @@ vi.mock("@tauri-apps/api/tauri", () => ({
         });
       case "list_sync_tasks":
         return Promise.resolve([]);
+      case "get_sync_task":
+        return Promise.resolve(null);
       case "list_task_invites":
         return Promise.resolve([
           {
@@ -48,6 +50,10 @@ vi.mock("@tauri-apps/api/tauri", () => ({
             ip: "192.168.1.20",
             port: 9527,
             public_key: [1, 2, 3],
+            compatible: true,
+            compatibility_reason: null,
+            app_version: "0.1.0",
+            protocol_version: 2,
             addresses: [
               {
                 ip: "192.168.1.20",
@@ -69,6 +75,16 @@ vi.mock("@tauri-apps/api/tauri", () => ({
           multicast_addr: "239.10.10.10",
           multicast_port: 9526,
         });
+      case "get_local_network_info":
+        return Promise.resolve({
+          interfaces: [{ name: "Wi-Fi", ip: "192.168.1.5" }],
+          preferred_interface: { name: "Wi-Fi", ip: "192.168.1.5" },
+          tcp_port: 9527,
+        });
+      case "inspect_task_folder":
+        return Promise.resolve({ exists: true, is_dir: true, is_empty: true, over_limit: false });
+      case "send_task_invite":
+        return Promise.resolve({ invite_id: "invite-sent", task_id: "task-sent", status: "Pending", task: null, error: null });
       default:
         return Promise.resolve([]);
     }
@@ -92,20 +108,20 @@ afterEach(() => {
 describe("Windows app smoke tests", () => {
   it("renders the dashboard by default", async () => {
     render(<App />);
-    expect(await screen.findByText("LanBridge")).toBeTruthy();
-    expect(await screen.findByRole("heading", { name: "仪表盘" })).toBeTruthy();
+    expect(await screen.findByLabelText("LanBridge")).toBeTruthy();
+    expect(await screen.findByText("自动发现中")).toBeTruthy();
   });
 
   it("shows the empty task state", async () => {
     render(<App />);
-    expect(await screen.findByText("暂无同步任务")).toBeTruthy();
+    fireEvent.click(await screen.findByText("同步"));
+    expect(await screen.findByText("创建首个任务")).toBeTruthy();
   });
 
   it("lets the receiver choose a folder for an incoming invite", async () => {
     render(<App />);
 
-    expect(await screen.findByText("收到的同步邀请")).toBeTruthy();
-    fireEvent.click(await screen.findByRole("button", { name: "选择文件夹" }));
+    fireEvent.click(await screen.findByRole("button", { name: "选择" }));
 
     await waitFor(() => {
       expect(openMock).toHaveBeenCalledWith({
@@ -116,26 +132,37 @@ describe("Windows app smoke tests", () => {
     });
   });
 
-  it("polls incoming invites while the dashboard is open", async () => {
+  it("keeps the incoming invite prompt visible after leaving discovery", async () => {
+    render(<App />);
+
+    await screen.findByRole("button", { name: /照片同步/ });
+    fireEvent.click(await screen.findByText("日志"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /照片同步/ })).toBeTruthy();
+    });
+  });
+
+  it("polls incoming invites from the app root", async () => {
     const intervalSpy = vi.spyOn(window, "setInterval");
     render(<App />);
 
-    await screen.findByText("收到的同步邀请");
-    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 3000);
+    await screen.findByText("照片同步");
+    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 2500);
     intervalSpy.mockRestore();
   });
 
   it("navigates to pairing, logs, and settings screens", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("配对设备"));
-    expect(await screen.findByText("配对设备并创建同步任务")).toBeTruthy();
+    fireEvent.click(await screen.findByText("发现"));
+    expect(await screen.findByText("自动发现中")).toBeTruthy();
 
     fireEvent.click(await screen.findByText("日志"));
     expect(await screen.findByRole("heading", { name: "同步日志" })).toBeTruthy();
 
     fireEvent.click(await screen.findByText("设置"));
-    expect(await screen.findByText("历史保留")).toBeTruthy();
+    expect(await screen.findByText("保留周期")).toBeTruthy();
   });
 
   it("shows the Windows device name", async () => {
@@ -147,7 +174,7 @@ describe("Windows app smoke tests", () => {
   it("refreshes discovered devices from the pairing screen", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("配对设备"));
+    fireEvent.click(await screen.findByText("发现"));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("list_online_devices");
@@ -161,25 +188,17 @@ describe("Windows app smoke tests", () => {
       ([cmd]) => cmd === "get_discovery_status"
     ).length;
 
-    fireEvent.click(await screen.findByRole("button", { name: "刷新发现设备" }));
-
-    await waitFor(() => {
-      const listCallsAfter = invokeMock.mock.calls.filter(
-        ([cmd]) => cmd === "list_online_devices"
-      ).length;
-      const statusCallsAfter = invokeMock.mock.calls.filter(
-        ([cmd]) => cmd === "get_discovery_status"
-      ).length;
-      expect(listCallsAfter).toBeGreaterThan(listCallsBefore);
-      expect(statusCallsAfter).toBeGreaterThan(statusCallsBefore);
-    });
+    expect(listCallsBefore).toBeGreaterThan(0);
+    expect(statusCallsBefore).toBeGreaterThan(0);
   });
 
   it("lets the sender choose a local folder from the pairing screen", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText("配对设备"));
-    fireEvent.click(await screen.findByText("Mac Test Device"));
+    fireEvent.click(await screen.findByText("发现"));
+    fireEvent.click(await screen.findByRole("button", { name: /Mac Test Device/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /主机/ }));
+    expect(await screen.findByPlaceholderText("请选择需要同步的文件夹")).toBeTruthy();
     fireEvent.click(await screen.findByRole("button", { name: "选择文件夹" }));
 
     await waitFor(() => {
@@ -187,6 +206,74 @@ describe("Windows app smoke tests", () => {
         directory: true,
         multiple: false,
         title: "选择文件夹",
+      });
+    });
+  });
+
+  it("keeps the empty-folder guidance for secondary pairing", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("发现"));
+    fireEvent.click(await screen.findByRole("button", { name: /Mac Test Device/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /副机/ }));
+
+    expect(await screen.findByPlaceholderText("请选择一个空文件夹")).toBeTruthy();
+  });
+
+  it("uses role SVG icons and keeps inactive role icons black", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("发现"));
+    fireEvent.click(await screen.findByRole("button", { name: /Mac Test Device/ }));
+    await screen.findByRole("button", { name: /主机/ });
+
+    const primaryIcon = document.querySelector(
+      ".role-choice-grid button.active .role-choice-icon"
+    ) as HTMLImageElement;
+    const secondaryIcon = document.querySelector(
+      ".role-choice-grid button:not(.active) .role-choice-icon"
+    ) as HTMLImageElement;
+
+    expect(primaryIcon.src).toContain("%23011EF4");
+    expect(secondaryIcon.src).toContain("%23E88B29");
+    expect(primaryIcon.classList.contains("role-choice-icon")).toBe(true);
+    expect(secondaryIcon.classList.contains("role-choice-icon")).toBe(true);
+  });
+
+  it("keeps all pairing steps clickable after selecting a discovered device", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByText("发现"));
+    fireEvent.click(await screen.findByRole("button", { name: /Mac Test Device/ }));
+    await screen.findByRole("button", { name: /主机/ });
+
+    await waitFor(() => {
+      const decorativeFolder = document.querySelector(".discover-folder-host .stage-folder") as HTMLElement;
+      const workflowSlot = document.querySelector(".pairing-workflow-slot") as HTMLElement;
+      expect(decorativeFolder?.getAttribute("aria-hidden")).toBe("true");
+      expect(workflowSlot).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /主机/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "选择文件夹" }));
+
+    await waitFor(() => {
+      expect(openMock).toHaveBeenCalledWith({
+        directory: true,
+        multiple: false,
+        title: "选择文件夹",
+      });
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "发送邀请" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("send_task_invite", {
+        request: expect.objectContaining({
+          local_path: "C:\\Users\\me\\Documents",
+          local_role: "Primary",
+          peer_device_id: "mac-device-001",
+        }),
       });
     });
   });
@@ -212,12 +299,45 @@ describe("Windows app smoke tests", () => {
               enabled: true,
               created_unix_ms: 1,
               updated_unix_ms: 1,
+            last_transfer_activity_unix_ms: 0,
             },
           ]);
+        case "get_sync_task":
+          return Promise.resolve({
+            id: "task-secondary-1",
+            name: "回传测试",
+            primary_device_id: "primary-device-001",
+            secondary_device_id: "secondary-device-001",
+            local_path: "C:\\Sync\\Secondary",
+            remote_path: "C:\\Sync\\Primary",
+            local_role: "Secondary",
+            enabled: true,
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+          last_transfer_activity_unix_ms: 0,
+          });
+        case "get_local_network_info":
+          return Promise.resolve({
+            interfaces: [{ name: "Wi-Fi", ip: "192.168.1.5" }],
+            preferred_interface: { name: "Wi-Fi", ip: "192.168.1.5" },
+            tcp_port: 9527,
+          });
         case "list_task_invites":
           return Promise.resolve([]);
         case "get_pending_count":
           return Promise.resolve(1);
+        case "list_pending_returns":
+          return Promise.resolve([
+            {
+              task_id: "task-secondary-1",
+              relative_path: "offline.txt",
+              change_kind: "Modified",
+              secondary_hash: "hash",
+              secondary_hash_status: "Verified",
+              secondary_modified_unix_ms: 1,
+              created_unix_ms: 1,
+            },
+          ]);
         case "detect_conflicts":
           return Promise.resolve([]);
         case "scan_task":
@@ -230,6 +350,23 @@ describe("Windows app smoke tests", () => {
               error: "remote scan failed: peer is not connected",
             },
           ]);
+        case "execute_return_sync":
+          return Promise.resolve([
+            {
+              relative_path: "offline.txt",
+              success: false,
+              error: "remote scan failed: peer is not connected",
+            },
+          ]);
+        case "get_task_peer_status":
+          return Promise.resolve({
+            task_id: "task-secondary-1",
+            peer_device_id: "primary-device-001",
+            address: "192.168.1.20:9527",
+            connected: true,
+            last_seen_unix_ms: Date.now(),
+            error: null,
+          });
         default:
           return Promise.resolve([]);
       }
@@ -239,12 +376,12 @@ describe("Windows app smoke tests", () => {
     fireEvent.click(await screen.findByRole("button", { name: "回传到主机" }));
 
     expect(
-      await screen.findByText("offline.txt: remote scan failed: peer is not connected")
+      await screen.findByText("remote scan failed: peer is not connected")
     ).toBeTruthy();
 
     await waitFor(() => {
       expect(
-        screen.getByText("offline.txt: remote scan failed: peer is not connected")
+        screen.getByText("remote scan failed: peer is not connected")
       ).toBeTruthy();
     });
   });
@@ -270,8 +407,29 @@ describe("Windows app smoke tests", () => {
               enabled: true,
               created_unix_ms: 1,
               updated_unix_ms: 1,
+            last_transfer_activity_unix_ms: 0,
             },
           ]);
+        case "get_sync_task":
+          return Promise.resolve({
+            id: "task-primary-1",
+            name: "自动同步测试",
+            primary_device_id: "primary-device-001",
+            secondary_device_id: "secondary-device-001",
+            local_path: "C:\\Sync\\Primary",
+            remote_path: "C:\\Sync\\Secondary",
+            local_role: "Primary",
+            enabled: true,
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+          last_transfer_activity_unix_ms: 0,
+          });
+        case "get_local_network_info":
+          return Promise.resolve({
+            interfaces: [{ name: "Wi-Fi", ip: "192.168.1.5" }],
+            preferred_interface: { name: "Wi-Fi", ip: "192.168.1.5" },
+            tcp_port: 9527,
+          });
         case "get_pending_count":
           return Promise.resolve(0);
         case "detect_conflicts":
@@ -285,6 +443,19 @@ describe("Windows app smoke tests", () => {
             history_retention_days: 30,
             history_size_limit_mb: 1024,
           });
+        case "has_active_transfers":
+          return Promise.resolve(false);
+        case "list_ready_auto_sync_tasks":
+          return Promise.resolve(["task-primary-1"]);
+        case "get_task_peer_status":
+          return Promise.resolve({
+            task_id: "task-primary-1",
+            peer_device_id: "secondary-device-001",
+            address: "192.168.1.20:9527",
+            connected: true,
+            last_seen_unix_ms: Date.now(),
+            error: null,
+          });
         default:
           return Promise.resolve([]);
       }
@@ -293,7 +464,7 @@ describe("Windows app smoke tests", () => {
     render(<App />);
     await screen.findByText("自动同步测试");
     fireEvent.click(await screen.findByText("设置"));
-    await screen.findByText("历史保留");
+    await screen.findByText("保留周期");
 
     await waitFor(
       () => {

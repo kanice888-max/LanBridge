@@ -3,10 +3,10 @@ pub mod pairing;
 // Re-export all public items so main.rs can reference commands::* unchanged.
 pub use pairing::*;
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -14,7 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State, Window};
 use uuid::Uuid;
 
-use crate::app_state::{AppState, PendingOutgoingTaskInvite, SyncRunAdmission};
+use crate::app_state::{
+    is_permission_denied_message, AppState, PendingOutgoingTaskInvite, SyncRunAdmission,
+    TaskAccessIssue,
+};
 use crate::core::conflict;
 use crate::core::executor;
 use crate::core::model::*;
@@ -96,6 +99,12 @@ pub struct ImportTaskEntriesResult {
     pub imported: Vec<ImportEntryResult>,
     pub conflicts: Vec<ImportEntryResult>,
     pub failed: Vec<ImportEntryResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WindowCursorPosition {
+    pub x: f64,
+    pub y: f64,
 }
 
 fn network_result(result: executor::ExecutionResult) -> NetworkActionResult {
@@ -507,9 +516,11 @@ pub fn list_task_invites(
     state: State<'_, AppState>,
 ) -> Result<Vec<IncomingTaskInviteInfo>, String> {
     let server = state._server.as_ref().ok_or("sync server is not running")?;
+    let local_device_id = state.identity.public().device_id;
     Ok(server
         .list_task_invites()
         .into_iter()
+        .filter(|invite| invite.requester_device_id != local_device_id)
         .map(|invite| IncomingTaskInviteInfo {
             invite_id: invite.invite_id,
             task_id: invite.task_id,
@@ -578,6 +589,7 @@ pub fn accept_task_invite(
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     let db = state.db.lock().map_err(|e| e.to_string())?;
     if !invite.requester_public_key.is_empty() {
@@ -666,13 +678,8 @@ pub async fn create_sync_task(
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
-
-    if let Some(server) = &state._server {
-        server
-            .register_task_root(task.id.to_string(), &task.local_path)
-            .map_err(|e| e.to_string())?;
-    }
 
     let mut task = task;
     if task.remote_path.is_empty() {
@@ -731,6 +738,11 @@ pub async fn create_sync_task(
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let repo = repository::SyncTaskRepository::new(&db);
         repo.insert(&task).map_err(|e| e.to_string())?;
+    }
+    if let Some(server) = &state._server {
+        server
+            .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
+            .map_err(|e| e.to_string())?;
     }
     state.start_task_watcher(&task).map_err(|e| e.to_string())?;
     if task.local_role == DeviceRole::Primary {
@@ -879,10 +891,73 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn peer_probe_errors_keep_actionable_categories() {
+        assert_eq!(
+            classify_peer_probe_error("tcp_ping", "192.168.1.5", "connection refused".into()).code,
+            "refused"
+        );
+        assert_eq!(
+            classify_peer_probe_error(
+                "authentication",
+                "192.168.1.5",
+                "authentication rejected: untrusted".into()
+            )
+            .code,
+            "authentication_rejected"
+        );
+        assert_eq!(
+            classify_peer_probe_error("identity", "192.168.1.5", "对端版本不兼容".into()).code,
+            "protocol_mismatch"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_private_no_route_is_classified_as_local_network_unavailable() {
+        let failure = classify_peer_probe_error(
+            "tcp_ping",
+            "192.168.1.5",
+            "No route to host (os error 65)".into(),
+        );
+        assert_eq!(failure.code, "local_network_unavailable");
+        assert!(failure.detail.contains("stage=tcp_ping"));
+    }
+
+    #[test]
     fn parse_device_role_rejects_unknown_role() {
         let result = parse_device_role("Mirror");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn file_manager_path_helper_rejects_similar_prefix() {
+        let root = Path::new("/tmp/lanbridge-task");
+        let child = Path::new("/tmp/lanbridge-task/sub/file.txt");
+        let sibling = Path::new("/tmp/lanbridge-task-other/file.txt");
+
+        assert!(is_same_or_child_path(root, root));
+        assert!(is_same_or_child_path(child, root));
+        assert!(!is_same_or_child_path(sibling, root));
+    }
+
+    #[test]
+    fn local_interface_score_prefers_physical_lan() {
+        let wifi = InterfaceInfo {
+            name: "Wi-Fi".to_string(),
+            ip: "192.168.1.5".to_string(),
+        };
+        let radmin = InterfaceInfo {
+            name: "Radmin VPN".to_string(),
+            ip: "26.229.189.141".to_string(),
+        };
+        let hyperv = InterfaceInfo {
+            name: "vEthernet (Default Switch)".to_string(),
+            ip: "172.20.1.1".to_string(),
+        };
+
+        assert!(local_interface_score(&wifi) > local_interface_score(&radmin));
+        assert!(local_interface_score(&wifi) > local_interface_score(&hyperv));
     }
 
     fn task_with_local_path(path: &str) -> SyncTask {
@@ -897,6 +972,7 @@ mod tests {
             enabled: true,
             created_unix_ms: 0,
             updated_unix_ms: 0,
+            last_transfer_activity_unix_ms: 0,
         }
     }
 
@@ -1032,6 +1108,7 @@ mod tests {
             enabled: true,
             created_unix_ms: 0,
             updated_unix_ms: 0,
+            last_transfer_activity_unix_ms: 0,
         };
         let snap = FileSnapshot {
             task_id: task.id,
@@ -1221,6 +1298,7 @@ fn create_task_from_invite(
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1232,7 +1310,7 @@ fn create_task_from_invite(
 
     if let Some(server) = &state._server {
         server
-            .register_task_root(task.id.to_string(), &task.local_path)
+            .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
             .map_err(|e| e.to_string())?;
     }
 
@@ -1368,7 +1446,7 @@ pub fn toggle_task_enabled(
     if enabled {
         if let Some(server) = &state._server {
             server
-                .register_task_root(task.id.to_string(), &task.local_path)
+                .register_task_root(task.id.to_string(), &task.local_path, task.peer_device_id())
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -1379,6 +1457,8 @@ pub fn toggle_task_enabled(
             .map_err(|e| e.to_string())?;
     }
     if enabled {
+        state.task_access_issues.clear(id);
+        state.auto_sync_sweeps.clear(id);
         state.start_task_watcher(&task).map_err(|e| e.to_string())?;
         if task.local_role == DeviceRole::Primary {
             state.dirty_tasks.mark_task_dirty(task.id);
@@ -1391,6 +1471,9 @@ pub fn toggle_task_enabled(
                 .map_err(|e| e.to_string())?;
         }
         state.dirty_tasks.clear(id);
+        state.auto_sync_sweeps.clear(id);
+        state.task_access_issues.clear(id);
+        state.stop_task_watcher(id);
     }
     Ok(())
 }
@@ -1422,9 +1505,35 @@ pub fn list_ready_auto_sync_tasks(state: State<'_, AppState>) -> Result<Vec<Stri
 
     for (task, baselines, cached_snapshots) in &task_states {
         if task.enabled && task.local_role == DeviceRole::Primary {
-            let reasons =
-                primary_task_needs_sync_sweep(task, baselines, cached_snapshots, &*state.platform)
-                    .map_err(|e| e.to_string())?;
+            if state.task_access_issues.contains(task.id) {
+                ready_set.remove(&task.id);
+                continue;
+            }
+            if ready_set.contains(&task.id) {
+                continue;
+            }
+            if !state.auto_sync_sweeps.should_sweep(task.id) {
+                continue;
+            }
+            let reasons = match primary_task_needs_sync_sweep(
+                task,
+                baselines,
+                cached_snapshots,
+                &*state.platform,
+            ) {
+                Ok(reasons) => reasons,
+                Err(error) if is_permission_denied_message(&error.to_string()) => {
+                    state.task_access_issues.mark(task, error.to_string());
+                    tracing::warn!(
+                        task_id = %task.id,
+                        root = %task.local_path,
+                        error = %error,
+                        "auto-sync fallback sweep paused because the task root is not accessible"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             if !reasons.is_empty() {
                 tracing::info!(
                     auto_sync_ready = true,
@@ -1446,6 +1555,11 @@ pub fn list_ready_auto_sync_tasks(state: State<'_, AppState>) -> Result<Vec<Stri
         })
         .map(|task| task.id.to_string())
         .collect())
+}
+
+#[tauri::command]
+pub fn list_task_access_issues(state: State<'_, AppState>) -> Vec<TaskAccessIssue> {
+    state.task_access_issues.list()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1584,6 +1698,7 @@ fn snapshot_metadata_changed(old: &FileSnapshot, current: &FileSnapshot) -> bool
 
 #[tauri::command]
 pub fn scan_task(state: State<'_, AppState>, task_id: String) -> Result<Vec<FileSnapshot>, String> {
+    crate::diagnostics::record_operation("scan_task_command_enter", format!("task_id={task_id}"));
     let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let (task, cached_snapshots) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1598,10 +1713,9 @@ pub fn scan_task(state: State<'_, AppState>, task_id: String) -> Result<Vec<File
         (task, cached_snapshots)
     };
 
-    let sync_root = std::path::Path::new(&task.local_path);
-    let cache = snapshot_cache_by_path(&cached_snapshots);
-    let results =
-        guarded_scan_root_with_cache(id, sync_root, &*state.platform, &cache, "scan_task")?;
+    let cached_snapshot_list = cached_snapshots;
+    let cache = snapshot_cache_by_path(&cached_snapshot_list);
+    let results = guarded_scan_root_with_cache(&state, &task, &cache, "scan_task")?;
 
     let mut snapshots = Vec::new();
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1615,11 +1729,19 @@ pub fn scan_task(state: State<'_, AppState>, task_id: String) -> Result<Vec<File
         .replace_for_task(&id, &snapshots)
         .map_err(|e| e.to_string())?;
 
+    crate::diagnostics::record_operation(
+        "scan_task_command_complete",
+        format!(
+            "task_id={} task_name={} entries={}",
+            id,
+            task.name,
+            snapshots.len()
+        ),
+    );
     Ok(snapshots)
 }
 
 fn refresh_task_snapshots(state: &AppState, task: &SyncTask) -> Result<Vec<FileSnapshot>, String> {
-    let sync_root = std::path::Path::new(&task.local_path);
     let cached_snapshots = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         repository::FileSnapshotRepository::new(&db)
@@ -1627,13 +1749,7 @@ fn refresh_task_snapshots(state: &AppState, task: &SyncTask) -> Result<Vec<FileS
             .map_err(|e| e.to_string())?
     };
     let cache = snapshot_cache_by_path(&cached_snapshots);
-    let results = guarded_scan_root_with_cache(
-        task.id,
-        sync_root,
-        &*state.platform,
-        &cache,
-        "refresh_task_snapshots",
-    )?;
+    let results = guarded_scan_root_with_cache(state, task, &cache, "refresh_task_snapshots")?;
 
     let snapshots = results
         .into_iter()
@@ -1660,12 +1776,13 @@ fn snapshot_cache_by_path(snapshots: &[FileSnapshot]) -> HashMap<String, FileSna
 }
 
 fn guarded_scan_root_with_cache(
-    task_id: Uuid,
-    sync_root: &Path,
-    platform: &dyn crate::platform::traits::Platform,
+    state: &AppState,
+    task: &SyncTask,
     cache: &HashMap<String, FileSnapshot>,
     reason: &str,
 ) -> Result<Vec<scanner::ScanResult>, String> {
+    let task_id = task.id;
+    let sync_root = Path::new(&task.local_path);
     tracing::info!(
         task_id = %task_id,
         root = %sync_root.display(),
@@ -1673,13 +1790,35 @@ fn guarded_scan_root_with_cache(
         cached = cache.len(),
         "local scan command start"
     );
+    crate::diagnostics::record_operation(
+        "scan_start",
+        format!(
+            "task_id={} root={} reason={} cached={}",
+            task_id,
+            sync_root.display(),
+            reason,
+            cache.len()
+        ),
+    );
     let started = Instant::now();
     let scanned = catch_unwind(AssertUnwindSafe(|| {
-        scanner::scan_root_with_cache(sync_root, platform, cache)
+        scanner::scan_root_with_cache(sync_root, &*state.platform, cache)
     }));
 
     match scanned {
         Ok(Ok(results)) => {
+            state.task_access_issues.clear(task_id);
+            crate::diagnostics::record_operation(
+                "scan_complete",
+                format!(
+                    "task_id={} root={} reason={} entries={} elapsed_ms={}",
+                    task_id,
+                    sync_root.display(),
+                    reason,
+                    results.len(),
+                    started.elapsed().as_millis()
+                ),
+            );
             tracing::info!(
                 task_id = %task_id,
                 root = %sync_root.display(),
@@ -1691,6 +1830,20 @@ fn guarded_scan_root_with_cache(
             Ok(results)
         }
         Ok(Err(error)) => {
+            if is_permission_denied_message(&error.to_string()) {
+                state.task_access_issues.mark(task, error.to_string());
+            }
+            crate::diagnostics::record_operation(
+                "scan_failed",
+                format!(
+                    "task_id={} root={} reason={} error={} elapsed_ms={}",
+                    task_id,
+                    sync_root.display(),
+                    reason,
+                    error,
+                    started.elapsed().as_millis()
+                ),
+            );
             tracing::error!(
                 task_id = %task_id,
                 root = %sync_root.display(),
@@ -1702,6 +1855,16 @@ fn guarded_scan_root_with_cache(
             Err(error.to_string())
         }
         Err(_) => {
+            crate::diagnostics::record_operation(
+                "scan_panicked",
+                format!(
+                    "task_id={} root={} reason={} elapsed_ms={}",
+                    task_id,
+                    sync_root.display(),
+                    reason,
+                    started.elapsed().as_millis()
+                ),
+            );
             tracing::error!(
                 task_id = %task_id,
                 root = %sync_root.display(),
@@ -1745,6 +1908,46 @@ pub struct TaskPeerStatus {
     pub connected: bool,
     pub last_seen_unix_ms: i64,
     pub error: Option<String>,
+    pub status_reason: Option<String>,
+    pub error_code: Option<String>,
+    pub error_detail: Option<String>,
+    pub peer_app_version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PeerProbeFailure {
+    code: &'static str,
+    detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshedPeer {
+    connection: connection::PeerConnection,
+    identity: connection::PeerIdentityDetails,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerAddressCandidate {
+    host: String,
+    port: u16,
+}
+
+impl PeerAddressCandidate {
+    fn from_host_port(host: String, port: u16) -> Self {
+        Self { host, port }
+    }
+
+    fn parse(address: &str) -> Option<Self> {
+        let (host, port) = address.rsplit_once(':')?;
+        Some(Self {
+            host: host.to_string(),
+            port: port.parse().ok()?,
+        })
+    }
+
+    fn address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1878,6 +2081,21 @@ pub async fn run_sync_now(
     Ok(all_results)
 }
 
+fn mark_task_transfer_activity(state: &AppState, task_id: Uuid) {
+    let result = (|| -> Result<(), String> {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::SyncTaskRepository::new(&db)
+            .mark_transfer_activity(&task_id, now_ms())
+            .map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(()) => state.transfer_activity.publish(task_id),
+        Err(error) => {
+            tracing::warn!(task_id = %task_id, error = %error, "failed to record local transfer activity");
+        }
+    }
+}
+
 async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionResult>, String> {
     let sync_start = Instant::now();
     record_sync_progress(id, "扫描本机", None);
@@ -1904,13 +2122,11 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
     };
     let deferred_transfers = deferred_transfer_set(&deferred_transfers, id);
 
-    let sync_root = Path::new(&task.local_path);
-
     // Scan outside the SQLite lock; hashing can be the slowest local stage.
     let local_scan_start = Instant::now();
-    let cache = snapshot_cache_by_path(&cached_snapshots);
-    let scan_results =
-        guarded_scan_root_with_cache(id, sync_root, &*state.platform, &cache, "sync_now")?;
+    let cached_snapshot_list = cached_snapshots;
+    let cache = snapshot_cache_by_path(&cached_snapshot_list);
+    let scan_results = guarded_scan_root_with_cache(state, &task, &cache, "sync_now")?;
     let local_scan_ms = local_scan_start.elapsed().as_millis() as u64;
     let snapshots = scan_results
         .into_iter()
@@ -1935,7 +2151,7 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
     if task.local_role == DeviceRole::Primary {
         let recovered_delete_count = append_recovered_delete_actions(
             &mut actions,
-            &cached_snapshots,
+            &cached_snapshot_list,
             &snapshots,
             &baselines,
         );
@@ -1995,6 +2211,30 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
                     );
                 }
                 record_sync_progress(id, "传输中", Some(format!("{} 个动作", actions.len())));
+                let remote_map = remote_files
+                    .iter()
+                    .map(|remote| (remote.relative_path.as_str(), remote))
+                    .collect::<HashMap<_, _>>();
+                let has_outgoing_attempt = actions.iter().any(|action| match action.decision {
+                    SyncDecision::ApplyToSecondary => {
+                        remote_conflict(action, &remote_map).is_none()
+                            && (matches!(
+                                action.snapshot.as_ref().map(|snapshot| snapshot.kind),
+                                Some(EntryKind::Directory)
+                            ) || !is_path_deferred(
+                                &deferred_transfers,
+                                &action.relative_path,
+                                "upload",
+                            ))
+                    }
+                    SyncDecision::MoveSecondaryToHistory => {
+                        remote_delete_safety_error(action, &remote_map).is_none()
+                    }
+                    _ => false,
+                });
+                if has_outgoing_attempt {
+                    mark_task_transfer_activity(state, id);
+                }
                 execute_primary_actions_over_network(
                     &actions,
                     &task,
@@ -2075,6 +2315,28 @@ async fn run_sync_now_once(state: &AppState, id: Uuid) -> Result<Vec<SyncActionR
                     "拉取主机变更",
                     Some(format!("{} 个远端条目", remote_files.len())),
                 );
+                let local_snapshot_map = snapshots
+                    .iter()
+                    .map(|snapshot| (snapshot.relative_path.as_str(), snapshot))
+                    .collect::<HashMap<_, _>>();
+                let baseline_map = baselines
+                    .iter()
+                    .map(|baseline| (baseline.relative_path.as_str(), baseline))
+                    .collect::<HashMap<_, _>>();
+                let has_pull_attempt = remote_files.iter().any(|remote| {
+                    secondary_should_download(remote, &local_snapshot_map, &baseline_map)
+                        && secondary_pull_conflict(remote, &local_snapshot_map, &baseline_map)
+                            .is_none()
+                        && (remote.kind == EntryKind::Directory
+                            || !is_path_deferred(
+                                &deferred_transfers,
+                                &remote.relative_path,
+                                "download",
+                            ))
+                });
+                if has_pull_attempt {
+                    mark_task_transfer_activity(state, id);
+                }
                 let mut pull_results = execute_secondary_pull_over_network(
                     &task,
                     sync_root,
@@ -2628,7 +2890,23 @@ async fn send_file_action(
         ));
     }
 
-    let source = sync_root.join(&action.relative_path);
+    let source = match path_safety::safe_join(sync_root, &action.relative_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return network_result(network_error(
+                &action.relative_path,
+                &format!("invalid local path: {}", error),
+                false,
+            ))
+        }
+    };
+    let expected_target_hash = match action.baseline.as_ref() {
+        None => Some(String::new()),
+        Some(baseline) if baseline.secondary_hash_status == HashStatus::Verified => {
+            baseline.secondary_hash.clone()
+        }
+        Some(_) => None,
+    };
     match send_file_with_retry(
         connections,
         local_identity,
@@ -2636,6 +2914,7 @@ async fn send_file_action(
         task.id.to_string(),
         action.relative_path.clone(),
         &source,
+        expected_target_hash,
     )
     .await
     {
@@ -2666,6 +2945,7 @@ async fn send_file_with_retry(
     task_id: String,
     relative_path: String,
     source: &Path,
+    expected_target_hash: Option<String>,
 ) -> anyhow::Result<connection::FileTransferOutcome> {
     connection::clear_transfer_cancel(&task_id, &relative_path, Some("upload"));
     if connection::is_transfer_deferred(&task_id, &relative_path, "upload") {
@@ -2676,13 +2956,14 @@ async fn send_file_with_retry(
     for attempt in 0..MAX_NETWORK_ATTEMPTS {
         let transfer_result = match connection::wait_for_source_file_stability(source).await {
             Ok(_) => {
-                connection::send_authenticated_file_to_peer(
+                connection::send_authenticated_file_to_peer_with_precondition(
                     connections,
                     local_identity,
                     peer_device_id,
                     task_id.clone(),
                     relative_path.clone(),
                     source,
+                    expected_target_hash.clone(),
                 )
                 .await
             }
@@ -3359,13 +3640,8 @@ pub fn run_refresh_pending_returns(
 
     let sync_root = Path::new(&task.local_path);
     let cache = snapshot_cache_by_path(&cached_snapshots);
-    let scan_results = guarded_scan_root_with_cache(
-        id,
-        sync_root,
-        &*state.platform,
-        &cache,
-        "refresh_pending_returns",
-    )?;
+    let scan_results =
+        guarded_scan_root_with_cache(state, &task, &cache, "refresh_pending_returns")?;
     let snapshots = scan_results
         .into_iter()
         .map(|result| {
@@ -3461,6 +3737,9 @@ pub async fn run_execute_return_sync(
         )
         .await
         .map_err(|e| format!("remote scan failed: {}", e))?;
+        if !selected_paths.is_empty() {
+            mark_task_transfer_activity(state, id);
+        }
         let mut results = execute_secondary_return_over_network_checked(
             &task,
             &selected_paths,
@@ -3477,6 +3756,9 @@ pub async fn run_execute_return_sync(
         persist_return_successes(&task, &pending_map, &mut results, sync_root, &db);
         results
     } else {
+        if !selected_paths.is_empty() {
+            mark_task_transfer_activity(state, id);
+        }
         let sync_root = std::path::Path::new(&task.local_path);
 
         // Refresh current primary snapshots before conflict detection.
@@ -3629,7 +3911,7 @@ async fn execute_secondary_return_over_network_checked(
                     &task.primary_device_id,
                     task.id,
                     path,
-                    None,
+                    return_delete_expectation(path, &remote_map),
                     connections,
                     local_identity,
                 )
@@ -3690,7 +3972,7 @@ async fn execute_secondary_return_over_network_checked(
                 &task.primary_device_id,
                 task.id,
                 path,
-                None,
+                return_delete_expectation(path, &remote_map),
                 connections,
                 local_identity,
             )
@@ -3716,7 +3998,17 @@ async fn execute_secondary_return_over_network_checked(
             continue;
         }
 
-        let source = sync_root.join(path);
+        let source = match path_safety::safe_join(sync_root, path) {
+            Ok(path) => path,
+            Err(error) => {
+                results.push(network_error(
+                    path,
+                    &format!("invalid local path: {}", error),
+                    false,
+                ));
+                continue;
+            }
+        };
         if source.is_dir() {
             let planned = planner::PlannedAction {
                 relative_path: path.clone(),
@@ -3737,6 +4029,14 @@ async fn execute_secondary_return_over_network_checked(
             continue;
         }
 
+        let expected_target_hash = remote_map
+            .get(path.as_str())
+            .and_then(|remote| {
+                (remote.hash_status == HashStatus::Verified)
+                    .then(|| remote.blake3_hash.clone())
+                    .flatten()
+            })
+            .or_else(|| (!remote_map.contains_key(path.as_str())).then(|| String::new()));
         match send_file_with_retry(
             connections,
             local_identity,
@@ -3744,6 +4044,7 @@ async fn execute_secondary_return_over_network_checked(
             task.id.to_string(),
             path.clone(),
             &source,
+            expected_target_hash,
         )
         .await
         {
@@ -3764,6 +4065,20 @@ async fn execute_secondary_return_over_network_checked(
         }
     }
     results
+}
+
+fn return_delete_expectation(
+    path: &str,
+    remote_map: &HashMap<&str, &RemoteFileState>,
+) -> Option<DeleteExpectation> {
+    let remote = remote_map.get(path)?;
+    Some(DeleteExpectation {
+        expected_kind: remote.kind,
+        expected_hash: remote.blake3_hash.clone(),
+        expected_hash_status: remote.hash_status,
+        expected_size: remote.size,
+        expected_modified_unix_ms: remote.modified_unix_ms,
+    })
 }
 
 fn secondary_return_conflict(
@@ -4115,6 +4430,96 @@ fn load_task_for_conflict(state: &State<'_, AppState>, id: Uuid) -> Result<SyncT
         .ok_or("task not found".to_string())
 }
 
+struct LocalConflictResolution {
+    resolution_id: String,
+    state: String,
+    conflict_path: Option<String>,
+    secondary_hash: Option<String>,
+}
+
+fn load_or_create_conflict_resolution(
+    state: &State<'_, AppState>,
+    task: &SyncTask,
+    relative_path: &str,
+    mode: &str,
+) -> Result<LocalConflictResolution, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let existing = db
+        .query_row(
+            "SELECT resolution_id, state, conflict_path, secondary_hash
+             WHERE task_id = ?1 AND relative_path = ?2 AND mode = ?3
+               AND state IN ('Prepared', 'RemoteApplied')
+             ORDER BY updated_unix_ms DESC LIMIT 1",
+            params![task.id.to_string(), relative_path, mode],
+            |row| {
+                Ok(LocalConflictResolution {
+                    resolution_id: row.get(0)?,
+                    state: row.get(1)?,
+                    conflict_path: row.get(2)?,
+                    secondary_hash: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
+    let resolution_id = Uuid::new_v4().to_string();
+    db.execute(
+        "INSERT OR IGNORE INTO conflict_resolution_journal
+         (resolution_id, task_id, relative_path, mode, state, created_unix_ms, updated_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, 'Prepared', ?5, ?5)",
+        params![
+            resolution_id,
+            task.id.to_string(),
+            relative_path,
+            mode,
+            now_ms()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(LocalConflictResolution {
+        resolution_id,
+        state: "Prepared".to_string(),
+        conflict_path: None,
+        secondary_hash: None,
+    })
+}
+
+fn mark_conflict_resolution_remote_applied(
+    state: &State<'_, AppState>,
+    resolution_id: &str,
+    conflict_path: &str,
+    secondary_hash: &str,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.execute(
+        "UPDATE conflict_resolution_journal
+         SET conflict_path = ?2, secondary_hash = ?3, state = 'RemoteApplied', updated_unix_ms = ?4
+         WHERE resolution_id = ?1",
+        params![resolution_id, conflict_path, secondary_hash, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn finish_conflict_resolution(
+    state: &State<'_, AppState>,
+    resolution_id: &str,
+    primary_hash: &str,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.execute(
+        "UPDATE conflict_resolution_journal
+         SET primary_hash = ?2, state = 'LocalCommitted', updated_unix_ms = ?3
+         WHERE resolution_id = ?1",
+        params![resolution_id, primary_hash, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 async fn resolve_secondary_conflict_network(
     state: &State<'_, AppState>,
     task: &SyncTask,
@@ -4133,54 +4538,160 @@ async fn resolve_secondary_conflict_network(
         return resolve_secondary_delete_conflict_network(state, task, relative_path, mode).await;
     }
 
+    let resolution = load_or_create_conflict_resolution(state, task, relative_path, mode)?;
+
     let source = path_safety::safe_join(Path::new(&task.local_path), relative_path)
         .map_err(|e| e.to_string())?;
-    if !source.is_file() {
-        return Ok(SyncActionResult {
+    let (apply, secondary_hash) = if resolution.state == "RemoteApplied" {
+        let conflict_path = resolution
+            .conflict_path
+            .clone()
+            .ok_or("冲突恢复日志缺少远端结果路径".to_string())?;
+        let secondary_hash = resolution
+            .secondary_hash
+            .clone()
+            .ok_or("冲突恢复日志缺少 Secondary hash".to_string())?;
+        (
+            executor::ExecutionResult {
+                relative_path: conflict_path,
+                success: true,
+                error: None,
+                retryable: false,
+            },
+            secondary_hash,
+        )
+    } else {
+        if !source.is_file() {
+            return Ok(SyncActionResult {
+                relative_path: relative_path.to_string(),
+                success: false,
+                error: Some("副机文件不存在".to_string()),
+            });
+        }
+        let staged_relative_path = format!(
+            ".lanbridge-temp/conflict-{}/{}",
+            resolution.resolution_id,
+            relative_path.trim_start_matches('/')
+        );
+        let upload = match send_file_with_retry(
+            &state.connections,
+            &state.identity,
+            &task.primary_device_id,
+            task.id.to_string(),
+            staged_relative_path.clone(),
+            &source,
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(SyncActionResult {
+                    relative_path: relative_path.to_string(),
+                    success: false,
+                    error: Some(format!("上传冲突文件失败: {}", error)),
+                })
+            }
+        };
+        let msg = SyncMessage::ConflictApply {
+            task_id: task.id.to_string(),
             relative_path: relative_path.to_string(),
-            success: false,
-            error: Some("副机文件不存在".to_string()),
-        });
-    }
-
-    let staged_relative_path = format!(
-        ".lanbridge-temp/conflict-{}/{}",
-        Uuid::new_v4(),
-        relative_path.trim_start_matches('/')
-    );
-    let upload = send_file_with_retry(
-        &state.connections,
-        &state.identity,
-        &task.primary_device_id,
-        task.id.to_string(),
-        staged_relative_path.clone(),
-        &source,
-    )
-    .await;
-    if let Err(error) = upload {
-        return Ok(SyncActionResult {
-            relative_path: relative_path.to_string(),
-            success: false,
-            error: Some(format!("上传冲突文件失败: {}", error)),
-        });
-    }
-
-    let msg = SyncMessage::ConflictApply {
-        task_id: task.id.to_string(),
-        relative_path: relative_path.to_string(),
-        staged_relative_path,
-        mode: mode.to_string(),
+            staged_relative_path,
+            mode: mode.to_string(),
+            resolution_id: Some(resolution.resolution_id.clone()),
+        };
+        let apply = expect_file_ack(
+            &task.primary_device_id,
+            relative_path,
+            &state.connections,
+            &state.identity,
+            msg,
+        )
+        .await;
+        if apply.success {
+            mark_conflict_resolution_remote_applied(
+                state,
+                &resolution.resolution_id,
+                &apply.relative_path,
+                &upload.blake3_hash,
+            )?;
+        }
+        (apply, upload.blake3_hash)
     };
-    let apply = expect_file_ack(
-        &task.primary_device_id,
-        relative_path,
-        &state.connections,
-        &state.identity,
-        msg,
-    )
-    .await;
     if apply.success {
-        persist_secondary_conflict_success(state, task, relative_path, mode, &source)?;
+        if mode == "keep_both" && apply.relative_path != relative_path {
+            let conflict_path =
+                path_safety::safe_join(Path::new(&task.local_path), &apply.relative_path)
+                    .map_err(|e| e.to_string())?;
+            let original_path = path_safety::safe_join(Path::new(&task.local_path), relative_path)
+                .map_err(|e| e.to_string())?;
+            let primary_temp_relative = format!(
+                ".lanbridge-temp/conflict-resolutions/{}/primary",
+                resolution.resolution_id
+            );
+            let primary_temp =
+                path_safety::safe_join(Path::new(&task.local_path), &primary_temp_relative)
+                    .map_err(|e| e.to_string())?;
+            let root_handle = path_safety::TaskRootHandle::new(Path::new(&task.local_path))
+                .map_err(|e| e.to_string())?;
+            let primary_temp_guard = root_handle
+                .prepare_mutation(&primary_temp)
+                .map_err(|e| e.to_string())?;
+            let primary = download_file_with_retry(
+                &state.connections,
+                &state.identity,
+                &task.primary_device_id,
+                task.id.to_string(),
+                relative_path.to_string(),
+                &primary_temp,
+                0,
+            )
+            .await
+            .map_err(|e| format!("恢复 Primary 冲突文件失败: {}", e))?;
+            primary_temp_guard.validate().map_err(|e| e.to_string())?;
+            let conflict_guard = root_handle
+                .prepare_mutation(&conflict_path)
+                .map_err(|e| e.to_string())?;
+            if conflict_path.exists() {
+                let existing_hash =
+                    scanner::hash_file(&conflict_path).map_err(|e| e.to_string())?;
+                if existing_hash != secondary_hash {
+                    let _ = std::fs::remove_file(&primary_temp);
+                    return Err("冲突副本路径已被其他文件占用".to_string());
+                }
+            } else {
+                if !source.is_file()
+                    || scanner::hash_file(&source).map_err(|e| e.to_string())? != secondary_hash
+                {
+                    let _ = std::fs::remove_file(&primary_temp);
+                    return Err("Secondary 原始版本已变化，无法恢复冲突副本".to_string());
+                }
+                let conflict_partial = conflict_path
+                    .with_extension(format!("lanbridge-conflict-{}", resolution.resolution_id));
+                std::fs::copy(&source, &conflict_partial).map_err(|e| e.to_string())?;
+                conflict_guard.validate().map_err(|e| e.to_string())?;
+                connection::replace_partial_file(&conflict_partial, &conflict_path)
+                    .map_err(|e| e.to_string())?;
+            }
+            path_safety::ensure_safe_for_mutation(Path::new(&task.local_path), &original_path)
+                .map_err(|e| e.to_string())?;
+            connection::replace_partial_file(&primary_temp, &original_path)
+                .map_err(|e| format!("提交 Primary 冲突文件失败: {}", e))?;
+            persist_secondary_keep_both_success(
+                state,
+                task,
+                relative_path,
+                &apply.relative_path,
+                &conflict_path,
+                &original_path,
+                &primary.blake3_hash,
+                &secondary_hash,
+            )?;
+            finish_conflict_resolution(state, &resolution.resolution_id, &primary.blake3_hash)?;
+        } else {
+            persist_secondary_conflict_success(state, task, relative_path, mode, &source)?;
+            finish_conflict_resolution(state, &resolution.resolution_id, &secondary_hash)?;
+        }
         state.file_list_refresh.mark(task.id, "sync_completed");
     }
     Ok(SyncActionResult {
@@ -4197,10 +4708,88 @@ async fn resolve_secondary_delete_conflict_network(
     mode: &str,
 ) -> Result<SyncActionResult, String> {
     if mode == "keep_both" {
+        let root = Path::new(&task.local_path);
+        let original_path =
+            path_safety::safe_join(root, relative_path).map_err(|e| e.to_string())?;
+        let temp_relative = format!(
+            ".lanbridge-temp/delete-conflicts/{}/primary",
+            Uuid::new_v4()
+        );
+        let temp_path = path_safety::safe_join(root, &temp_relative).map_err(|e| e.to_string())?;
+        let root_handle = path_safety::TaskRootHandle::new(root).map_err(|e| e.to_string())?;
+        let temp_guard = root_handle
+            .prepare_mutation(&temp_path)
+            .map_err(|e| e.to_string())?;
+        let primary = download_file_with_retry(
+            &state.connections,
+            &state.identity,
+            &task.primary_device_id,
+            task.id.to_string(),
+            relative_path.to_string(),
+            &temp_path,
+            0,
+        )
+        .await
+        .map_err(|e| format!("恢复 Primary 删除冲突文件失败: {}", e))?;
+        temp_guard.validate().map_err(|e| e.to_string())?;
+        let original_guard = root_handle
+            .prepare_mutation(&original_path)
+            .map_err(|e| e.to_string())?;
+        path_safety::ensure_safe_for_mutation(root, &original_path).map_err(|e| e.to_string())?;
+        original_guard.validate().map_err(|e| e.to_string())?;
+        connection::replace_partial_file(&temp_path, &original_path)
+            .map_err(|e| format!("提交 Primary 删除冲突文件失败: {}", e))?;
+        let metadata = std::fs::metadata(&original_path).map_err(|e| e.to_string())?;
+        let modified_unix_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_else(now_ms);
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        repository::PendingReturnRepository::new(&db)
+        let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+        repository::PendingReturnRepository::new(&tx)
             .remove(&task.id, relative_path)
             .map_err(|e| e.to_string())?;
+        repository::FileSnapshotRepository::new(&tx)
+            .upsert(&FileSnapshot {
+                task_id: task.id,
+                relative_path: relative_path.to_string(),
+                kind: EntryKind::File,
+                size: metadata.len() as i64,
+                modified_unix_ms,
+                blake3_hash: Some(primary.blake3_hash.clone()),
+                hash_status: HashStatus::Verified,
+                deleted: false,
+                is_symlink: false,
+            })
+            .map_err(|e| e.to_string())?;
+        repository::SyncBaselineRepository::new(&tx)
+            .upsert(&SyncBaseline {
+                task_id: task.id,
+                relative_path: relative_path.to_string(),
+                primary_hash: Some(primary.blake3_hash.clone()),
+                primary_hash_status: HashStatus::Verified,
+                primary_size: metadata.len() as i64,
+                secondary_size: metadata.len() as i64,
+                primary_modified_unix_ms: modified_unix_ms,
+                secondary_hash: Some(primary.blake3_hash),
+                secondary_hash_status: HashStatus::Verified,
+                secondary_modified_unix_ms: modified_unix_ms,
+                last_synced_unix_ms: now_ms(),
+            })
+            .map_err(|e| e.to_string())?;
+        repository::LogRepository::new(&tx)
+            .insert(&LogEntry {
+                id: None,
+                level: LogLevel::Info,
+                task_id: Some(task.id),
+                relative_path: Some(relative_path.to_string()),
+                message: "Secondary delete intent discarded; kept Primary version".to_string(),
+                created_unix_ms: now_ms(),
+            })
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         state.file_list_refresh.mark(task.id, "sync_completed");
         return Ok(SyncActionResult {
             relative_path: relative_path.to_string(),
@@ -4246,7 +4835,8 @@ fn persist_secondary_conflict_success(
     source: &Path,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    repository::PendingReturnRepository::new(&db)
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    repository::PendingReturnRepository::new(&tx)
         .remove(&task.id, relative_path)
         .map_err(|e| e.to_string())?;
     let metadata = std::fs::metadata(source).map_err(|e| e.to_string())?;
@@ -4257,7 +4847,7 @@ fn persist_secondary_conflict_success(
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_else(now_ms);
     let hash = scanner::hash_file(source).map_err(|e| e.to_string())?;
-    repository::SyncBaselineRepository::new(&db)
+    repository::SyncBaselineRepository::new(&tx)
         .upsert(&SyncBaseline {
             task_id: task.id,
             relative_path: relative_path.to_string(),
@@ -4272,6 +4862,89 @@ fn persist_secondary_conflict_success(
             last_synced_unix_ms: now_ms(),
         })
         .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn persist_secondary_keep_both_success(
+    state: &State<'_, AppState>,
+    task: &SyncTask,
+    original_relative_path: &str,
+    conflict_relative_path: &str,
+    conflict_path: &Path,
+    original_path: &Path,
+    primary_hash: &str,
+    secondary_hash: &str,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let now = now_ms();
+    let original_metadata = std::fs::metadata(original_path).map_err(|e| e.to_string())?;
+    let conflict_metadata = std::fs::metadata(conflict_path).map_err(|e| e.to_string())?;
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    let snapshot_repo = repository::FileSnapshotRepository::new(&tx);
+    let baseline_repo = repository::SyncBaselineRepository::new(&tx);
+    repository::PendingReturnRepository::new(&tx)
+        .remove(&task.id, original_relative_path)
+        .map_err(|e| e.to_string())?;
+    snapshot_repo
+        .upsert(&FileSnapshot {
+            task_id: task.id,
+            relative_path: original_relative_path.to_string(),
+            kind: EntryKind::File,
+            size: original_metadata.len() as i64,
+            modified_unix_ms: now,
+            blake3_hash: Some(primary_hash.to_string()),
+            hash_status: HashStatus::Verified,
+            deleted: false,
+            is_symlink: false,
+        })
+        .map_err(|e| e.to_string())?;
+    snapshot_repo
+        .upsert(&FileSnapshot {
+            task_id: task.id,
+            relative_path: conflict_relative_path.to_string(),
+            kind: EntryKind::File,
+            size: conflict_metadata.len() as i64,
+            modified_unix_ms: now,
+            blake3_hash: Some(secondary_hash.to_string()),
+            hash_status: HashStatus::Verified,
+            deleted: false,
+            is_symlink: false,
+        })
+        .map_err(|e| e.to_string())?;
+    baseline_repo
+        .upsert(&SyncBaseline {
+            task_id: task.id,
+            relative_path: original_relative_path.to_string(),
+            primary_hash: Some(primary_hash.to_string()),
+            primary_hash_status: HashStatus::Verified,
+            primary_size: original_metadata.len() as i64,
+            secondary_size: original_metadata.len() as i64,
+            primary_modified_unix_ms: now,
+            secondary_hash: Some(primary_hash.to_string()),
+            secondary_hash_status: HashStatus::Verified,
+            secondary_modified_unix_ms: now,
+            last_synced_unix_ms: now,
+        })
+        .map_err(|e| e.to_string())?;
+    baseline_repo
+        .upsert(&SyncBaseline {
+            task_id: task.id,
+            relative_path: conflict_relative_path.to_string(),
+            primary_hash: Some(secondary_hash.to_string()),
+            primary_hash_status: HashStatus::Verified,
+            primary_size: conflict_metadata.len() as i64,
+            secondary_size: conflict_metadata.len() as i64,
+            primary_modified_unix_ms: now,
+            secondary_hash: Some(secondary_hash.to_string()),
+            secondary_hash_status: HashStatus::Verified,
+            secondary_modified_unix_ms: now,
+            last_synced_unix_ms: now,
+        })
+        .map_err(|e| e.to_string())?;
+    drop(snapshot_repo);
+    drop(baseline_repo);
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -4290,17 +4963,15 @@ pub fn list_history(
         .ok_or("task not found")?;
     let repo = repository::HistoryRepository::new(&db);
     let entries = repo.list_by_task(&id).map_err(|e| e.to_string())?;
-    let mut entries = entries
-        .into_iter()
-        .filter(|entry| {
-            if Path::new(&entry.stored_path).exists() {
-                true
-            } else {
-                let _ = repo.remove(&id, &entry.id);
-                false
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut existing_entries = Vec::new();
+    for entry in entries {
+        if Path::new(&entry.stored_path).exists() {
+            existing_entries.push(entry);
+        } else {
+            repo.remove(&id, &entry.id).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut entries = existing_entries;
     let mut known_paths = entries
         .iter()
         .map(|entry| entry.stored_path.clone())
@@ -4531,6 +5202,26 @@ pub fn list_logs(
 }
 
 #[tauri::command]
+pub fn get_diagnostic_report(state: State<'_, AppState>) -> Result<String, String> {
+    let app_data_dir = state
+        .platform
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let db = state.db.lock().map_err(|error| error.to_string())?;
+    let tasks = repository::SyncTaskRepository::new(&db)
+        .list_all()
+        .map_err(|error| error.to_string())?;
+    let logs = repository::LogRepository::new(&db)
+        .list_recent(50)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::diagnostics::build_diagnostic_report(
+        &app_data_dir,
+        &tasks,
+        &logs,
+    ))
+}
+
+#[tauri::command]
 pub fn write_log(
     state: State<'_, AppState>,
     level: String,
@@ -4571,14 +5262,135 @@ pub fn write_log(
 pub struct AppSettings {
     pub history_retention_days: i64,
     pub history_size_limit_mb: i64,
+    pub discovery_enabled: bool,
+    pub update_check: crate::update::UpdateCheckResult,
 }
 
 #[tauri::command]
-pub fn get_settings() -> Result<AppSettings, String> {
+pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    load_app_settings(&state)
+}
+
+#[tauri::command]
+pub fn get_app_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    load_app_settings(&state)
+}
+
+#[tauri::command]
+pub fn set_discovery_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<crate::transport::DiscoveryStatus, String> {
+    let mut settings =
+        crate::app_settings::load(state.platform.as_ref()).map_err(|e| e.to_string())?;
+    settings.discovery_enabled = enabled;
+    crate::app_settings::save(state.platform.as_ref(), &settings).map_err(|e| e.to_string())?;
+
+    if enabled {
+        let server = state
+            ._server
+            .as_ref()
+            .ok_or_else(|| "同步服务未启动，无法开启自动发现".to_string())?;
+        let public = state.identity.public();
+        let hostname = default_hostname();
+        crate::transport::discovery::start_existing_in_background(
+            state.discovery.clone(),
+            public.device_id,
+            hostname,
+            public.public_key,
+            server.port(),
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        state.discovery.mark_disabled();
+    }
+
+    Ok(state.discovery.status())
+}
+
+#[tauri::command]
+pub async fn check_for_updates(
+    state: State<'_, AppState>,
+    force: bool,
+) -> Result<crate::update::UpdateCheckResult, String> {
+    let mut settings =
+        crate::app_settings::load(state.platform.as_ref()).map_err(|e| e.to_string())?;
+    let now = crate::update::now_unix_ms().map_err(|e| e.to_string())?;
+
+    if !force && !crate::update::is_check_due(&settings, now) {
+        return crate::update::cached_result(&settings).map_err(|e| e.to_string());
+    }
+
+    let release = crate::update::fetch_latest_release()
+        .await
+        .map_err(|e| format!("无法连接 GitHub 检查更新：{e}"))?;
+    let result = crate::update::result_from_release(release, now).map_err(|e| e.to_string())?;
+    settings.last_update_check_unix_ms = Some(now);
+    settings.latest_release = crate::update::cache_release(result.release.as_ref());
+    crate::app_settings::save(state.platform.as_ref(), &settings).map_err(|e| e.to_string())?;
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn open_project_github() -> Result<(), String> {
+    open_fixed_external_url(crate::update::PROJECT_GITHUB_URL)
+}
+
+#[tauri::command]
+pub fn open_available_update_release(state: State<'_, AppState>) -> Result<(), String> {
+    let settings = crate::app_settings::load(state.platform.as_ref()).map_err(|e| e.to_string())?;
+    let result = crate::update::cached_result(&settings).map_err(|e| e.to_string())?;
+    if result.status != crate::update::UpdateCheckStatus::UpdateAvailable {
+        return Err("当前没有可打开的新版本发布页".to_string());
+    }
+    let release = result
+        .release
+        .ok_or_else(|| "当前没有可打开的新版本发布页".to_string())?;
+    let url = crate::update::release_page_url(&release.tag_name).map_err(|e| e.to_string())?;
+    open_fixed_external_url(&url)
+}
+
+fn open_fixed_external_url(url: &str) -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("无法打开浏览器：{e}"))?;
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("无法打开浏览器：{e}"))?;
+    } else {
+        return Err("当前平台不支持打开浏览器".to_string());
+    }
+    Ok(())
+}
+
+fn load_app_settings(state: &State<'_, AppState>) -> Result<AppSettings, String> {
+    let settings = crate::app_settings::load(state.platform.as_ref()).map_err(|e| e.to_string())?;
     Ok(AppSettings {
         history_retention_days: 30,
         history_size_limit_mb: 1024,
+        discovery_enabled: settings.discovery_enabled,
+        update_check: crate::update::cached_result(&settings).map_err(|e| e.to_string())?,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn default_hostname() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "Device".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn default_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Device".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn default_hostname() -> String {
+    "Device".to_string()
 }
 
 #[tauri::command]
@@ -4743,53 +5555,356 @@ pub async fn get_task_peer_status(
     } else {
         task.primary_device_id.clone()
     };
-    let peer = state.connections.get_peer(&peer_device_id);
-    let Some(peer) = peer else {
-        return Ok(TaskPeerStatus {
-            task_id,
-            peer_device_id,
-            address: None,
-            connected: false,
-            last_seen_unix_ms: 0,
-            error: Some("peer has no known address".to_string()),
-        });
+    let paired_device = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::PairedDeviceRepository::new(&db)
+            .get(&peer_device_id)
+            .map_err(|e| e.to_string())?
     };
-    let address = peer.address.clone();
+    let peer = state.connections.get_peer(&peer_device_id);
+
+    let candidates = candidate_peer_addresses(
+        &state,
+        &peer_device_id,
+        peer.as_ref(),
+        paired_device.as_ref(),
+    );
+    let address = peer
+        .as_ref()
+        .map(|peer| peer.address.clone())
+        .or_else(|| {
+            paired_device
+                .as_ref()
+                .and_then(|device| device.last_address.clone())
+        })
+        .or_else(|| candidates.first().map(PeerAddressCandidate::address));
+    let last_seen_unix_ms = peer.as_ref().map_or_else(
+        || {
+            paired_device
+                .as_ref()
+                .map_or(0, |device| device.last_seen_unix_ms)
+        },
+        |peer| peer.last_seen_unix_ms,
+    );
+
     if state.connections.is_manually_disconnected(&peer_device_id) {
         return Ok(TaskPeerStatus {
             task_id,
             peer_device_id,
-            address: Some(address),
+            address,
             connected: false,
-            last_seen_unix_ms: peer.last_seen_unix_ms,
+            last_seen_unix_ms,
             error: Some("manually disconnected".to_string()),
+            status_reason: Some("local_manual_disconnect".to_string()),
+            error_code: None,
+            error_detail: None,
+            peer_app_version: None,
         });
     }
-    match connection::ping_known_peer(&state.connections, &peer_device_id).await {
-        Ok(()) => {
-            let refreshed = state.connections.get_peer(&peer_device_id).unwrap_or(peer);
+
+    if state
+        ._server
+        .as_ref()
+        .is_some_and(|server| server.peer_requested_disconnect(&peer_device_id))
+    {
+        state.connections.disconnect(&peer_device_id);
+        return Ok(TaskPeerStatus {
+            task_id,
+            peer_device_id,
+            address,
+            connected: false,
+            last_seen_unix_ms,
+            error: Some("peer manually disconnected".to_string()),
+            status_reason: Some("remote_manual_disconnect".to_string()),
+            error_code: None,
+            error_detail: None,
+            peer_app_version: None,
+        });
+    }
+
+    if candidates.is_empty() {
+        return Ok(TaskPeerStatus {
+            task_id,
+            peer_device_id,
+            address,
+            connected: false,
+            last_seen_unix_ms,
+            error: Some("peer has no known address".to_string()),
+            status_reason: Some("offline".to_string()),
+            error_code: Some("unknown".to_string()),
+            error_detail: Some("peer has no known address".to_string()),
+            peer_app_version: None,
+        });
+    }
+
+    match refresh_peer_reachable_address(
+        &state,
+        &peer_device_id,
+        paired_device.as_ref(),
+        &candidates,
+    )
+    .await
+    {
+        Ok(refreshed) => Ok(TaskPeerStatus {
+            task_id,
+            peer_device_id,
+            address: Some(refreshed.connection.address),
+            connected: true,
+            last_seen_unix_ms: refreshed.connection.last_seen_unix_ms,
+            error: None,
+            status_reason: Some("online".to_string()),
+            error_code: None,
+            error_detail: None,
+            peer_app_version: refreshed.identity.app_version,
+        }),
+        Err(error) => {
+            state.connections.disconnect(&peer_device_id);
             Ok(TaskPeerStatus {
                 task_id,
                 peer_device_id,
-                address: Some(refreshed.address),
-                connected: true,
-                last_seen_unix_ms: refreshed.last_seen_unix_ms,
-                error: None,
+                address,
+                connected: false,
+                last_seen_unix_ms,
+                error: Some(connection::friendly_peer_connection_error(&error.detail)),
+                status_reason: Some("offline".to_string()),
+                error_code: Some(error.code.to_string()),
+                error_detail: Some(error.detail),
+                peer_app_version: None,
             })
         }
-        Err(error) => Ok(TaskPeerStatus {
-            task_id,
-            peer_device_id,
-            address: Some(address),
-            connected: false,
-            last_seen_unix_ms: peer.last_seen_unix_ms,
-            error: Some(error.to_string()),
-        }),
     }
 }
 
 #[tauri::command]
-pub fn disconnect_task_peer(
+pub fn open_local_network_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")
+            .spawn()
+            .map_err(|error| format!("无法打开本地网络设置：{error}"))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err("当前系统不支持直接打开本地网络权限设置".to_string())
+}
+
+fn candidate_peer_addresses(
+    state: &AppState,
+    peer_device_id: &str,
+    peer: Option<&connection::PeerConnection>,
+    paired_device: Option<&PairedDevice>,
+) -> Vec<PeerAddressCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(peer) = peer {
+        push_peer_candidate(&mut candidates, PeerAddressCandidate::parse(&peer.address));
+    }
+    if let Some(address) = paired_device.and_then(|device| device.last_address.as_deref()) {
+        push_peer_candidate(&mut candidates, PeerAddressCandidate::parse(address));
+    }
+    if let Some(device) = state
+        .discovery
+        .list_devices()
+        .into_iter()
+        .find(|device| device.device_id == peer_device_id && device.compatible)
+    {
+        for address in device.addresses {
+            push_peer_candidate(
+                &mut candidates,
+                Some(PeerAddressCandidate::from_host_port(
+                    address.ip,
+                    address.port,
+                )),
+            );
+        }
+    }
+    candidates
+}
+
+fn push_peer_candidate(
+    candidates: &mut Vec<PeerAddressCandidate>,
+    candidate: Option<PeerAddressCandidate>,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if !candidates.iter().any(|item| item == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+async fn refresh_peer_reachable_address(
+    state: &AppState,
+    peer_device_id: &str,
+    paired_device: Option<&PairedDevice>,
+    candidates: &[PeerAddressCandidate],
+) -> Result<RefreshedPeer, PeerProbeFailure> {
+    let mut last_error = None;
+    for candidate in candidates {
+        match verify_peer_address(&state.identity, peer_device_id, paired_device, candidate).await {
+            Ok(identity) => {
+                let address = candidate.address();
+                let refreshed = connection::PeerConnection {
+                    device_id: peer_device_id.to_string(),
+                    address: address.clone(),
+                    connected: true,
+                    last_seen_unix_ms: now_ms(),
+                };
+                state.connections.register_connection(refreshed.clone());
+                persist_refreshed_peer_address(state, paired_device, &identity.identity, &address)
+                    .map_err(|detail| PeerProbeFailure {
+                        code: "unknown",
+                        detail,
+                    })?;
+                return Ok(RefreshedPeer {
+                    connection: refreshed,
+                    identity,
+                });
+            }
+            Err(error) => {
+                crate::diagnostics::record_operation(
+                    "peer_online_probe_failed",
+                    format!(
+                        "peer_device_id={} address={} code={} detail={}",
+                        peer_device_id,
+                        candidate.address(),
+                        error.code,
+                        error.detail
+                    ),
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| PeerProbeFailure {
+        code: "unknown",
+        detail: "peer is unreachable".to_string(),
+    }))
+}
+
+async fn verify_peer_address(
+    local_identity: &crate::pairing::DeviceIdentity,
+    peer_device_id: &str,
+    paired_device: Option<&PairedDevice>,
+    candidate: &PeerAddressCandidate,
+) -> Result<connection::PeerIdentityDetails, PeerProbeFailure> {
+    connection::ping_peer_address(&candidate.host, candidate.port)
+        .await
+        .map_err(|error| {
+            classify_peer_probe_error("tcp_ping", &candidate.host, error.to_string())
+        })?;
+    let identity = connection::request_peer_identity_details(&candidate.host, candidate.port)
+        .await
+        .map_err(|error| {
+            classify_peer_probe_error("identity", &candidate.host, error.to_string())
+        })?;
+    if identity.identity.device_id != peer_device_id {
+        return Err(PeerProbeFailure {
+            code: "identity_mismatch",
+            detail: "对端身份已变化，请重新发现设备。".to_string(),
+        });
+    }
+    if let Some(paired_device) = paired_device {
+        if !paired_device.public_key.is_empty()
+            && paired_device.public_key != identity.identity.public_key
+        {
+            return Err(PeerProbeFailure {
+                code: "identity_mismatch",
+                detail: "对端公钥与已配对设备不一致，请重新配对。".to_string(),
+            });
+        }
+    }
+    connection::authenticate_peer_address(
+        &candidate.host,
+        candidate.port,
+        local_identity,
+        peer_device_id,
+    )
+    .await
+    .map_err(|error| {
+        classify_peer_probe_error("authentication", &candidate.host, error.to_string())
+    })?;
+    Ok(identity)
+}
+
+fn classify_peer_probe_error(stage: &str, host: &str, error: String) -> PeerProbeFailure {
+    let normalized = error.to_lowercase();
+    let private_address = host
+        .parse::<IpAddr>()
+        .ok()
+        .is_some_and(|address| match address {
+            IpAddr::V4(address) => address.is_private() || address.is_link_local(),
+            IpAddr::V6(address) => address.is_unique_local() || address.is_unicast_link_local(),
+        });
+    let code = if normalized.contains("identity mismatch")
+        || normalized.contains("身份已变化")
+        || normalized.contains("公钥")
+    {
+        "identity_mismatch"
+    } else if normalized.contains("authentication rejected") {
+        "authentication_rejected"
+    } else if normalized.contains("版本不兼容")
+        || normalized.contains("protocol")
+        || normalized.contains("negotiation")
+    {
+        "protocol_mismatch"
+    } else if cfg!(target_os = "macos")
+        && private_address
+        && (normalized.contains("os error 65") || normalized.contains("no route to host"))
+    {
+        "local_network_unavailable"
+    } else if normalized.contains("no route to host")
+        || normalized.contains("network is unreachable")
+        || normalized.contains("host is down")
+        || normalized.contains("os error 51")
+        || normalized.contains("os error 113")
+        || normalized.contains("os error 10051")
+        || normalized.contains("os error 10065")
+    {
+        "no_route"
+    } else if normalized.contains("connection refused")
+        || normalized.contains("actively refused")
+        || normalized.contains("os error 61")
+        || normalized.contains("os error 111")
+        || normalized.contains("os error 10061")
+    {
+        "refused"
+    } else if normalized.contains("timed out") || normalized.contains("timeout") {
+        "timeout"
+    } else {
+        "unknown"
+    };
+    PeerProbeFailure {
+        code,
+        detail: format!("stage={stage} address={host}: {error}"),
+    }
+}
+
+fn persist_refreshed_peer_address(
+    state: &AppState,
+    paired_device: Option<&PairedDevice>,
+    identity: &crate::pairing::PublicIdentity,
+    address: &str,
+) -> Result<(), String> {
+    let Some(existing) = paired_device else {
+        return Ok(());
+    };
+    let refreshed = PairedDevice {
+        device_id: existing.device_id.clone(),
+        display_name: existing.display_name.clone(),
+        public_key: identity.public_key.clone(),
+        last_seen_unix_ms: now_ms(),
+        trusted: existing.trusted,
+        last_address: Some(address.to_string()),
+    };
+    let db = state.db.lock().map_err(|error| error.to_string())?;
+    repository::PairedDeviceRepository::new(&db)
+        .upsert(&refreshed)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn disconnect_task_peer(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<TaskPeerStatus, String> {
@@ -4807,7 +5922,19 @@ pub fn disconnect_task_peer(
         task.primary_device_id.clone()
     };
     let peer = state.connections.get_peer(&peer_device_id);
+    let persisted = {
+        let db = state.db.lock().map_err(|error| error.to_string())?;
+        repository::PeerConnectionStateRepository::new(&db)
+            .set_local_disconnected(&peer_device_id, true, now_ms())
+            .map_err(|error| error.to_string())?
+    };
     state.connections.manual_disconnect(&peer_device_id);
+    if let Some(server) = &state._server {
+        server.set_local_peer_disconnected(&peer_device_id, true);
+    }
+    state
+        .peer_state_publisher
+        .publish(peer_device_id.clone(), true, persisted.local_revision);
 
     Ok(TaskPeerStatus {
         task_id,
@@ -4816,7 +5943,46 @@ pub fn disconnect_task_peer(
         connected: false,
         last_seen_unix_ms: peer.map_or(0, |item| item.last_seen_unix_ms),
         error: Some("manually disconnected".to_string()),
+        status_reason: Some("local_manual_disconnect".to_string()),
+        error_code: None,
+        error_detail: None,
+        peer_app_version: None,
     })
+}
+
+#[tauri::command]
+pub async fn reconnect_task_peer(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<TaskPeerStatus, String> {
+    let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let task = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::SyncTaskRepository::new(&db)
+            .get(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or("task not found")?
+    };
+    let peer_device_id = if task.local_role == DeviceRole::Primary {
+        task.secondary_device_id.clone()
+    } else {
+        task.primary_device_id.clone()
+    };
+    let persisted = {
+        let db = state.db.lock().map_err(|error| error.to_string())?;
+        repository::PeerConnectionStateRepository::new(&db)
+            .set_local_disconnected(&peer_device_id, false, now_ms())
+            .map_err(|error| error.to_string())?
+    };
+    state.connections.clear_manual_disconnect(&peer_device_id);
+    if let Some(server) = state._server.as_ref() {
+        server.set_local_peer_disconnected(&peer_device_id, false);
+    }
+    state
+        .peer_state_publisher
+        .publish(peer_device_id.clone(), false, persisted.local_revision);
+    let status = get_task_peer_status(state.clone(), task_id).await?;
+    Ok(status)
 }
 
 // ─── Transfer Speed Limit ───
@@ -4839,7 +6005,8 @@ pub fn get_transfer_speed_limit() -> Result<u64, String> {
 // ─── File Manager ───
 
 #[tauri::command]
-pub fn open_in_file_manager(path: String) -> Result<(), String> {
+pub fn open_in_file_manager(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let path = validate_file_manager_path(state.inner(), &path)?;
     if cfg!(target_os = "macos") {
         std::process::Command::new("open")
             .arg(&path)
@@ -4856,6 +6023,57 @@ pub fn open_in_file_manager(path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_file_manager_path(state: &AppState, path: &str) -> Result<PathBuf, String> {
+    if path.contains("://") || path.starts_with("file:") {
+        return Err("只能打开 LanBridge 管理的本地路径".to_string());
+    }
+
+    let target = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|_| "无法打开该路径".to_string())?;
+
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| "数据库暂时不可用".to_string())?;
+    let tasks = repository::SyncTaskRepository::new(&db)
+        .list_all()
+        .map_err(|e| format!("读取任务列表失败: {}", e))?;
+    drop(db);
+
+    for task in tasks {
+        let Ok(root) = PathBuf::from(&task.local_path).canonicalize() else {
+            continue;
+        };
+        if is_same_or_child_path(&target, &root) {
+            return Ok(target);
+        }
+
+        let history = root.join(".lanbridge-history");
+        if let Ok(history) = history.canonicalize() {
+            if is_same_or_child_path(&target, &history) {
+                return Ok(target);
+            }
+        }
+    }
+
+    if let Ok(log_path) = state.platform.log_path() {
+        if let Some(log_dir) = log_path.parent() {
+            if let Ok(log_dir) = log_dir.canonicalize() {
+                if is_same_or_child_path(&target, &log_dir) {
+                    return Ok(target);
+                }
+            }
+        }
+    }
+
+    Err("只能打开任务、历史或诊断日志路径".to_string())
+}
+
+fn is_same_or_child_path(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
 // ─── Local Network Info ───
 
 #[derive(Debug, Clone, Serialize)]
@@ -4867,27 +6085,71 @@ pub struct InterfaceInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalNetworkInfo {
     pub interfaces: Vec<InterfaceInfo>,
+    pub preferred_interface: Option<InterfaceInfo>,
     pub tcp_port: u16,
 }
 
 #[tauri::command]
 pub fn get_local_network_info(state: State<'_, AppState>) -> Result<LocalNetworkInfo, String> {
     let tcp_port = state._server.as_ref().map_or(0, |s| s.port());
-    let interfaces = local_ip_address::list_afinet_netifas()
+    let mut interfaces = local_ip_address::list_afinet_netifas()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(name, ip)| match ip {
-            IpAddr::V4(ip) if !ip.is_loopback() => Some(InterfaceInfo {
+            IpAddr::V4(ip) if is_usable_local_ipv4(ip) => Some(InterfaceInfo {
                 name,
                 ip: ip.to_string(),
             }),
             _ => None,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    interfaces.sort_by(|left, right| {
+        local_interface_score(right)
+            .cmp(&local_interface_score(left))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.ip.cmp(&right.ip))
+    });
+    let preferred_interface = interfaces.first().cloned();
     Ok(LocalNetworkInfo {
         interfaces,
+        preferred_interface,
         tcp_port,
     })
+}
+
+fn is_usable_local_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+}
+
+fn local_interface_score(interface: &InterfaceInfo) -> i32 {
+    let ip_score = interface
+        .ip
+        .parse::<Ipv4Addr>()
+        .map(|ip| if ip.is_private() { 100 } else { 10 })
+        .unwrap_or(0);
+    let virtual_penalty = if looks_like_virtual_or_vpn_interface(&interface.name) {
+        -40
+    } else {
+        0
+    };
+    ip_score + virtual_penalty
+}
+
+fn looks_like_virtual_or_vpn_interface(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("vpn")
+        || lower.contains("tun")
+        || lower.contains("tap")
+        || lower.contains("utun")
+        || lower.contains("virtual")
+        || lower.contains("hyper-v")
+        || lower.contains("vethernet")
+        || lower.contains("vmware")
+        || lower.contains("virtualbox")
+        || lower.contains("wsl")
+        || lower.contains("radmin")
+        || lower.contains("zerotier")
+        || lower.contains("tailscale")
 }
 
 // ─── Delete Task ───
@@ -4915,6 +6177,23 @@ pub fn delete_task_entry(
             .get(&id)
             .map_err(|e| e.to_string())?
             .ok_or("task not found")?
+    };
+    let secondary_delete_baselines = if task.local_role == DeviceRole::Secondary {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        repository::SyncBaselineRepository::new(&db)
+            .list_by_task(&task.id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|baseline| {
+                baseline.relative_path == relative_path
+                    || baseline
+                        .relative_path
+                        .strip_prefix(&relative_path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
     };
     let root = Path::new(&task.local_path);
     let target = path_safety::safe_join(root, &relative_path).map_err(|e| e.to_string())?;
@@ -4945,15 +6224,40 @@ pub fn delete_task_entry(
 
     if task.local_role == DeviceRole::Secondary {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        repository::FileSnapshotRepository::new(&db)
-            .remove_tree(&task.id, &relative_path)
+        let pending_repo = repository::PendingReturnRepository::new(&db);
+        let existing_pending = pending_repo
+            .get(&task.id, &relative_path)
             .map_err(|e| e.to_string())?;
-        repository::SyncBaselineRepository::new(&db)
-            .remove_tree(&task.id, &relative_path)
-            .map_err(|e| e.to_string())?;
-        repository::PendingReturnRepository::new(&db)
-            .remove_tree(&task.id, &relative_path)
-            .map_err(|e| e.to_string())?;
+        if secondary_delete_baselines.is_empty() {
+            // A newly-created Secondary file that was never returned should
+            // disappear from pending state rather than become a delete request.
+            pending_repo
+                .remove_tree(&task.id, &relative_path)
+                .map_err(|e| e.to_string())?;
+            if existing_pending.is_some() {
+                repository::FileSnapshotRepository::new(&db)
+                    .remove_tree(&task.id, &relative_path)
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            let snapshot_repo = repository::FileSnapshotRepository::new(&db);
+            for baseline in &secondary_delete_baselines {
+                snapshot_repo
+                    .mark_deleted(&task.id, &baseline.relative_path)
+                    .map_err(|e| e.to_string())?;
+                pending_repo
+                    .upsert(&PendingReturnChange {
+                        task_id: task.id,
+                        relative_path: baseline.relative_path.clone(),
+                        change_kind: ChangeKind::Deleted,
+                        secondary_hash: None,
+                        secondary_hash_status: HashStatus::Unavailable,
+                        secondary_modified_unix_ms: now_ms(),
+                        created_unix_ms: now_ms(),
+                    })
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
     state.file_list_refresh.mark(id, "entry_deleted");
     Ok(vec![DeleteEntryResult {
@@ -5005,7 +6309,14 @@ pub fn import_task_entries(
     let mut failed = Vec::new();
 
     for source in source_paths {
-        match plan_import_entry(&state, root, &target_dir, &target_relative_dir, &source, &collision_policy) {
+        match plan_import_entry(
+            &state,
+            root,
+            &target_dir,
+            &target_relative_dir,
+            &source,
+            &collision_policy,
+        ) {
             Ok(Some(item)) => planned.push(item),
             Ok(None) => {}
             Err((relative_path, error)) => {
@@ -5061,6 +6372,40 @@ pub fn import_task_entries(
     })
 }
 
+#[tauri::command]
+pub fn get_window_cursor_position(window: Window) -> Result<Option<WindowCursorPosition>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+        let mut point = POINT { x: 0, y: 0 };
+        let ok = unsafe { GetCursorPos(&mut point) };
+        if ok == 0 {
+            return Ok(None);
+        }
+
+        let inner_position = window.inner_position().map_err(|e| e.to_string())?;
+        let scale_factor = window.scale_factor().map_err(|e| e.to_string())?;
+        let scale_factor = if scale_factor <= 0.0 {
+            1.0
+        } else {
+            scale_factor
+        };
+
+        return Ok(Some(WindowCursorPosition {
+            x: (point.x - inner_position.x) as f64 / scale_factor,
+            y: (point.y - inner_position.y) as f64 / scale_factor,
+        }));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        Ok(None)
+    }
+}
+
 fn plan_import_entry(
     state: &State<'_, AppState>,
     root: &Path,
@@ -5100,8 +6445,10 @@ fn plan_import_entry(
                 return Err((initial_relative, "目标已存在".to_string()));
             }
             ImportCollisionPolicy::Overwrite => (initial_destination, initial_relative),
-            ImportCollisionPolicy::KeepBoth => unique_import_destination(root, target_dir, target_relative_dir, name)
-                .map_err(|e| (initial_relative.clone(), e))?,
+            ImportCollisionPolicy::KeepBoth => {
+                unique_import_destination(root, target_dir, target_relative_dir, name)
+                    .map_err(|e| (initial_relative.clone(), e))?
+            }
         }
     } else {
         (initial_destination, initial_relative)
@@ -5118,8 +6465,12 @@ fn join_relative_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn should_ignore_import_entry(platform: &dyn crate::platform::traits::Platform, name: &str, is_dir: bool) -> bool {
-    if name == ".lanbridge-history" || name == ".lanbridge-tmp" {
+fn should_ignore_import_entry(
+    platform: &dyn crate::platform::traits::Platform,
+    name: &str,
+    is_dir: bool,
+) -> bool {
+    if name == ".lanbridge-history" || name == ".lanbridge-temp" {
         return true;
     }
     matches!(
@@ -5146,7 +6497,8 @@ fn unique_import_destination(
             _ => format!("{} ({})", name, index),
         };
         let relative_path = join_relative_path(target_relative_dir, &candidate_name);
-        let destination = path_safety::safe_join(root, &relative_path).map_err(|e| e.to_string())?;
+        let destination =
+            path_safety::safe_join(root, &relative_path).map_err(|e| e.to_string())?;
         if !destination.exists() && !target_dir.join(&candidate_name).exists() {
             return Ok((destination, relative_path));
         }
@@ -5155,7 +6507,9 @@ fn unique_import_destination(
 }
 
 fn reject_import_cycle(source: &Path, destination: &Path) -> Result<(), String> {
-    let source_canonical = source.canonicalize().map_err(|e| format!("读取源路径失败: {}", e))?;
+    let source_canonical = source
+        .canonicalize()
+        .map_err(|e| format!("读取源路径失败: {}", e))?;
     if let Ok(destination_canonical) = destination.canonicalize() {
         if source_canonical == destination_canonical {
             return Err("源文件和目标文件相同".to_string());
@@ -5203,11 +6557,77 @@ fn copy_import_entry(
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目标文件夹失败: {}", e))?;
         }
-        std::fs::copy(source, destination)
-            .map(|_| ())
-            .map_err(|e| format!("复制文件失败: {}", e))
+        copy_file_atomically(source, destination)
     } else {
         Err("不支持导入此类型".to_string())
+    }
+}
+
+fn copy_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "目标路径无效".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建目标文件夹失败: {}", e))?;
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "目标文件名无效".to_string())?;
+    let temp_path = parent.join(format!(
+        ".{}.{}.lanbridge-import-partial",
+        file_name,
+        Uuid::new_v4()
+    ));
+    let backup_path = parent.join(format!(
+        ".{}.{}.lanbridge-import-backup",
+        file_name,
+        Uuid::new_v4()
+    ));
+
+    let source_size = std::fs::metadata(source)
+        .map_err(|e| format!("读取源文件失败: {}", e))?
+        .len();
+    if let Err(error) = std::fs::copy(source, &temp_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("复制文件失败: {}", error));
+    }
+    match std::fs::metadata(&temp_path) {
+        Ok(metadata) if metadata.len() == source_size => {}
+        Ok(_) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err("复制文件失败: 文件大小不一致".to_string());
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("验证复制文件失败: {}", error));
+        }
+    }
+
+    if destination.exists() {
+        if destination.is_dir() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err("目标已存在且不是文件".to_string());
+        }
+        std::fs::rename(destination, &backup_path)
+            .map_err(|e| format!("备份现有文件失败: {}", e))?;
+        if let Err(error) = std::fs::rename(&temp_path, destination) {
+            let restore_result = std::fs::rename(&backup_path, destination);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(match restore_result {
+                Ok(()) => format!("替换文件失败，已恢复原文件: {}", error),
+                Err(restore_error) => format!(
+                    "替换文件失败，且恢复原文件失败: {}; {}",
+                    error, restore_error
+                ),
+            });
+        }
+        let _ = std::fs::remove_file(&backup_path);
+        Ok(())
+    } else {
+        if let Err(error) = std::fs::rename(&temp_path, destination) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("写入目标文件失败: {}", error));
+        }
+        Ok(())
     }
 }
 
@@ -5223,9 +6643,7 @@ fn copy_import_directory(
             .metadata()
             .map_err(|e| format!("读取条目失败: {}", e))?;
         let name = entry.file_name();
-        let name = name
-            .to_str()
-            .ok_or_else(|| "文件名无效".to_string())?;
+        let name = name.to_str().ok_or_else(|| "文件名无效".to_string())?;
         if should_ignore_import_entry(&*state.platform, name, metadata.is_dir()) {
             continue;
         }
@@ -5239,8 +6657,7 @@ fn copy_import_directory(
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("创建目标文件夹失败: {}", e))?;
             }
-            std::fs::copy(&path, &next_destination)
-                .map_err(|e| format!("复制文件失败: {}", e))?;
+            copy_file_atomically(&path, &next_destination)?;
         }
     }
     Ok(())
@@ -5295,11 +6712,10 @@ pub fn delete_sync_task(state: State<'_, AppState>, task_id: String) -> Result<(
     )
     .map_err(|e| e.to_string())?;
 
-    // Remove watcher if present
-    {
-        let mut watchers = state._watchers.lock().map_err(|e| e.to_string())?;
-        watchers.retain(|(tid, _)| tid != &task_id);
-    }
+    state.stop_task_watcher(id);
+    state.dirty_tasks.clear(id);
+    state.auto_sync_sweeps.clear(id);
+    state.task_access_issues.clear(id);
 
     tracing::info!("deleted sync task '{}' at {}", task.name, task.local_path);
     Ok(())
@@ -5308,6 +6724,7 @@ pub fn delete_sync_task(state: State<'_, AppState>, task_id: String) -> Result<(
 #[cfg(test)]
 mod return_sync_tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn pending_return(change_kind: ChangeKind) -> PendingReturnChange {
         PendingReturnChange {
@@ -5370,6 +6787,7 @@ mod return_sync_tests {
             enabled: true,
             created_unix_ms: 1_000,
             updated_unix_ms: 1_000,
+            last_transfer_activity_unix_ms: 0,
         }
     }
 
@@ -5417,6 +6835,34 @@ mod return_sync_tests {
 
     fn snapshot_from_remote(remote: RemoteFileState) -> FileSnapshot {
         remote_file_state_to_snapshot(Uuid::nil(), &remote)
+    }
+
+    #[test]
+    fn import_copy_replaces_existing_file_after_full_temp_copy() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        std::fs::write(&source, "new content").unwrap();
+        std::fs::write(&destination, "old content").unwrap();
+
+        copy_file_atomically(&source, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "new content"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.contains("lanbridge-import"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]

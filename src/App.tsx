@@ -1,16 +1,29 @@
-import { useState, useEffect, useCallback, useRef, type MouseEvent } from "react";
+import {
+  lazy,
+  Suspense,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type MouseEvent,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   getIdentity,
+  checkForUpdates,
   getTaskPeerStatus,
   hideMainWindowToTray,
   hasActiveTransfers,
   listReadyAutoSyncTasks,
+  listTaskAccessIssues,
+  listTaskInvites,
   listSyncTasks,
   quitApp,
   syncNow,
   type IdentityInfo,
+  type IncomingTaskInviteInfo,
   type SyncTask,
+  type TaskAccessIssue,
 } from "./lib/tauriApi";
 import { LanguageProvider, useTranslation } from "./lib/i18n/context";
 import { TabBar, type Tab } from "./components/TabBar";
@@ -21,28 +34,41 @@ import {
   FolderTransitionProvider,
   useStartFolderTransition,
 } from "./components/FolderPageTransition";
-import { SyncStage } from "./features/sync-task/SyncStage";
-import { PairingScreen } from "./features/pairing/PairingScreen";
-import { LogsScreen } from "./features/logs/LogsScreen";
-import { SettingsScreen } from "./features/settings/SettingsScreen";
 import { isBrowserPreviewBridgeError } from "./lib/runtime";
 import { AppContextMenu, type ContextMenuState } from "./components/AppContextMenu";
 import { CloseConfirmDialog } from "./components/CloseConfirmDialog";
+import { IncomingTaskInvitePrompt } from "./components/IncomingTaskInvitePrompt";
 import "./styles.css";
 
 const MINIMIZE_TO_TRAY_KEY = "lanbridge.minimizeToTrayOnClose";
 const CLOSE_BEHAVIOR_KEY = "lanbridge.closeBehavior";
+
+const SyncStage = lazy(() =>
+  import("./features/sync-task/SyncStage").then((module) => ({ default: module.SyncStage }))
+);
+const PairingScreen = lazy(() =>
+  import("./features/pairing/PairingScreen").then((module) => ({ default: module.PairingScreen }))
+);
+const LogsScreen = lazy(() =>
+  import("./features/logs/LogsScreen").then((module) => ({ default: module.LogsScreen }))
+);
+const SettingsScreen = lazy(() =>
+  import("./features/settings/SettingsScreen").then((module) => ({ default: module.SettingsScreen }))
+);
 
 function AppContent() {
   const [tab, setTab] = useState<Tab>("discover");
   const [pageTransitionPhase, setPageTransitionPhase] = useState<"idle" | "exit" | "enter">("idle");
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
   const [tasks, setTasks] = useState<SyncTask[]>([]);
+  const [taskAccessIssues, setTaskAccessIssues] = useState<TaskAccessIssue[]>([]);
+  const [incomingInvites, setIncomingInvites] = useState<IncomingTaskInviteInfo[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [closeDialogOpen, setCloseDialogOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [updateSettingsRefreshToken, setUpdateSettingsRefreshToken] = useState(0);
   const [minimizeToTrayOnClose, setMinimizeToTrayOnClose] = useState(
     () => localStorage.getItem(MINIMIZE_TO_TRAY_KEY) === "true"
   );
@@ -74,6 +100,19 @@ function AppContent() {
     }
   }, []);
 
+  const refreshIncomingInvites = useCallback(async () => {
+    try {
+      const invites = await listTaskInvites();
+      setIncomingInvites(
+        invites
+          .filter((invite) => invite.status === "Pending")
+          .sort((left, right) => left.created_unix_ms - right.created_unix_ms)
+      );
+    } catch (nextError) {
+      if (!isBrowserPreviewBridgeError(nextError)) setError(String(nextError));
+    }
+  }, []);
+
   useEffect(() => {
     getIdentity()
       .then(setIdentity)
@@ -84,7 +123,54 @@ function AppContent() {
   }, [refreshTasks]);
 
   useEffect(() => {
+    let disposed = false;
+    checkForUpdates(false)
+      .then(() => {
+        if (!disposed) setUpdateSettingsRefreshToken((value) => value + 1);
+      })
+      .catch(() => {
+        // Update checks are advisory and must never interrupt normal startup.
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ task_id: string }>("lanbridge://task-transfer-activity", () => {
+      void refreshTasks();
+    })
+      .then((cleanup) => {
+        unlisten = cleanup;
+      })
+      .catch((e) => {
+        if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+      });
+    return () => {
+      unlisten?.();
+    };
+  }, [refreshTasks]);
+
+  useEffect(() => {
+    void refreshIncomingInvites();
+    const id = window.setInterval(() => {
+      void refreshIncomingInvites();
+    }, 2500);
+    return () => window.clearInterval(id);
+  }, [refreshIncomingInvites]);
+
+  useEffect(() => {
+    let disposed = false;
     const autoSyncPrimaryTasks = async () => {
+      let blockedTaskIds = new Set<string>();
+      try {
+        const issues = await listTaskAccessIssues();
+        blockedTaskIds = new Set(issues.map((issue) => issue.task_id));
+        if (!disposed) setTaskAccessIssues(issues);
+      } catch {
+        // Access issues are advisory; auto-sync readiness remains authoritative.
+      }
       try {
         if (await hasActiveTransfers()) return;
       } catch {
@@ -97,37 +183,45 @@ function AppContent() {
         readyTaskIds = new Set();
       }
       const primaryTasks = tasks.filter(
-        (task) => task.enabled && task.local_role === "Primary"
+        (task) =>
+          task.enabled &&
+          task.local_role === "Primary" &&
+          !blockedTaskIds.has(task.id)
       );
       for (const task of primaryTasks) {
         if (autoSyncInFlight.current.has(task.id)) continue;
         autoSyncInFlight.current.add(task.id);
+        let attemptedSync = false;
         try {
           const status = await getTaskPeerStatus(task.id);
           const wasConnected = lastPeerConnected.current.get(task.id);
           lastPeerConnected.current.set(task.id, status.connected);
           if (!status.connected) continue;
           if (wasConnected === false || wasConnected === undefined) {
-            await syncNow(task.id);
+            attemptedSync = (await syncNow(task.id)).length > 0;
             continue;
           }
           if (!readyTaskIds.has(task.id)) continue;
-          await syncNow(task.id);
+          attemptedSync = (await syncNow(task.id)).length > 0;
         } catch {
           lastPeerConnected.current.set(task.id, false);
           // silent
         } finally {
           autoSyncInFlight.current.delete(task.id);
+          if (attemptedSync && !disposed) {
+            await refreshTasks();
+          }
         }
       }
     };
+    void autoSyncPrimaryTasks();
     const id = window.setInterval(autoSyncPrimaryTasks, 3000);
     return () => {
+      disposed = true;
       window.clearInterval(id);
       autoSyncInFlight.current.clear();
-      lastPeerConnected.current.clear();
     };
-  }, [tasks]);
+  }, [tasks, refreshTasks]);
 
   useEffect(() => () => {
     if (pageTransitionTimer.current !== null) {
@@ -193,6 +287,16 @@ function AppContent() {
     refreshTasks();
     setTab("sync");
   };
+
+  const handleIncomingInviteAccepted = useCallback(async (task: SyncTask) => {
+    await refreshTasks();
+    if (task.local_role !== "Primary") return;
+    try {
+      await syncNow(task.id);
+    } catch (nextError) {
+      if (!isBrowserPreviewBridgeError(nextError)) setError(String(nextError));
+    }
+  }, [refreshTasks]);
 
   const handleContextRefresh = () => {
     setRefreshToken((value) => value + 1);
@@ -293,6 +397,7 @@ function AppContent() {
           <SettingsScreen
             minimizeToTrayOnClose={minimizeToTrayOnClose}
             onMinimizeToTrayOnCloseChange={handleMinimizePreferenceChange}
+            updateRefreshToken={updateSettingsRefreshToken}
           />
         );
 
@@ -312,13 +417,24 @@ function AppContent() {
       />
 
       <TopMessageList
-        messages={error ? [{
-          id: "app-error",
-          tone: "danger",
-          icon: "!",
-          title: error,
-          action: <button className="top-message-action" type="button" onClick={() => setError(null)}>{t.app.dismiss}</button>,
-        }] : []}
+        messages={[
+          ...taskAccessIssues.map((issue) => ({
+            id: `task-access-${issue.task_id}`,
+            tone: "danger" as const,
+            icon: "!",
+            title: t.app.taskAccessPaused,
+            detail: t.app.taskAccessDetail
+              .replace("{task}", issue.task_name)
+              .replace("{path}", issue.local_path),
+          })),
+          ...(error ? [{
+            id: "app-error",
+            tone: "danger" as const,
+            icon: "!",
+            title: error,
+            action: <button className="top-message-action" type="button" onClick={() => setError(null)}>{t.app.dismiss}</button>,
+          }] : []),
+        ]}
       />
 
       {identity && (
@@ -331,8 +447,16 @@ function AppContent() {
 
       <ProgressBar />
 
+      <IncomingTaskInvitePrompt
+        invites={incomingInvites}
+        onRefresh={refreshIncomingInvites}
+        onAccepted={handleIncomingInviteAccepted}
+      />
+
       <main className={`main-content page-transition-${pageTransitionPhase}`}>
-        {renderTabContent()}
+        <Suspense fallback={<div className="stage-loading" aria-live="polite">Loading…</div>}>
+          {renderTabContent()}
+        </Suspense>
       </main>
 
       <AppContextMenu

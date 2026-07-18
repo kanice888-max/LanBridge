@@ -1,7 +1,15 @@
 use crate::platform::traits::{IgnoreDecision, IgnoreReason};
 
 /// Exact file names to ignore on Windows.
-const EXACT_FILE_NAMES: &[&str] = &["Thumbs.db", "desktop.ini", "Desktop.ini", ".DS_Store"];
+const EXACT_FILE_NAMES: &[&str] = &[
+    "Thumbs.db",
+    "desktop.ini",
+    "Desktop.ini",
+    ".DS_Store",
+    crate::diagnostics::APP_LOG_FILE_NAME,
+    crate::diagnostics::STARTUP_CRASH_FILE_NAME,
+    crate::diagnostics::CRASH_DIAGNOSTICS_FILE_NAME,
+];
 
 /// Exact directory names to ignore (matched with trailing slash).
 const EXACT_DIR_NAMES: &[&str] = &[
@@ -122,6 +130,18 @@ mod tests {
         assert_eq!(
             classify_entry("desktop.ini", false),
             IgnoreDecision::Ignored(IgnoreReason::ExactName("desktop.ini".to_string()))
+        );
+        assert_eq!(
+            classify_entry("lanbridge.log", false),
+            IgnoreDecision::Ignored(IgnoreReason::ExactName("lanbridge.log".to_string()))
+        );
+        assert_eq!(
+            classify_entry("startup-crash.log", false),
+            IgnoreDecision::Ignored(IgnoreReason::ExactName("startup-crash.log".to_string()))
+        );
+        assert_eq!(
+            classify_entry("crash-diagnostics.log", false),
+            IgnoreDecision::Ignored(IgnoreReason::ExactName("crash-diagnostics.log".to_string()))
         );
     }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   listPendingReturns,
   refreshPendingReturns,
@@ -8,6 +8,8 @@ import {
   resolveConflictKeepBoth,
   type PendingReturnChange,
   type ConflictInfo,
+  type SyncActionResult,
+  formatSyncOperationError,
 } from "../../lib/tauriApi";
 import { ConflictModal } from "../conflicts/ConflictModal";
 import { useTranslation } from "../../lib/i18n/context";
@@ -22,28 +24,37 @@ export function ReturnSyncScreen({ taskId, onBack: _onBack }: ReturnSyncScreenPr
   const [pending, setPending] = useState<PendingReturnChange[]>([]);
   const [conflicts, setConflicts] = useState<ConflictInfo[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [results, setResults] = useState<any[]>([]);
+  const [results, setResults] = useState<SyncActionResult[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conflictCheckError, setConflictCheckError] = useState<string | null>(null);
   const [activeConflict, setActiveConflict] = useState<ConflictInfo | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+  }, []);
 
   const loadData = useCallback(async (checkConflicts = true) => {
     try {
       await refreshPendingReturns(taskId);
       const p = await listPendingReturns(taskId);
+      if (!mountedRef.current) return;
       setPending(p);
       setError(null);
       if (!checkConflicts) return;
       try {
         const c = await detectConflicts(taskId);
+        if (!mountedRef.current) return;
         setConflicts(c);
         setConflictCheckError(null);
       } catch (e) {
+        if (!mountedRef.current) return;
         setConflicts([]);
         setConflictCheckError(String(e));
       }
     } catch (e) {
+      if (!mountedRef.current) return;
       setError(String(e));
     }
   }, [taskId]);
@@ -79,7 +90,11 @@ export function ReturnSyncScreen({ taskId, onBack: _onBack }: ReturnSyncScreenPr
       const r = await executeReturnSync(taskId, Array.from(selected));
       setResults(r);
       await loadData();
-      setSelected(new Set());
+      const failed = r.filter((result) => !result.success);
+      setSelected(new Set(failed.map((result) => result.relative_path)));
+      if (failed.length > 0) {
+        setError(formatSyncOperationError(failed[0].error || `${failed[0].relative_path} 回传失败，可重试`));
+      }
     } catch (e) { setError(String(e)); }
     finally { setSyncing(false); }
   };
@@ -91,23 +106,46 @@ export function ReturnSyncScreen({ taskId, onBack: _onBack }: ReturnSyncScreenPr
       const r = await executeReturnSync(taskId, [path]);
       setResults(r);
       await loadData();
-      setSelected((prev) => {
-        const next = new Set(prev);
-        next.delete(path);
-        return next;
-      });
+      if (r.some((result) => !result.success)) {
+        setSelected((prev) => new Set(prev).add(path));
+        setError(formatSyncOperationError(r.find((result) => !result.success)?.error || `${path} 回传失败，可重试`));
+      } else {
+        setSelected((prev) => {
+          const next = new Set(prev);
+          next.delete(path);
+          return next;
+        });
+      }
     } catch (e) { setError(String(e)); }
     finally { setSyncing(false); }
   };
 
   const handleConflictOverwrite = async () => {
     if (!activeConflict) return;
-    try { await resolveConflictOverwrite(taskId, activeConflict.relative_path); setActiveConflict(null); await loadData(); } catch (e) { setError(String(e)); }
+    try {
+      const result = await resolveConflictOverwrite(taskId, activeConflict.relative_path);
+      setResults([result]);
+      if (!result.success) {
+        setError(formatSyncOperationError(result.error || "覆盖主机失败"));
+        return;
+      }
+      setActiveConflict(null);
+      await loadData();
+    } catch (e) { setError(formatSyncOperationError(e)); }
   };
 
   const handleConflictKeepBoth = async () => {
     if (!activeConflict) return;
-    try { await resolveConflictKeepBoth(taskId, activeConflict.relative_path); setActiveConflict(null); await loadData(); } catch (e) { setError(String(e)); }
+    try {
+      const result = await resolveConflictKeepBoth(taskId, activeConflict.relative_path);
+      setResults([result]);
+      if (!result.success) {
+        setError(formatSyncOperationError(result.error || "保留两份失败"));
+        return;
+      }
+      setActiveConflict(null);
+      await loadData();
+    } catch (e) { setError(formatSyncOperationError(e)); }
   };
 
   const conflictPaths = new Set(conflicts.map((c) => c.relative_path));

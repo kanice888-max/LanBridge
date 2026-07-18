@@ -4,7 +4,8 @@ use lanbridge::core::model::{
 use lanbridge::core::{planner, scanner};
 use lanbridge::pairing::PublicIdentity;
 use lanbridge::pairing::{derive_pairing_code, generate_nonce, DeviceIdentity};
-use lanbridge::platform::windows::WinPlatform as TestPlatform;
+#[cfg(target_os = "macos")]
+use lanbridge::platform::macos::MacPlatform as TestPlatform;
 #[cfg(target_os = "windows")]
 use lanbridge::platform::windows::WinPlatform as TestPlatform;
 use lanbridge::state::{
@@ -190,6 +191,9 @@ fn test_discovery_state_keeps_multiple_addresses_for_same_peer() {
         display_name: "Peer".to_string(),
         public_key: vec![7; 32],
         port: 9527,
+        app_version: "0.1.0".to_string(),
+        protocol_version: 2,
+        min_protocol_version: 2,
     };
 
     state.record_peer(
@@ -230,6 +234,9 @@ fn test_discovery_state_ignores_announces_without_tcp_port() {
             display_name: "No TCP".to_string(),
             public_key: vec![1; 32],
             port: 0,
+            app_version: "0.1.0".to_string(),
+            protocol_version: 2,
+            min_protocol_version: 2,
         },
         "192.168.1.50".to_string(),
         Some("wifi".to_string()),
@@ -349,7 +356,7 @@ async fn test_sync_server_rejects_unauthenticated_file_transfer() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(task_id, remote_dir.path(), "unused-peer")
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -376,6 +383,7 @@ async fn test_sync_server_rejects_unauthenticated_file_transfer() {
             relative_path,
             success,
             error,
+            ..
         } => {
             assert_eq!(ack_task, task_id);
             assert_eq!(relative_path, "docs/readme.txt");
@@ -396,7 +404,11 @@ async fn test_sync_server_receives_authenticated_file_transfer_and_acks() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-auth-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -444,7 +456,11 @@ async fn test_sync_server_keeps_legacy_v1_chunk_ack_contract() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-legacy-v1-ack";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -461,6 +477,7 @@ async fn test_sync_server_keeps_legacy_v1_chunk_ack_contract() {
                 relative_path: "legacy.txt".to_string(),
                 file_hash,
                 total_bytes: data.len() as u64,
+                expected_target_hash: None,
             })
             .unwrap(),
         )
@@ -509,7 +526,11 @@ async fn test_sync_server_v1_streaming_uses_checkpoint_acks() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-v1-checkpoint-ack";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -527,6 +548,7 @@ async fn test_sync_server_v1_streaming_uses_checkpoint_acks() {
                 relative_path: "checkpoint.bin".to_string(),
                 file_hash: String::new(),
                 total_bytes,
+                expected_target_hash: None,
             })
             .unwrap(),
         )
@@ -593,7 +615,11 @@ async fn test_sync_server_rejects_windows_reserved_relative_path() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-reserved-path-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -634,7 +660,11 @@ async fn test_connection_manager_sends_message_to_registered_peer() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-002";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -680,6 +710,13 @@ async fn test_task_register_message_enables_later_file_transfer() {
     server.register_trusted_peer(local_identity.public());
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-003";
+    server
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id.clone(),
+        )
+        .unwrap();
     let manager = ConnectionManager::new();
     manager.register_connection(lanbridge::transport::PeerConnection {
         device_id: "peer-002".to_string(),
@@ -704,6 +741,26 @@ async fn test_task_register_message_enables_later_file_transfer() {
             assert!(success, "unexpected task ack error: {:?}", error);
         }
         other => panic!("expected TaskAck, got {:?}", other),
+    }
+
+    let unauthorized_dir = TempDir::new().unwrap();
+    let rejected = lanbridge::transport::connection::send_authenticated_message_to_peer(
+        &manager,
+        &local_identity,
+        "peer-002",
+        SyncMessage::TaskRegister {
+            task_id: task_id.to_string(),
+            root_path: unauthorized_dir.path().to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    match rejected {
+        SyncMessage::TaskAck { success, error, .. } => {
+            assert!(!success);
+            assert_eq!(error.as_deref(), Some("TaskRootMismatch"));
+        }
+        other => panic!("expected rejected TaskAck, got {:?}", other),
     }
 
     let data = b"after task register".to_vec();
@@ -742,7 +799,11 @@ async fn test_unregister_task_root_rejects_later_file_transfer() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-network-unregistered";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
     server.unregister_task_root(task_id).unwrap();
 
@@ -1324,7 +1385,11 @@ async fn test_authenticated_chunked_transfer_supports_files_over_message_limit()
     let source_dir = TempDir::new().unwrap();
     let task_id = "task-large-file-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let source_path = source_dir.path().join("large.bin");
@@ -1367,7 +1432,11 @@ async fn test_authenticated_v2_upload_negotiates_and_transfers_file() {
     let task_id = "task-v2-upload-001";
     let peer_id = "v2-upload-peer";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let source_path = source_dir.path().join("v2-upload.bin");
@@ -1413,7 +1482,11 @@ async fn test_v2_upload_rejects_bad_offset_and_cleans_partial() {
     let task_id = "task-v2-bad-offset";
     let relative_path = "bad-offset.bin";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
@@ -1426,6 +1499,7 @@ async fn test_v2_upload_rejects_bad_offset_and_cleans_partial() {
             task_id: task_id.to_string(),
             relative_path: relative_path.to_string(),
             total_bytes: 4,
+            expected_target_hash: None,
         },
     )
     .await;
@@ -1493,6 +1567,7 @@ async fn test_v2_upload_returns_error_when_checkpoint_ack_fails() {
                 task_id,
                 relative_path,
                 total_bytes,
+                ..
             } => {
                 assert_eq!(total_bytes, 17 * 1024 * 1024);
                 (task_id, relative_path)
@@ -1593,6 +1668,7 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                 relative_path: start_path,
                 file_hash,
                 total_bytes,
+                ..
             } => {
                 assert_eq!(start_task, task_id);
                 assert_eq!(start_path, "fallback.txt");
@@ -1608,6 +1684,10 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                         relative_path: start_path.clone(),
                         success: true,
                         error: None,
+                        resolution: None,
+                        conflict_path: None,
+                        primary_hash: None,
+                        secondary_hash: None,
                     },
                 )
                 .await;
@@ -1635,6 +1715,10 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                             relative_path: chunk_path,
                             success: true,
                             error: None,
+                            resolution: None,
+                            conflict_path: None,
+                            primary_hash: None,
+                            secondary_hash: None,
                         },
                     )
                     .await;
@@ -1654,6 +1738,10 @@ async fn test_v2_negotiation_failure_falls_back_to_v1() {
                             relative_path: end_path,
                             success: true,
                             error: None,
+                            resolution: None,
+                            conflict_path: None,
+                            primary_hash: None,
+                            secondary_hash: None,
                         },
                     )
                     .await;
@@ -1703,7 +1791,11 @@ async fn test_authenticated_file_download_request_streams_file_to_client() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-download-001";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
     std::fs::create_dir_all(remote_dir.path().join("docs")).unwrap();
     std::fs::write(
@@ -1746,7 +1838,11 @@ async fn test_authenticated_v2_file_download_uses_checkpoint_acks() {
     let remote_dir = TempDir::new().unwrap();
     let task_id = "task-download-v2-checkpoint";
     server
-        .register_task_root(task_id, remote_dir.path())
+        .register_task_root(
+            task_id,
+            remote_dir.path(),
+            local_identity.public().device_id,
+        )
         .unwrap();
 
     let source = remote_dir.path().join("large-download.bin");
@@ -1849,10 +1945,15 @@ async fn test_server_updates_db_after_authenticated_chunked_receive() {
             enabled: true,
             created_unix_ms: 1,
             updated_unix_ms: 1,
+            last_transfer_activity_unix_ms: 0,
         })
         .unwrap();
     server
-        .register_task_root(task_id.to_string(), remote_dir.path())
+        .register_task_root(
+            task_id.to_string(),
+            remote_dir.path(),
+            local_public.device_id.clone(),
+        )
         .unwrap();
 
     let manager = ConnectionManager::new();
@@ -1910,6 +2011,13 @@ async fn test_task_register_persists_across_server_restart() {
         let server = SyncServer::start_in_background(0).unwrap();
         server.set_task_roots_persistence_path(&roots_path).unwrap();
         server.register_trusted_peer(local_identity.public());
+        server
+            .register_task_root(
+                task_id,
+                remote_dir.path(),
+                local_identity.public().device_id.clone(),
+            )
+            .unwrap();
         let manager = ConnectionManager::new();
         manager.register_connection(lanbridge::transport::PeerConnection {
             device_id: "persist-peer".to_string(),
@@ -1983,6 +2091,9 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
             display_name: "Secondary".to_string(),
             public_key: secondary_public.public_key.clone(),
             port: secondary_server.port(),
+            app_version: "0.1.0".to_string(),
+            protocol_version: 2,
+            min_protocol_version: 2,
         },
         "127.0.0.1".to_string(),
         Some("loopback".to_string()),
@@ -2024,7 +2135,18 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
     let primary_dir = TempDir::new().unwrap();
     let secondary_dir = TempDir::new().unwrap();
     primary_server
-        .register_task_root(task_id.to_string(), primary_dir.path())
+        .register_task_root(
+            task_id.to_string(),
+            primary_dir.path(),
+            secondary_public.device_id.clone(),
+        )
+        .unwrap();
+    secondary_server
+        .register_task_root(
+            task_id.to_string(),
+            secondary_dir.path(),
+            primary_public.device_id.clone(),
+        )
         .unwrap();
 
     let register_response = lanbridge::transport::connection::send_authenticated_message_to_peer(
@@ -2121,6 +2243,7 @@ async fn test_full_discovery_pair_task_plan_transfer_ack_and_status_flow() {
             enabled: true,
             created_unix_ms: 1,
             updated_unix_ms: 1,
+            last_transfer_activity_unix_ms: 0,
         })
         .unwrap();
     let baseline_repo = SyncBaselineRepository::new(&conn);

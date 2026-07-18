@@ -7,18 +7,22 @@
   },
   "package": {
     "productName": "LanBridge",
-    "version": "0.1.0"
+    "version": "0.1.4"
   },
   "tauri": {
     "allowlist": {
       "all": false,
       "shell": {
         "all": false,
-        "open": true
+        "open": false
       },
       "dialog": {
         "all": false,
         "open": true
+      },
+      "clipboard": {
+        "all": false,
+        "writeText": true
       }
     },
     "bundle": {
@@ -34,7 +38,11 @@
       ]
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
+    },
+    "systemTray": {
+      "iconPath": "icons/32x32.png",
+      "iconAsTemplate": true
     },
     "windows": [
       {
@@ -42,7 +50,9 @@
         "resizable": true,
         "title": "LanBridge",
         "width": 900,
-        "height": 620
+        "height": 620,
+        "minWidth": 690,
+        "minHeight": 449
       }
     ]
   }

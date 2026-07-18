@@ -12,6 +12,7 @@ export function HistoryScreen({ taskId }: HistoryScreenProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<string | null>(null);
+  const [cleaning, setCleaning] = useState(false);
 
   const loadData = async () => {
     if (!taskId) { setLoading(false); return; }
@@ -26,15 +27,17 @@ export function HistoryScreen({ taskId }: HistoryScreenProps) {
   useEffect(() => { loadData(); }, [taskId]);
 
   const handleRestore = async (entryId: string) => {
-    if (!taskId) return;
+    if (!taskId || cleaning) return;
     setRestoring(entryId);
     try { await restoreHistoryEntry(taskId, entryId); await loadData(); } catch (e) { setError(String(e)); }
     finally { setRestoring(null); }
   };
 
   const handleCleanup = async () => {
-    if (!taskId) return;
+    if (!taskId || cleaning) return;
+    setCleaning(true);
     try { await cleanupHistory(taskId); await loadData(); } catch (e) { setError(String(e)); }
+    finally { setCleaning(false); }
   };
 
   const formatSize = (bytes: number) => {
@@ -63,7 +66,9 @@ export function HistoryScreen({ taskId }: HistoryScreenProps) {
     <div className="history-screen" style={{ padding: 0 }}>
       <div className="history-toolbar">
         <h1 style={{ margin: 0 }}>{t.history.title}</h1>
-        <button className="btn btn-secondary btn-small" onClick={handleCleanup}>{t.history.cleanup}</button>
+        <button className="btn btn-secondary btn-small" onClick={handleCleanup} disabled={cleaning || loading}>
+          {t.history.cleanup}
+        </button>
       </div>
 
       {error && <div className="error-message">{error}</div>}
@@ -91,7 +96,7 @@ export function HistoryScreen({ taskId }: HistoryScreenProps) {
                   {" · "}{formatSize(entry.size)} · {formatTime(entry.created_unix_ms)}
                 </span>
               </div>
-              <button className="btn btn-secondary btn-small" onClick={() => handleRestore(entry.id)} disabled={restoring === entry.id}>
+              <button className="btn btn-secondary btn-small" onClick={() => handleRestore(entry.id)} disabled={cleaning || restoring === entry.id}>
                 {restoring === entry.id ? t.history.restoring : t.history.restore}
               </button>
             </div>

@@ -1,5 +1,11 @@
 import { useEffect, useState, useRef } from "react";
 import {
+  AnimatePresence,
+  motion,
+  type Transition,
+  useReducedMotion,
+} from "motion/react";
+import {
   cancelTransfer,
   getTransferProgress,
   listDeferredTransfers,
@@ -7,6 +13,8 @@ import {
   syncNow,
   type DeferredTransfer,
 } from "../lib/tauriApi";
+import { AppOverlayLayer } from "./OverlayPortal";
+import { CircleCheckIcon, XIcon } from "./icons/animate-icons";
 
 interface DisplayItem {
   key: string;
@@ -14,12 +22,39 @@ interface DisplayItem {
   relativePath: string;
   path: string;
   direction: string;
+  rawDirection: string;
   percent: number;
   mbps: number;
   visible: boolean;
   fading: boolean;
   cancellable: boolean;
   indeterminate: boolean;
+}
+
+interface TransferStackProps {
+  items: DisplayItem[];
+  expanded: boolean;
+  onToggle: () => void;
+  onCancel: (item: DisplayItem) => void;
+}
+
+const notificationStackTransition: Transition = {
+  type: "spring",
+  stiffness: 300,
+  damping: 26,
+};
+
+function getTransferCardVariants(index: number) {
+  return {
+    collapsed: {
+      marginTop: index === 0 ? 0 : -44,
+      scaleX: 1 - Math.min(index, 4) * 0.05,
+    },
+    expanded: {
+      marginTop: index === 0 ? 0 : 4,
+      scaleX: 1,
+    },
+  };
 }
 
 function directionLabel(direction: string) {
@@ -35,49 +70,156 @@ function directionLabel(direction: string) {
   }
 }
 
+function TransferCard({
+  item,
+  clickable,
+  onToggle,
+  onCancel,
+}: {
+  item: DisplayItem;
+  clickable: boolean;
+  onToggle: () => void;
+  onCancel: (item: DisplayItem) => void;
+}) {
+  return (
+    <div
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      className={`transfer-card ${clickable ? "clickable" : ""} ${item.fading ? "is-fading" : ""} ${item.cancellable || item.fading ? "has-action" : ""}`}
+      onClick={clickable ? onToggle : undefined}
+      aria-disabled={!clickable}
+      onKeyDown={(event) => {
+        if (!clickable || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        onToggle();
+      }}
+    >
+      <span className="transfer-title">传输{item.path}</span>
+      <span className="transfer-speed">
+        {item.mbps > 0 ? `${item.mbps.toFixed(1)} MB/s` : ""}
+      </span>
+      {item.fading && (
+        <span className="transfer-done" title="传输完成">
+          <CircleCheckIcon size={15} isAnimated={false} />
+        </span>
+      )}
+      {item.cancellable && (
+        <button
+          className="transfer-cancel"
+          type="button"
+          title="中断传输"
+          onClick={(event) => {
+            event.stopPropagation();
+            onCancel(item);
+          }}
+        >
+          <XIcon size={17} />
+        </button>
+      )}
+      <span className="transfer-track">
+        <span
+          className={`transfer-fill ${item.indeterminate ? "progress-fill-indeterminate" : ""}`}
+          style={item.indeterminate ? undefined : { width: `${item.percent}%` }}
+        />
+      </span>
+    </div>
+  );
+}
+
+function TransferStack({ items, expanded, onToggle, onCancel }: TransferStackProps) {
+  const reduceMotion = useReducedMotion();
+  const hasMultiple = items.length > 1;
+  const visibleItems = expanded ? items : items.slice(0, hasMultiple ? 2 : 1);
+
+  if (items.length === 0) return null;
+
+  return (
+    <div className={`transfer-overlay ${hasMultiple ? "multi" : "single"} ${expanded ? "expanded" : "collapsed"}`}>
+      <div className="transfer-stack-viewport">
+        <AnimatePresence initial={false}>
+          {visibleItems.map((item, index) => (
+            <motion.div
+              key={item.key}
+              className="transfer-card-frame"
+              initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8, scale: 0.985 }}
+              animate={{
+                opacity: 1,
+                y: 0,
+                scale: 1,
+                ...(hasMultiple ? getTransferCardVariants(index)[expanded ? "expanded" : "collapsed"] : { marginTop: 0, scaleX: 1 }),
+              }}
+              exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8, scale: 0.985 }}
+              transition={reduceMotion ? { duration: 0 } : notificationStackTransition}
+              style={{ zIndex: visibleItems.length - index }}
+            >
+              <TransferCard item={item} clickable={hasMultiple} onToggle={onToggle} onCancel={onCancel} />
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
+    </div>
+  );
+}
+
 export function ProgressBar() {
   const [items, setItems] = useState<DisplayItem[]>([]);
   const [deferred, setDeferred] = useState<DeferredTransfer[]>([]);
-  const [dismissedDeferred, setDismissedDeferred] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useState(false);
   const completedRef = useRef<Map<string, number>>(new Map());
-  const totalRef = useRef(0);
+  const percentRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
+    let disposed = false;
     const poll = async () => {
       try {
         const [transfers, deferredTransfers] = await Promise.all([
           getTransferProgress(),
           listDeferredTransfers(),
         ]);
+        if (disposed) return;
         const now = Date.now();
         setDeferred(deferredTransfers);
 
         const active = transfers
           .filter((t) => !t.finished)
-          .map((t) => ({
-            key: `${t.task_id}:${t.relative_path}:${t.direction}`,
-            taskId: t.task_id,
-            relativePath: t.relative_path,
-            path: t.relative_path.split("/").pop() || t.relative_path,
-            direction: directionLabel(t.direction),
-            percent: t.bytes_total > 0 ? Math.round((t.bytes_done / t.bytes_total) * 100) : 0,
-            mbps: t.mbps,
-            visible: true,
-            fading: false,
-            cancellable: Boolean(t.relative_path),
-            indeterminate: false,
-          }));
-
-        totalRef.current = active.length;
+          .map((t) => {
+            const key = t.transfer_id || `${t.task_id}:${t.relative_path}:${t.direction}`;
+            const rawPercent = t.bytes_total > 0 ? Math.round((t.bytes_done / t.bytes_total) * 100) : 0;
+            const previousPercent = percentRef.current.get(key);
+            const percent = previousPercent == null ? rawPercent : Math.max(previousPercent, rawPercent);
+            percentRef.current.set(key, percent);
+            return {
+              key,
+              taskId: t.task_id,
+              relativePath: t.relative_path,
+              path: t.relative_path.split("/").pop() || t.relative_path,
+              direction: directionLabel(t.direction),
+              rawDirection: t.direction,
+              percent,
+              mbps: t.mbps,
+              visible: true,
+              fading: false,
+              cancellable: Boolean(t.relative_path),
+              indeterminate: false,
+            };
+          })
+          .sort((a, b) => {
+            const left = `${a.taskId}:${a.relativePath}:${a.rawDirection}:${a.key}`;
+            const right = `${b.taskId}:${b.relativePath}:${b.rawDirection}:${b.key}`;
+            return left.localeCompare(right);
+          });
 
         const prevKeys = new Set(active.map((a) => a.key));
         completedRef.current.forEach((_, key) => {
           if (!prevKeys.has(key)) completedRef.current.delete(key);
         });
+        percentRef.current.forEach((_, key) => {
+          if (!prevKeys.has(key)) percentRef.current.delete(key);
+        });
 
         const transferred: DisplayItem[] = [];
         transfers.filter((t) => t.finished).forEach((t) => {
-          const key = `${t.task_id}:${t.relative_path}:${t.direction}`;
+          const key = t.transfer_id || `${t.task_id}:${t.relative_path}:${t.direction}`;
           if (!completedRef.current.has(key)) {
             completedRef.current.set(key, now);
             const pct = t.bytes_total > 0 ? Math.round((t.bytes_done / t.bytes_total) * 100) : 100;
@@ -87,6 +229,7 @@ export function ProgressBar() {
               relativePath: t.relative_path,
               path: t.relative_path.split("/").pop() || t.relative_path,
               direction: directionLabel(t.direction),
+              rawDirection: t.direction,
               percent: pct,
               mbps: 0,
               visible: false,
@@ -101,36 +244,35 @@ export function ProgressBar() {
           if (now - ts > 2000) completedRef.current.delete(key);
         });
 
-        setItems([...active, ...transferred]);
+        setItems([...active, ...transferred.sort((a, b) => a.key.localeCompare(b.key))]);
       } catch {
-        setItems([]);
+        if (!disposed) setItems([]);
       }
     };
 
+    void poll();
     const id = window.setInterval(poll, 600);
-    return () => window.clearInterval(id);
+    return () => {
+      disposed = true;
+      window.clearInterval(id);
+    };
   }, []);
 
   const handleCancel = async (item: DisplayItem) => {
     if (!item.cancellable) return;
     try {
-      await cancelTransfer(item.taskId, item.relativePath);
+      await cancelTransfer(item.taskId, item.relativePath, item.rawDirection);
     } catch {
       // The next poll will reflect the transfer state.
     }
   };
 
-  const deferredKey = (item: DeferredTransfer) => `${item.task_id}:${item.relative_path}`;
-  const prompt = deferred.find((item) => !dismissedDeferred.has(deferredKey(item))) ?? null;
+  const deferredKey = (item: DeferredTransfer) => `${item.task_id}:${item.relative_path}:${item.direction}`;
+  const deferredItems = [...deferred].sort((a, b) => deferredKey(a).localeCompare(deferredKey(b)));
 
   const handleResume = async (item: DeferredTransfer) => {
     try {
-      await resumeTransfer(item.task_id, item.relative_path);
-      setDismissedDeferred((prev) => {
-        const next = new Set(prev);
-        next.delete(deferredKey(item));
-        return next;
-      });
+      await resumeTransfer(item.task_id, item.relative_path, item.direction);
       setDeferred((prev) => prev.filter((entry) => deferredKey(entry) !== deferredKey(item)));
       await syncNow(item.task_id);
     } catch {
@@ -138,61 +280,48 @@ export function ProgressBar() {
     }
   };
 
-  const handleSkip = (item: DeferredTransfer) => {
-    setDismissedDeferred((prev) => new Set(prev).add(deferredKey(item)));
+  const hasMultiple = items.length > 1;
+  const toggleExpanded = () => {
+    if (hasMultiple) setExpanded((value) => !value);
   };
 
-  if (items.length === 0 && !prompt) return null;
+  useEffect(() => {
+    if (items.length <= 1 && expanded) {
+      setExpanded(false);
+    }
+  }, [expanded, items.length]);
+
+  if (items.length === 0 && deferredItems.length === 0) return null;
 
   return (
-    <div className="global-progress">
-      {prompt && (
-        <div className="deferred-transfer-prompt">
-          <div className="deferred-transfer-copy">
-            <strong>文件已取消</strong>
-            <span>{prompt.relative_path.split("/").pop() || prompt.relative_path}</span>
-          </div>
-          <div className="deferred-transfer-actions">
-            <button className="btn btn-secondary btn-small" type="button" onClick={() => handleSkip(prompt)}>
-              本次不同步
-            </button>
-            <button className="btn btn-primary btn-small" type="button" onClick={() => handleResume(prompt)}>
-              继续传输
-            </button>
-          </div>
+    <AppOverlayLayer className="transfer-overlay-layer">
+      <TransferStack
+        items={items}
+        expanded={expanded}
+        onToggle={toggleExpanded}
+        onCancel={handleCancel}
+      />
+      {deferredItems.length > 0 && (
+        <div className="deferred-transfer-list">
+          {deferredItems.map((prompt) => (
+            <div key={deferredKey(prompt)} className="deferred-transfer-prompt">
+              <div className="deferred-transfer-copy">
+                <strong>待处理</strong>
+                <span>{directionLabel(prompt.direction)} {prompt.relative_path.split("/").pop() || prompt.relative_path}</span>
+              </div>
+              <div className="deferred-transfer-actions">
+                <button
+                  className="btn btn-primary btn-small"
+                  type="button"
+                  onClick={() => handleResume(prompt)}
+                >
+                  重新同步
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
-      {items.map((item) => (
-        <div key={item.key} className={`progress-row ${item.fading ? "progress-fade" : ""}`}>
-          <div className="progress-row-header">
-            <span className="progress-pct">{item.percent}%</span>
-            <span className="progress-filename">{item.direction} {item.path}</span>
-            <span className="progress-speed">
-              {item.mbps > 0 ? `${item.mbps.toFixed(1)} MB/s` : ""}
-              {item.fading ? " ✓" : ""}
-            </span>
-            {item.cancellable && (
-              <button
-                className="progress-cancel"
-                type="button"
-                title="中断传输"
-                onClick={() => handleCancel(item)}
-              >
-                ×
-              </button>
-            )}
-          </div>
-          <div className="progress-track">
-            <div
-              className={`progress-fill ${item.indeterminate ? "progress-fill-indeterminate" : ""}`}
-              style={item.indeterminate ? undefined : { width: `${item.percent}%` }}
-            />
-          </div>
-          {totalRef.current > 1 && (
-            <span className="progress-queue">{totalRef.current} 个文件等待中</span>
-          )}
-        </div>
-      ))}
-    </div>
+    </AppOverlayLayer>
   );
 }

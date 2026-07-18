@@ -1,75 +1,206 @@
+import * as Popover from "@radix-ui/react-popover";
 import { useEffect, useState } from "react";
-import { getSettings, type AppSettings } from "../../lib/tauriApi";
+import {
+  checkForUpdates,
+  getSettings,
+  openAvailableUpdateRelease,
+  openProjectGithub,
+  setDiscoveryEnabled,
+  type AppSettings,
+} from "../../lib/tauriApi";
 import { useTranslation, type Lang } from "../../lib/i18n/context";
+import { isBrowserPreviewBridgeError } from "../../lib/runtime";
+import { ChevronDownIcon } from "../../components/icons/animate-icons";
 
 interface SettingsScreenProps {
-  onClose: () => void;
+  minimizeToTrayOnClose: boolean;
+  onMinimizeToTrayOnCloseChange: (enabled: boolean) => void;
+  updateRefreshToken: number;
 }
 
-export function SettingsScreen({ onClose }: SettingsScreenProps) {
+export function SettingsScreen({
+  minimizeToTrayOnClose,
+  onMinimizeToTrayOnCloseChange,
+  updateRefreshToken,
+}: SettingsScreenProps) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [savingDiscovery, setSavingDiscovery] = useState(false);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [languageOpen, setLanguageOpen] = useState(false);
   const { lang, setLang, t } = useTranslation();
 
   useEffect(() => {
-    getSettings().then(setSettings).catch((e) => setError(String(e)));
-  }, []);
+    getSettings().then(setSettings).catch((e) => {
+      if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+    });
+  }, [updateRefreshToken]);
+
+  const handleDiscoveryChange = async (enabled: boolean) => {
+    setSavingDiscovery(true);
+    setError(null);
+    setSettings((prev) => (prev ? { ...prev, discovery_enabled: enabled } : prev));
+    try {
+      await setDiscoveryEnabled(enabled);
+      setSettings((prev) => (prev ? { ...prev, discovery_enabled: enabled } : prev));
+    } catch (e) {
+      setSettings((prev) => (prev ? { ...prev, discovery_enabled: !enabled } : prev));
+      if (!isBrowserPreviewBridgeError(e)) setError(String(e));
+    } finally {
+      setSavingDiscovery(false);
+    }
+  };
+
+  const handleCheckForUpdates = async () => {
+    setCheckingUpdates(true);
+    try {
+      const updateCheck = await checkForUpdates(true);
+      setSettings((previous) => (previous ? { ...previous, update_check: updateCheck } : previous));
+    } catch {
+      // Update checks are intentionally silent; the button returns to its default state.
+    } finally {
+      setCheckingUpdates(false);
+    }
+  };
+
+  const handleOpenProjectGithub = async () => {
+    try {
+      await openProjectGithub();
+    } catch (nextError) {
+      if (!isBrowserPreviewBridgeError(nextError)) setError(String(nextError));
+    }
+  };
+
+  const handleOpenAvailableRelease = async () => {
+    try {
+      await openAvailableUpdateRelease();
+    } catch (nextError) {
+      if (!isBrowserPreviewBridgeError(nextError)) setError(String(nextError));
+    }
+  };
+
+  const updateAvailable = settings?.update_check?.status === "update_available";
 
   return (
-    <div className="settings-overlay" onClick={onClose}>
-      <div className="settings-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="settings-panel-header">
-          <h2>{t.settings.title}</h2>
-          <button className="btn btn-ghost btn-small" onClick={onClose}>
-            <svg viewBox="0 0 24 24" style={{width:14,height:14,stroke:"currentColor",fill:"none",strokeWidth:2,strokeLinecap:"round"}}>
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
-          </button>
-        </div>
+    <section className="settings-screen stage-list-page">
+      <div className="stage-page-header">
+        <h1>{t.settings.title}</h1>
+      </div>
 
-        <div className="settings-panel-body">
-          {error && <div className="error-message">{error}</div>}
+      {error && <div className="top-inline-error">{error}</div>}
 
-          <div className="settings-block">
-            <h3>{t.settings.language}</h3>
-            <div className="settings-row">
-              <span className="settings-label">{t.settings.language}</span>
-              <select className="settings-select" value={lang} onChange={(e) => setLang(e.target.value as Lang)}>
-                <option value="zh">{t.settings.langZh}</option>
-                <option value="en">{t.settings.langEn}</option>
-              </select>
-            </div>
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.general}</div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.language}</span>
+          <div className="settings-language-control">
+            <Popover.Root open={languageOpen} onOpenChange={setLanguageOpen}>
+              <Popover.Trigger asChild>
+                <button
+                  className="settings-language-trigger"
+                  type="button"
+                  aria-label={t.settings.language}
+                >
+                  <span>{lang === "zh" ? t.settings.langZh : t.settings.langEn}</span>
+                  <ChevronDownIcon size={15} isAnimated={false} />
+                </button>
+              </Popover.Trigger>
+              <Popover.Content
+                className="sort-popover settings-language-popover"
+                side="bottom"
+                sideOffset={8}
+                align="end"
+                avoidCollisions={false}
+              >
+                {(["zh", "en"] as Lang[]).map((option) => (
+                  <button
+                    key={option}
+                    className={lang === option ? "active" : ""}
+                    type="button"
+                    onClick={() => {
+                      setLang(option);
+                      setLanguageOpen(false);
+                    }}
+                  >
+                    {option === "zh" ? t.settings.langZh : t.settings.langEn}
+                  </button>
+                ))}
+              </Popover.Content>
+            </Popover.Root>
           </div>
-
-          {settings && (
-            <div className="settings-block">
-              <h3>{t.settings.historyRetention}</h3>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.retentionPeriod}</span>
-                <span className="settings-value">{settings.history_retention_days} {t.settings.days}</span>
-              </div>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.sizeLimit}</span>
-                <span className="settings-value">{settings.history_size_limit_mb} {t.settings.mb}</span>
-              </div>
-
-              <h3 style={{ marginTop: "var(--space-5)", paddingTop: "var(--space-5)", borderTop: "1px solid var(--border-light)" }}>{t.settings.about}</h3>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.version}</span>
-                <span className="settings-value">0.1.0</span>
-              </div>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.syncModel}</span>
-                <span className="settings-value">{t.settings.syncModelDesc}</span>
-              </div>
-              <div className="settings-row">
-                <span className="settings-label">{t.settings.hashAlgorithm}</span>
-                <span className="settings-value">BLAKE3</span>
-              </div>
-            </div>
-          )}
         </div>
       </div>
-    </div>
+
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.windowBehavior}</div>
+        <label className="stage-row settings-stage-row">
+          <span>{t.settings.discoveryEnabled}</span>
+          <span className="settings-switch-wrap">
+            <input
+              type="checkbox"
+              checked={settings?.discovery_enabled ?? true}
+              disabled={savingDiscovery}
+              onChange={(event) => handleDiscoveryChange(event.target.checked)}
+            />
+            <span className="settings-switch" aria-hidden="true" />
+          </span>
+        </label>
+        <label className="stage-row settings-stage-row">
+          <span>{t.settings.minimizeToTrayOnClose}</span>
+          <span className="settings-switch-wrap">
+            <input
+              type="checkbox"
+              checked={minimizeToTrayOnClose}
+              onChange={(event) => onMinimizeToTrayOnCloseChange(event.target.checked)}
+            />
+            <span className="settings-switch" aria-hidden="true" />
+          </span>
+        </label>
+      </div>
+
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.historyRetention}</div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.retentionPeriod}</span>
+          <strong>{settings ? `${settings.history_retention_days}${t.settings.days}` : "-"}</strong>
+        </div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.sizeLimit}</span>
+          <strong>{settings ? `${settings.history_size_limit_mb}${t.settings.mb}` : "-"}</strong>
+        </div>
+      </div>
+
+      <div className="settings-group">
+        <div className="stage-section-label">{t.settings.about}</div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.version}</span>
+          <strong>{__APP_VERSION__}</strong>
+        </div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.hashAlgorithm}</span>
+          <strong>BLAKE3</strong>
+        </div>
+        <div className="stage-row settings-stage-row">
+          <span>{t.settings.repositoryAddress}</span>
+          <div className="settings-repository-actions">
+            <button className="settings-github-link" type="button" onClick={handleOpenProjectGithub}>
+              {t.settings.githubLink}
+            </button>
+            <button
+              className={`settings-action-button${updateAvailable ? " settings-update-available-button" : ""}`}
+              type="button"
+              disabled={checkingUpdates}
+              onClick={updateAvailable ? handleOpenAvailableRelease : handleCheckForUpdates}
+            >
+              {checkingUpdates
+                ? t.settings.checkingForUpdates
+                : updateAvailable
+                  ? t.settings.updateAvailableAction
+                  : t.settings.checkForUpdates}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }

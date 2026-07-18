@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::core::model::{HistoryEntry, HistoryReason};
+use crate::core::path_safety::{ensure_safe_for_mutation, safe_join, TaskRootHandle};
 
 /// Default history retention: 30 days in milliseconds.
 pub const DEFAULT_RETENTION_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -41,10 +42,23 @@ impl HistoryStore {
         relative_path: &str,
         now_unix_ms: i64,
     ) -> Result<HistoryEntry> {
-        let dest = self
-            .trash_dir()
-            .join(now_unix_ms.to_string())
-            .join(relative_path);
+        self.move_to_trash_in_batch(source, relative_path, now_unix_ms, &now_unix_ms.to_string())
+    }
+
+    /// Move a file or directory into a caller-selected trash batch.
+    ///
+    /// Stores at: `.lanbridge-history/trash/<batch>/<relative_path>`.
+    /// If that target already exists, a unique suffix is added to avoid
+    /// collisions between directory parents and children in the same batch.
+    pub fn move_to_trash_in_batch(
+        &self,
+        source: &Path,
+        relative_path: &str,
+        now_unix_ms: i64,
+        batch_id: &str,
+    ) -> Result<HistoryEntry> {
+        let dest = self.trash_dir().join(batch_id).join(relative_path);
+        let dest = unique_history_dest(dest);
         self.move_to_history(
             source,
             &dest,
@@ -63,10 +77,11 @@ impl HistoryStore {
         relative_path: &str,
         now_unix_ms: i64,
     ) -> Result<HistoryEntry> {
-        let dest = self
-            .overwritten_dir()
-            .join(now_unix_ms.to_string())
-            .join(relative_path);
+        let dest = unique_history_dest(
+            self.overwritten_dir()
+                .join(now_unix_ms.to_string())
+                .join(relative_path),
+        );
         self.move_to_history(
             source,
             &dest,
@@ -74,6 +89,42 @@ impl HistoryStore {
             HistoryReason::Overwritten,
             now_unix_ms,
         )
+    }
+
+    /// Copy an existing file to a unique overwritten-history location while
+    /// leaving the live target in place. Receive commits use this form so a
+    /// failed replacement never removes the current target.
+    pub fn backup_to_overwritten(
+        &self,
+        source: &Path,
+        relative_path: &str,
+        now_unix_ms: i64,
+    ) -> Result<HistoryEntry> {
+        let dest = unique_history_dest(
+            self.overwritten_dir()
+                .join(now_unix_ms.to_string())
+                .join(relative_path),
+        );
+        let sync_root = self
+            .history_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("history has no task root"))?;
+        let root_handle = TaskRootHandle::new(sync_root)?;
+        let source_guard = root_handle.prepare_mutation(source)?;
+        let dest_guard = root_handle.prepare_mutation(&dest)?;
+        source_guard.validate()?;
+        dest_guard.validate()?;
+        let size = std::fs::copy(source, &dest)? as i64;
+        std::fs::File::open(&dest)?.sync_all()?;
+        Ok(HistoryEntry {
+            id: Uuid::new_v4(),
+            task_id: Uuid::nil(),
+            original_relative_path: relative_path.to_string(),
+            stored_path: dest.to_string_lossy().to_string(),
+            reason: HistoryReason::Overwritten,
+            created_unix_ms: now_unix_ms,
+            size,
+        })
     }
 
     /// Restore a history entry to its original relative path.
@@ -86,7 +137,18 @@ impl HistoryStore {
         now_unix_ms: i64,
     ) -> Result<PathBuf> {
         let source = Path::new(&entry.stored_path);
-        let original = sync_root.join(&entry.original_relative_path);
+        let history_root = self
+            .history_dir
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("history root is unavailable: {e}"))?;
+        let canonical_source = source
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("history source is unavailable: {e}"))?;
+        if !canonical_source.starts_with(&history_root) {
+            anyhow::bail!("UnsafePath: history source is outside task history");
+        }
+        ensure_safe_for_mutation(sync_root, source)?;
+        let original = safe_join(sync_root, &entry.original_relative_path)?;
 
         let dest = if original.exists() {
             // Original path occupied — use timestamped name
@@ -108,16 +170,24 @@ impl HistoryStore {
             let ts = dt.format("%Y-%m-%d %H%M%S").to_string();
 
             let restored_name = format!("{} (restored {}){}", stem, ts, ext);
-            sync_root.join(parent).join(restored_name)
+            let restored_relative = if parent.as_os_str().is_empty() {
+                restored_name
+            } else {
+                parent.join(restored_name).to_string_lossy().to_string()
+            };
+            safe_join(sync_root, &restored_relative)?
         } else {
             original
         };
 
         // Ensure parent directory exists
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let root_handle = TaskRootHandle::new(sync_root)?;
+        let source_guard = root_handle.prepare_mutation(source)?;
+        let dest_guard = root_handle.prepare_mutation(&dest)?;
+        ensure_safe_for_mutation(sync_root, &dest)?;
 
+        source_guard.validate()?;
+        dest_guard.validate()?;
         std::fs::rename(source, &dest)?;
         Ok(dest)
     }
@@ -135,18 +205,15 @@ impl HistoryStore {
                 continue;
             }
 
-            for entry in walkdir::WalkDir::new(&reason_dir)
-                .min_depth(1)
-                .into_iter()
-                .filter_map(|entry| entry.ok())
-            {
+            let mut walker = walkdir::WalkDir::new(&reason_dir).min_depth(1).into_iter();
+            while let Some(entry) = walker.next() {
+                let Ok(entry) = entry else {
+                    continue;
+                };
                 if !entry.file_type().is_file() && !entry.file_type().is_dir() {
                     continue;
                 }
                 let stored_path = entry.path().to_path_buf();
-                if entry.file_type().is_dir() && std::fs::read_dir(&stored_path)?.next().is_some() {
-                    continue;
-                }
                 let relative = stored_path.strip_prefix(&reason_dir)?;
                 let components = relative
                     .components()
@@ -156,14 +223,24 @@ impl HistoryStore {
                     continue;
                 }
 
-                let (created_unix_ms, original_parts) = match components[0].parse::<i64>() {
-                    Ok(timestamp) if components.len() > 1 => (timestamp, &components[1..]),
-                    Ok(_) => continue,
-                    Err(_) => (
-                        metadata_modified_unix_ms(&stored_path)?,
-                        components.as_slice(),
-                    ),
+                let Some((created_unix_ms, is_batch_id)) =
+                    history_batch_created_unix_ms(&components[0])
+                else {
+                    if entry.file_type().is_dir() {
+                        walker.skip_current_dir();
+                    }
+                    continue;
                 };
+                let original_parts = &components[1..];
+                if original_parts.is_empty() {
+                    continue;
+                }
+                if entry.file_type().is_dir()
+                    && !is_batch_id
+                    && std::fs::read_dir(&stored_path)?.next().is_some()
+                {
+                    continue;
+                }
                 let original_relative_path = original_parts.join("/");
                 let metadata = std::fs::metadata(&stored_path)?;
                 let stored_path_string = stored_path.to_string_lossy().to_string();
@@ -181,6 +258,9 @@ impl HistoryStore {
                         metadata.len() as i64
                     },
                 });
+                if metadata.is_dir() {
+                    walker.skip_current_dir();
+                }
             }
         }
         entries.sort_by(|a, b| b.created_unix_ms.cmp(&a.created_unix_ms));
@@ -196,10 +276,13 @@ impl HistoryStore {
         reason: HistoryReason,
         now_unix_ms: i64,
     ) -> Result<HistoryEntry> {
-        // Ensure destination directory exists
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let sync_root = self
+            .history_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("history has no task root"))?;
+        let root_handle = TaskRootHandle::new(sync_root)?;
+        let source_guard = root_handle.prepare_mutation(source)?;
+        let dest_guard = root_handle.prepare_mutation(dest)?;
 
         // Get file size before moving
         let size = std::fs::metadata(source)
@@ -207,7 +290,13 @@ impl HistoryStore {
             .unwrap_or(0);
 
         // Move the file
+        source_guard.validate()?;
+        dest_guard.validate()?;
         std::fs::rename(source, dest)?;
+        if let Err(e) = self.cleanup_to_size_limit_preserving(DEFAULT_SIZE_LIMIT_BYTES, Some(dest))
+        {
+            tracing::warn!("history size cleanup failed after move: {}", e);
+        }
 
         Ok(HistoryEntry {
             id: uuid::Uuid::new_v4(),
@@ -325,8 +414,144 @@ impl HistoryStore {
             }
         }
 
+        deleted += self.cleanup_to_size_limit(DEFAULT_SIZE_LIMIT_BYTES)?;
         Ok(deleted)
     }
+
+    /// Delete oldest on-disk history files until total size is at or below `max_bytes`.
+    pub fn cleanup_to_size_limit(&self, max_bytes: i64) -> Result<usize> {
+        self.cleanup_to_size_limit_preserving(max_bytes, None)
+    }
+
+    fn cleanup_to_size_limit_preserving(
+        &self,
+        max_bytes: i64,
+        preserve_path: Option<&Path>,
+    ) -> Result<usize> {
+        if max_bytes < 0 {
+            return Ok(0);
+        }
+
+        let mut entries = Vec::new();
+        let mut total_size = 0_i64;
+        for (reason_dir, reason_root) in [
+            (self.trash_dir(), self.trash_dir()),
+            (self.overwritten_dir(), self.overwritten_dir()),
+        ] {
+            if !reason_dir.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&reason_dir)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path().to_path_buf();
+                let size = entry.metadata().map(|meta| meta.len() as i64).unwrap_or(0);
+                total_size += size;
+                entries.push(HistoryFileForCleanup {
+                    created_unix_ms: history_created_unix_ms(&reason_root, &path)?,
+                    path,
+                    size,
+                    root: reason_root.clone(),
+                });
+            }
+        }
+
+        if total_size <= max_bytes {
+            return Ok(0);
+        }
+
+        entries.sort_by(|left, right| {
+            left.created_unix_ms
+                .cmp(&right.created_unix_ms)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        let mut deleted = 0;
+        for entry in entries {
+            if total_size <= max_bytes {
+                break;
+            }
+            if preserve_path.is_some_and(|preserve| preserve == entry.path) {
+                continue;
+            }
+            if entry.path.exists() {
+                std::fs::remove_file(&entry.path)?;
+                total_size -= entry.size;
+                deleted += 1;
+                prune_empty_history_dirs(entry.path.parent(), &entry.root)?;
+            }
+        }
+
+        Ok(deleted)
+    }
+}
+
+fn unique_history_dest(dest: PathBuf) -> PathBuf {
+    if !dest.exists() {
+        return dest;
+    }
+    let parent = dest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(PathBuf::new);
+    let file_name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "entry".to_string());
+    for _ in 0..16 {
+        let candidate = parent.join(format!("{}.lanbridge-{}", file_name, Uuid::new_v4()));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{}.lanbridge-{}", file_name, Uuid::new_v4()))
+}
+
+struct HistoryFileForCleanup {
+    created_unix_ms: i64,
+    path: PathBuf,
+    size: i64,
+    root: PathBuf,
+}
+
+fn history_created_unix_ms(root: &Path, path: &Path) -> Result<i64> {
+    let relative = path.strip_prefix(root)?;
+    let first = relative
+        .components()
+        .next()
+        .map(|component| component.as_os_str().to_string_lossy().to_string());
+    if let Some((ts, _)) = first.and_then(|value| history_batch_created_unix_ms(&value)) {
+        return Ok(ts);
+    }
+    metadata_modified_unix_ms(path)
+}
+
+fn history_batch_created_unix_ms(batch: &str) -> Option<(i64, bool)> {
+    if let Ok(timestamp) = batch.parse::<i64>() {
+        return Some((timestamp, false));
+    }
+    let timestamp = batch.split_once('-')?.0.parse::<i64>().ok()?;
+    Some((timestamp, true))
+}
+
+fn prune_empty_history_dirs(mut current: Option<&Path>, root: &Path) -> Result<()> {
+    while let Some(dir) = current {
+        if dir == root {
+            break;
+        }
+        if std::fs::read_dir(dir)?.next().is_none() {
+            std::fs::remove_dir(dir)?;
+            current = dir.parent();
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn metadata_modified_unix_ms(path: &Path) -> Result<i64> {

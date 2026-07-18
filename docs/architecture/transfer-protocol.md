@@ -150,6 +150,24 @@ SHA256("lanbridge-pairing-v1" || nonce || min_pubkey || max_pubkey)
 device.sign(payload) → signature
 ```
 
+### 连接意图同步
+
+手动断开是按可信设备保存的持久化状态，不等同于网络不可达。双方分别保存本机意图和对端意图；只有两者均允许连接时，任务扫描、传输、删除和冲突操作才可执行。
+
+认证后可交换以下控制消息：
+
+```text
+PeerDisconnect { device_id, state_revision? }
+PeerDisconnectAck { device_id, state_revision? }
+PeerReconnect { device_id, state_revision? }
+PeerReconnectAck { device_id, state_revision? }
+```
+
+- `state_revision` 仅在本机意图变化时递增；重复消息幂等，较小 revision 被忽略。
+- 旧版消息缺少 revision 时只按当前会话处理，不覆盖已持久化的新状态。
+- 启动后发布当前本机状态；失败按 1、5、15、60 秒退避重试，收到 ACK 后停止。
+- 手动断开期间仍允许 Ping、身份认证和以上控制消息，以便原发起端恢复；其他任务消息返回 `PeerDisconnected`。
+
 ---
 
 ## 4. 传输协议
@@ -530,3 +548,30 @@ enum AppError {
 | 历史大小限制 | 1 GB | 每个同步任务 |
 | 历史保留天数 | 30 天 | 自动清理阈值 |
 | 日志保留 | 10000 条/7天 | 取更少值 |
+
+---
+
+## 12. 接收提交、兼容与恢复
+
+### 目标前置条件
+
+- `expected_target_hash = Some("")`：目标必须不存在。
+- `Some(hash)`：提交前目标必须仍为该 hash。
+- `None`：legacy 请求；仅允许创建缺失目标，已有文件更新/删除返回 `TargetPreconditionFailed`。
+- 前置条件变化返回 `TargetChanged`，发送方重新扫描并进入冲突流程，禁止盲覆盖。
+
+V1/V2 身份均可在认证后完成能力协商。V1 缺失能力使用安全默认值；V2 才使用二进制流和增强 ACK。`FileAck` 的 `resolution`、`conflict_path`、`primary_hash`、`secondary_hash` 及 `ConflictApply.resolution_id` 均为可选 serde 字段，旧 peer 可忽略。
+
+### Incoming 隔离
+
+接收状态以 `(connection_id, task_id, relative_path)` 定位，并以 `(task_id, relative_path)` lease 排他。每次传输在 `.lanbridge-temp/incoming/` 使用 UUID partial。错误连接不能 append、finish 或 cancel；断线、注销、超量 chunk、hash/flush/replace 失败统一清理句柄、进度、lease 和 partial。
+
+### Durable commit
+
+`transfer_commit_journal` 状态为 `Prepared → FilesystemCommitted → MetadataCommitted`：先写日志，再备份旧目标并原子替换，最后在 SQLite 事务中更新 snapshot、baseline、history 和 pending。启动时若最终文件 hash 等于 incoming hash，则补齐 metadata；否则清理废弃 partial 与日志。相同内容重试复用恢复记录，不返回伪 `TargetChanged`。
+
+Windows 已实现 `ReplaceFileW` / `MoveFileExW`，sharing/lock violation 以 50/100/200/400/800ms 重试，失败返回带 `retryable` 与 `os_code` 的 `AtomicReplaceFailed`。真实 NTFS 行为仍以原生 CI 和双机验收为准。
+
+### Keep Both
+
+Primary 以 `resolution_id` 幂等应用 Secondary staging，并在 ACK 返回唯一冲突路径和双方 hash。Secondary 先下载并验证 Primary 临时文件，再创建/校验 Secondary 冲突副本，最后原子提交 Primary 到原路径；`conflict_resolution_journal` 支持从 `RemoteApplied` 继续，避免重试上传已被替换的原路径。

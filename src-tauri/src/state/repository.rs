@@ -5,6 +5,20 @@ use uuid::Uuid;
 
 use crate::core::model::*;
 
+fn escaped_tree_like_pattern(relative_path: &str) -> String {
+    let mut escaped = String::with_capacity(relative_path.len() + 4);
+    for ch in relative_path.trim_end_matches('/').chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    format!("{escaped}/%")
+}
+
 fn parse_uuid_text(value: String, col: usize) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&value)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(col, Type::Text, Box::new(e)))
@@ -68,6 +82,7 @@ fn sync_task_from_row(row: &Row<'_>) -> rusqlite::Result<SyncTask> {
         enabled: row.get::<_, i32>(7)? != 0,
         created_unix_ms: row.get(8)?,
         updated_unix_ms: row.get(9)?,
+        last_transfer_activity_unix_ms: row.get(10)?,
     })
 }
 
@@ -153,6 +168,27 @@ fn paired_device_from_row(row: &Row<'_>) -> rusqlite::Result<PairedDevice> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerConnectionStateRecord {
+    pub peer_device_id: String,
+    pub local_disconnected: bool,
+    pub local_revision: u64,
+    pub remote_disconnected: bool,
+    pub remote_revision: Option<u64>,
+    pub updated_unix_ms: i64,
+}
+
+fn peer_connection_state_from_row(row: &Row<'_>) -> rusqlite::Result<PeerConnectionStateRecord> {
+    Ok(PeerConnectionStateRecord {
+        peer_device_id: row.get(0)?,
+        local_disconnected: row.get::<_, i32>(1)? != 0,
+        local_revision: row.get(2)?,
+        remote_disconnected: row.get::<_, i32>(3)? != 0,
+        remote_revision: row.get(4)?,
+        updated_unix_ms: row.get(5)?,
+    })
+}
+
 fn log_entry_from_row(row: &Row<'_>) -> rusqlite::Result<LogEntry> {
     let level: String = row.get(1)?;
     Ok(LogEntry {
@@ -179,8 +215,8 @@ impl<'a> SyncTaskRepository<'a> {
 
     pub fn insert(&self, task: &SyncTask) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sync_tasks (id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO sync_tasks (id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms, last_transfer_activity_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 task.id.to_string(),
                 task.name,
@@ -192,6 +228,7 @@ impl<'a> SyncTaskRepository<'a> {
                 task.enabled as i32,
                 task.created_unix_ms,
                 task.updated_unix_ms,
+                task.last_transfer_activity_unix_ms,
             ],
         )?;
         Ok(())
@@ -199,7 +236,7 @@ impl<'a> SyncTaskRepository<'a> {
 
     pub fn get(&self, id: &Uuid) -> Result<Option<SyncTask>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms
+            "SELECT id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms, last_transfer_activity_unix_ms
              FROM sync_tasks WHERE id = ?1",
         )?;
         let result = stmt.query_row(params![id.to_string()], sync_task_from_row);
@@ -212,7 +249,7 @@ impl<'a> SyncTaskRepository<'a> {
 
     pub fn list_all(&self) -> Result<Vec<SyncTask>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms
+            "SELECT id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms, last_transfer_activity_unix_ms
              FROM sync_tasks ORDER BY created_unix_ms",
         )?;
         let tasks = stmt.query_map([], sync_task_from_row)?;
@@ -227,6 +264,17 @@ impl<'a> SyncTaskRepository<'a> {
         self.conn.execute(
             "UPDATE sync_tasks SET enabled = ?1, updated_unix_ms = ?2 WHERE id = ?3",
             params![enabled as i32, now_unix_ms, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Record transfer activity without changing task configuration recency.
+    pub fn mark_transfer_activity(&self, id: &Uuid, now_unix_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sync_tasks
+             SET last_transfer_activity_unix_ms = MAX(last_transfer_activity_unix_ms, ?1)
+             WHERE id = ?2",
+            params![now_unix_ms, id.to_string()],
         )?;
         Ok(())
     }
@@ -351,10 +399,10 @@ impl<'a> FileSnapshotRepository<'a> {
     }
 
     pub fn remove_tree(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
-        let prefix = format!("{}/%", relative_path.trim_end_matches('/'));
+        let prefix = escaped_tree_like_pattern(relative_path);
         self.conn.execute(
             "DELETE FROM file_snapshots
-             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3)",
+             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3 ESCAPE '\\')",
             params![task_id.to_string(), relative_path, prefix],
         )?;
         Ok(())
@@ -440,10 +488,10 @@ impl<'a> SyncBaselineRepository<'a> {
     }
 
     pub fn remove_tree(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
-        let prefix = format!("{}/%", relative_path.trim_end_matches('/'));
+        let prefix = escaped_tree_like_pattern(relative_path);
         self.conn.execute(
             "DELETE FROM sync_baselines
-             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3)",
+             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3 ESCAPE '\\')",
             params![task_id.to_string(), relative_path, prefix],
         )?;
         Ok(())
@@ -520,10 +568,10 @@ impl<'a> PendingReturnRepository<'a> {
     }
 
     pub fn remove_tree(&self, task_id: &Uuid, relative_path: &str) -> Result<()> {
-        let prefix = format!("{}/%", relative_path.trim_end_matches('/'));
+        let prefix = escaped_tree_like_pattern(relative_path);
         self.conn.execute(
             "DELETE FROM pending_return_changes
-             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3)",
+             WHERE task_id = ?1 AND (relative_path = ?2 OR relative_path LIKE ?3 ESCAPE '\\')",
             params![task_id.to_string(), relative_path, prefix],
         )?;
         Ok(())
@@ -742,6 +790,8 @@ impl<'a> PairedDeviceRepository<'a> {
                 device.last_address,
             ],
         )?;
+        PeerConnectionStateRepository::new(self.conn)
+            .ensure(&device.device_id, device.last_seen_unix_ms)?;
         Ok(())
     }
 
@@ -769,6 +819,105 @@ impl<'a> PairedDeviceRepository<'a> {
             result.push(row?);
         }
         Ok(result)
+    }
+}
+
+/// Durable, peer-scoped connection intent. Local and remote intent are independent:
+/// both sides must allow the connection before task traffic can resume.
+pub struct PeerConnectionStateRepository<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> PeerConnectionStateRepository<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+
+    pub fn ensure(&self, peer_device_id: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO peer_connection_state (
+                peer_device_id, local_disconnected, local_revision,
+                remote_disconnected, remote_revision, updated_unix_ms
+             ) VALUES (?1, 0, 0, 0, NULL, ?2)",
+            params![peer_device_id, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn get(&self, peer_device_id: &str) -> Result<Option<PeerConnectionStateRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer_device_id, local_disconnected, local_revision,
+                    remote_disconnected, remote_revision, updated_unix_ms
+             FROM peer_connection_state WHERE peer_device_id = ?1",
+        )?;
+        let result = stmt.query_row(params![peer_device_id], peer_connection_state_from_row);
+        match result {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn list_all(&self) -> Result<Vec<PeerConnectionStateRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT peer_device_id, local_disconnected, local_revision,
+                    remote_disconnected, remote_revision, updated_unix_ms
+             FROM peer_connection_state ORDER BY peer_device_id",
+        )?;
+        let rows = stmt.query_map([], peer_connection_state_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn set_local_disconnected(
+        &self,
+        peer_device_id: &str,
+        disconnected: bool,
+        now_ms: i64,
+    ) -> Result<PeerConnectionStateRecord> {
+        self.conn.execute(
+            "INSERT INTO peer_connection_state (
+                peer_device_id, local_disconnected, local_revision,
+                remote_disconnected, remote_revision, updated_unix_ms
+             ) VALUES (?1, ?2, 1, 0, NULL, ?3)
+             ON CONFLICT(peer_device_id) DO UPDATE SET
+                local_disconnected = excluded.local_disconnected,
+                local_revision = peer_connection_state.local_revision + 1,
+                updated_unix_ms = excluded.updated_unix_ms
+             WHERE peer_connection_state.local_disconnected != excluded.local_disconnected",
+            params![peer_device_id, disconnected as i32, now_ms],
+        )?;
+        self.get(peer_device_id)?
+            .ok_or_else(|| anyhow::anyhow!("peer connection state was not persisted"))
+    }
+
+    /// Apply a revisioned remote state. Returns false for stale or contradictory
+    /// duplicate revisions so delayed messages cannot roll state backwards.
+    pub fn apply_remote_disconnected(
+        &self,
+        peer_device_id: &str,
+        disconnected: bool,
+        revision: u64,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT INTO peer_connection_state (
+                peer_device_id, local_disconnected, local_revision,
+                remote_disconnected, remote_revision, updated_unix_ms
+             ) VALUES (?1, 0, 0, ?2, ?3, ?4)
+             ON CONFLICT(peer_device_id) DO UPDATE SET
+                remote_disconnected = excluded.remote_disconnected,
+                remote_revision = excluded.remote_revision,
+                updated_unix_ms = excluded.updated_unix_ms
+             WHERE peer_connection_state.remote_revision IS NULL
+                OR excluded.remote_revision > peer_connection_state.remote_revision
+                OR (
+                    excluded.remote_revision = peer_connection_state.remote_revision
+                    AND excluded.remote_disconnected = peer_connection_state.remote_disconnected
+                )",
+            params![peer_device_id, disconnected as i32, revision, now_ms],
+        )?;
+        Ok(changed > 0)
     }
 }
 

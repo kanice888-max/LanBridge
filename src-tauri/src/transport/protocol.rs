@@ -7,6 +7,7 @@ use crate::core::model::{EntryKind, HashStatus};
 pub(crate) const TRANSFER_V1_CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TRANSFER_V2_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub(crate) const TRANSFER_V1_ACK_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const TRANSFER_V2_ACK_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const TRANSFER_PROGRESS_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const NEGOTIATION_TIMEOUT_SECS: u64 = 1;
 
@@ -16,6 +17,10 @@ fn default_remote_entry_kind() -> EntryKind {
 
 fn default_remote_hash_status() -> HashStatus {
     HashStatus::Unavailable
+}
+
+fn legacy_protocol_version() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +46,12 @@ pub enum SyncMessage {
     IdentityResponse {
         device_id: String,
         public_key: Vec<u8>,
+        #[serde(default)]
+        app_version: Option<String>,
+        #[serde(default = "legacy_protocol_version")]
+        protocol_version: u16,
+        #[serde(default = "legacy_protocol_version")]
+        min_protocol_version: u16,
     },
 
     /// Request pairing with verification code.
@@ -145,6 +156,8 @@ pub enum SyncMessage {
         relative_path: String,
         file_hash: String,
         total_bytes: u64,
+        #[serde(default)]
+        expected_target_hash: Option<String>,
     },
 
     /// One chunk in a chunked file transfer.
@@ -179,6 +192,30 @@ pub enum SyncMessage {
     FileDelete {
         task_id: String,
         relative_path: String,
+        #[serde(default)]
+        expected_kind: Option<EntryKind>,
+        #[serde(default)]
+        expected_hash: Option<String>,
+        #[serde(default)]
+        expected_hash_status: Option<HashStatus>,
+        #[serde(default)]
+        expected_size: Option<i64>,
+        #[serde(default)]
+        expected_modified_unix_ms: Option<i64>,
+        #[serde(default)]
+        delete_batch_id: Option<String>,
+    },
+
+    /// Apply a conflict file that was uploaded to a temporary path.
+    ///
+    /// `mode` is `overwrite` or `keep_both`.
+    ConflictApply {
+        task_id: String,
+        relative_path: String,
+        staged_relative_path: String,
+        mode: String,
+        #[serde(default)]
+        resolution_id: Option<String>,
     },
 
     /// Acknowledge successful file write.
@@ -187,6 +224,14 @@ pub enum SyncMessage {
         relative_path: String,
         success: bool,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secondary_hash: Option<String>,
     },
 
     /// Checkpoint ACK during chunked transfer. Sent every N bytes instead of every chunk.
@@ -214,10 +259,40 @@ pub enum SyncMessage {
     /// Heartbeat response.
     Pong,
 
+    /// Notify a trusted peer that this device intentionally disconnected.
+    PeerDisconnect {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
+
+    /// Acknowledge a peer disconnect notification.
+    PeerDisconnectAck {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
+
+    /// Notify a trusted peer that this device is available again after a manual disconnect.
+    PeerReconnect {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
+
+    /// Acknowledge a peer reconnect notification.
+    PeerReconnectAck {
+        device_id: String,
+        #[serde(default)]
+        state_revision: Option<u64>,
+    },
+
     /// Cancel an in-flight transfer and remove any receiver-side partial file.
     TransferCancel {
         task_id: String,
         relative_path: String,
+        #[serde(default)]
+        direction: Option<String>,
     },
 
     // ── V2 protocol negotiation ──
@@ -240,6 +315,8 @@ pub enum SyncMessage {
         task_id: String,
         relative_path: String,
         total_bytes: u64,
+        #[serde(default)]
+        expected_target_hash: Option<String>,
     },
 
     /// V2 binary chunk header. Raw payload of `bytes` length follows immediately after.
@@ -351,18 +428,78 @@ mod tests {
         let msg = SyncMessage::IdentityResponse {
             device_id: "abc123".to_string(),
             public_key: vec![1, 2, 3, 4],
+            app_version: Some("0.1.0".to_string()),
+            protocol_version: 2,
+            min_protocol_version: 1,
         };
         let decoded = round_trip(&msg);
         match decoded {
             SyncMessage::IdentityResponse {
                 device_id,
                 public_key,
+                app_version,
+                protocol_version,
+                min_protocol_version,
             } => {
                 assert_eq!(device_id, "abc123");
                 assert_eq!(public_key, vec![1, 2, 3, 4]);
+                assert_eq!(app_version.as_deref(), Some("0.1.0"));
+                assert_eq!(protocol_version, 2);
+                assert_eq!(min_protocol_version, 1);
             }
             other => panic!("unexpected variant: {:?}", other),
         }
+    }
+
+    #[test]
+    fn identity_response_defaults_old_messages_to_legacy_protocol() {
+        let json = serde_json::json!({
+            "IdentityResponse": {
+                "device_id": "old",
+                "public_key": [1, 2, 3, 4]
+            }
+        });
+        let decoded: SyncMessage = serde_json::from_value(json).unwrap();
+        match decoded {
+            SyncMessage::IdentityResponse {
+                protocol_version,
+                min_protocol_version,
+                app_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, 1);
+                assert_eq!(min_protocol_version, 1);
+                assert!(app_version.is_none());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn peer_connection_state_messages_accept_legacy_and_revisioned_payloads() {
+        let legacy: SyncMessage = serde_json::from_value(serde_json::json!({
+            "PeerDisconnect": { "device_id": "old-peer" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            SyncMessage::PeerDisconnect {
+                device_id,
+                state_revision: None
+            } if device_id == "old-peer"
+        ));
+
+        let revisioned = round_trip(&SyncMessage::PeerReconnect {
+            device_id: "new-peer".to_string(),
+            state_revision: Some(42),
+        });
+        assert!(matches!(
+            revisioned,
+            SyncMessage::PeerReconnect {
+                device_id,
+                state_revision: Some(42)
+            } if device_id == "new-peer"
+        ));
     }
 
     #[test]
@@ -410,6 +547,7 @@ mod tests {
             relative_path: "big.bin".to_string(),
             file_hash: "abc".to_string(),
             total_bytes: 1_048_576,
+            expected_target_hash: None,
         };
         match round_trip(&msg) {
             SyncMessage::FileChunkStart {
@@ -417,11 +555,13 @@ mod tests {
                 relative_path,
                 file_hash,
                 total_bytes,
+                expected_target_hash,
             } => {
                 assert_eq!(task_id, "t1");
                 assert_eq!(relative_path, "big.bin");
                 assert_eq!(file_hash, "abc");
                 assert_eq!(total_bytes, 1_048_576);
+                assert_eq!(expected_target_hash, None);
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -486,11 +626,23 @@ mod tests {
             relative_path: "p".to_string(),
             success: true,
             error: None,
+            resolution: Some("keep_both".to_string()),
+            conflict_path: Some("p (Secondary conflict).txt".to_string()),
+            primary_hash: Some("primary".to_string()),
+            secondary_hash: Some("secondary".to_string()),
         };
         match round_trip(&ok) {
-            SyncMessage::FileAck { success, error, .. } => {
+            SyncMessage::FileAck {
+                success,
+                error,
+                resolution,
+                conflict_path,
+                ..
+            } => {
                 assert!(success);
                 assert!(error.is_none());
+                assert_eq!(resolution.as_deref(), Some("keep_both"));
+                assert_eq!(conflict_path.as_deref(), Some("p (Secondary conflict).txt"));
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -500,6 +652,10 @@ mod tests {
             relative_path: "p".to_string(),
             success: false,
             error: Some("disk full".to_string()),
+            resolution: None,
+            conflict_path: None,
+            primary_hash: None,
+            secondary_hash: None,
         };
         match round_trip(&fail) {
             SyncMessage::FileAck { success, error, .. } => {
@@ -542,12 +698,13 @@ mod tests {
             SyncMessage::TransferReady {
                 selected_version: 2,
                 max_chunk_size: 4 * 1024 * 1024,
-                ack_interval_bytes: 16 * 1024 * 1024,
+                ack_interval_bytes: TRANSFER_V2_ACK_INTERVAL_BYTES,
             },
             SyncMessage::FileStreamStartV2 {
                 task_id: "task".to_string(),
                 relative_path: "file.bin".to_string(),
                 total_bytes: 123,
+                expected_target_hash: None,
             },
             SyncMessage::FileStreamEndV2 {
                 task_id: "task".to_string(),
@@ -632,16 +789,61 @@ mod tests {
         let del = SyncMessage::FileDelete {
             task_id: "t".to_string(),
             relative_path: "old.txt".to_string(),
+            expected_kind: None,
+            expected_hash: None,
+            expected_hash_status: None,
+            expected_size: None,
+            expected_modified_unix_ms: None,
+            delete_batch_id: None,
         };
         match round_trip(&del) {
             SyncMessage::FileDelete {
                 task_id,
                 relative_path,
+                expected_kind,
+                expected_hash,
+                expected_hash_status,
+                expected_size,
+                expected_modified_unix_ms,
+                delete_batch_id,
             } => {
                 assert_eq!(task_id, "t");
                 assert_eq!(relative_path, "old.txt");
+                assert_eq!(expected_kind, None);
+                assert_eq!(expected_hash, None);
+                assert_eq!(expected_hash_status, None);
+                assert_eq!(expected_size, None);
+                assert_eq!(expected_modified_unix_ms, None);
+                assert_eq!(delete_batch_id, None);
             }
             other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn round_trip_conflict_apply() {
+        let msg = SyncMessage::ConflictApply {
+            task_id: "task".to_string(),
+            relative_path: "folder/file.txt".to_string(),
+            staged_relative_path: ".lanbridge-temp/conflict-1/file.txt".to_string(),
+            mode: "overwrite".to_string(),
+            resolution_id: Some("resolution-1".to_string()),
+        };
+        match round_trip(&msg) {
+            SyncMessage::ConflictApply {
+                task_id,
+                relative_path,
+                staged_relative_path,
+                mode,
+                resolution_id,
+            } => {
+                assert_eq!(task_id, "task");
+                assert_eq!(relative_path, "folder/file.txt");
+                assert_eq!(staged_relative_path, ".lanbridge-temp/conflict-1/file.txt");
+                assert_eq!(mode, "overwrite");
+                assert_eq!(resolution_id.as_deref(), Some("resolution-1"));
+            }
+            other => panic!("unexpected conflict apply: {:?}", other),
         }
     }
 }

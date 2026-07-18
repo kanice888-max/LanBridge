@@ -61,6 +61,18 @@ pub struct SyncTask {
     pub enabled: bool,
     pub created_unix_ms: i64,
     pub updated_unix_ms: i64,
+    /// Last time this task began a real data operation. This intentionally excludes
+    /// configuration changes and no-op scans so the task switcher reflects activity.
+    pub last_transfer_activity_unix_ms: i64,
+}
+
+impl SyncTask {
+    pub fn peer_device_id(&self) -> &str {
+        match self.local_role {
+            DeviceRole::Primary => &self.secondary_device_id,
+            DeviceRole::Secondary => &self.primary_device_id,
+        }
+    }
 }
 
 /// Snapshot of a file or directory at scan time.
@@ -85,6 +97,7 @@ pub struct SyncBaseline {
     pub primary_hash: Option<String>,
     pub primary_hash_status: HashStatus,
     pub primary_size: i64,
+    pub secondary_size: i64,
     pub primary_modified_unix_ms: i64,
     pub secondary_hash: Option<String>,
     pub secondary_hash_status: HashStatus,
@@ -123,6 +136,16 @@ pub enum HistoryReason {
     Trash,
     /// Old primary file backed up before overwrite.
     Overwritten,
+}
+
+/// A user-deferred transfer that should not retry automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredTransferRecord {
+    pub task_id: Uuid,
+    pub relative_path: String,
+    pub direction: String,
+    pub reason: String,
+    pub created_unix_ms: i64,
 }
 
 /// An event log entry.

@@ -37,7 +37,11 @@ LanBridge is not general bidirectional sync. It uses a fixed primary-secondary m
 - Real-device test instructions live in `docs/testing/` when present.
 - Transfer protocol details: `docs/architecture/transfer-protocol.md`
 - Current transfer strategy and return-sync/conflict plan: `docs/architecture/current-transfer-and-return-sync-strategy.md`
+- Local Tauri/Tao runtime patch note: `docs/architecture/tao-local-patch.md`
 
 ## Current Automation Level
 
-The current minimum auto-sync path is UI-triggered polling from the Dashboard for Primary tasks. A true background OS watcher is tracked as follow-up debt.
+Enabled tasks use a process-lifetime OS watcher to mark changed paths dirty. The UI polls the
+lightweight readiness state every three seconds, while a metadata-only fallback sweep runs at
+most once every two minutes per Primary task. Filesystem permission failures pause that task's
+automatic access in memory and are surfaced to the UI; incomplete scans never replace snapshots.

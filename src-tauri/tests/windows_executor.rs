@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 use lanbridge::core::executor::*;
 use lanbridge::core::model::*;
 use lanbridge::core::planner::PlannedAction;
@@ -36,6 +38,7 @@ fn create_task(conn: &Connection) -> SyncTask {
         enabled: true,
         created_unix_ms: now_ms(),
         updated_unix_ms: now_ms(),
+        last_transfer_activity_unix_ms: 0,
     };
     let repo = SyncTaskRepository::new(conn);
     repo.insert(&task).unwrap();
@@ -218,6 +221,7 @@ fn test_execute_move_to_history() {
         primary_hash: Some("hash789".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: now_ms(),
         secondary_hash: Some("hash789".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -257,6 +261,7 @@ fn test_secondary_delete_does_not_affect_primary() {
         primary_hash: Some("hash".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -374,6 +379,7 @@ fn test_return_sync_conflict_blocked() {
             primary_hash: Some("original_hash".to_string()),
             primary_hash_status: HashStatus::Verified,
             primary_size: 100,
+            secondary_size: 100,
             primary_modified_unix_ms: 1000,
             secondary_hash: Some("original_hash".to_string()),
             secondary_hash_status: HashStatus::Verified,
@@ -426,6 +432,7 @@ fn test_return_sync_blocks_secondary_modify_when_primary_deleted_after_baseline(
             primary_hash: Some("original_hash".to_string()),
             primary_hash_status: HashStatus::Verified,
             primary_size: 100,
+            secondary_size: 100,
             primary_modified_unix_ms: 1000,
             secondary_hash: Some("original_hash".to_string()),
             secondary_hash_status: HashStatus::Verified,
@@ -501,6 +508,7 @@ fn test_return_sync_no_conflict_succeeds() {
             primary_hash: Some("same_hash".to_string()),
             primary_hash_status: HashStatus::Verified,
             primary_size: 100,
+            secondary_size: 100,
             primary_modified_unix_ms: 1000,
             secondary_hash: Some("same_hash".to_string()),
             secondary_hash_status: HashStatus::Verified,
@@ -573,6 +581,7 @@ fn test_return_sync_delete_moves_primary_to_history_and_clears_baseline() {
         primary_hash: Some(hash.clone()),
         primary_hash_status: HashStatus::Verified,
         primary_size: "primary copy".len() as i64,
+        secondary_size: "primary copy".len() as i64,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some(hash),
         secondary_hash_status: HashStatus::Verified,

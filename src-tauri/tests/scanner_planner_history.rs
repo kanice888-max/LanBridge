@@ -1,10 +1,11 @@
 use lanbridge::core::conflict::{conflict_filename, detect_conflict, ConflictResult};
 use lanbridge::core::model::*;
 use lanbridge::core::planner::plan_sync;
-use lanbridge::core::scanner::scan_root;
+use lanbridge::core::scanner::{scan_root, scan_root_with_cache};
 use lanbridge::core::transient::cleanup_lanbridge_transient_files;
 use lanbridge::history::store::HistoryStore;
 use lanbridge::platform::macos::MacPlatform;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -46,6 +47,17 @@ fn test_scanner_finds_files() {
     assert!(paths.contains(&"readme.txt".to_string()));
     assert!(paths.contains(&"data.csv".to_string()));
     assert!(paths.contains(&"docs/guide.md".to_string()));
+}
+
+#[test]
+fn test_scanner_fails_closed_when_root_cannot_be_read() {
+    let dir = TempDir::new().unwrap();
+    let missing_root = dir.path().join("missing");
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+
+    let error = scan_root(&missing_root, &platform).unwrap_err();
+
+    assert!(error.to_string().contains("cannot read directory"));
 }
 
 #[test]
@@ -138,6 +150,32 @@ fn test_scanner_hashes_small_files() {
     assert_eq!(readme.snapshot.size, 11); // "hello world"
 }
 
+#[test]
+fn test_scanner_reuses_cached_verified_hash() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("cached.txt"), "stable").unwrap();
+    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+
+    let first = scan_root(dir.path(), &platform).unwrap();
+    let mut cached = first
+        .into_iter()
+        .find(|result| result.snapshot.relative_path == "cached.txt")
+        .unwrap()
+        .snapshot;
+    cached.blake3_hash = Some("cached-hash".to_string());
+
+    let mut cache = HashMap::new();
+    cache.insert(cached.relative_path.clone(), cached);
+    let second = scan_root_with_cache(dir.path(), &platform, &cache).unwrap();
+    let scanned = second
+        .iter()
+        .find(|result| result.snapshot.relative_path == "cached.txt")
+        .unwrap();
+
+    assert_eq!(scanned.snapshot.blake3_hash.as_deref(), Some("cached-hash"));
+    assert_eq!(scanned.snapshot.hash_status, HashStatus::Verified);
+}
+
 // ===== Planner Tests =====
 
 #[test]
@@ -205,6 +243,7 @@ fn test_planner_primary_delete() {
         primary_hash: Some("hash1".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -226,6 +265,7 @@ fn test_planner_primary_delete_orders_children_before_parent_directory() {
         primary_hash: None,
         primary_hash_status: HashStatus::Unavailable,
         primary_size: 0,
+        secondary_size: 0,
         primary_modified_unix_ms: 1000,
         secondary_hash: None,
         secondary_hash_status: HashStatus::Unavailable,
@@ -239,6 +279,7 @@ fn test_planner_primary_delete_orders_children_before_parent_directory() {
         primary_hash_status: HashStatus::Verified,
         secondary_hash_status: HashStatus::Verified,
         primary_size: 10,
+        secondary_size: 10,
         primary_modified_unix_ms: 1000,
         secondary_modified_unix_ms: 1000,
         last_synced_unix_ms: 1000,
@@ -260,6 +301,7 @@ fn test_planner_secondary_delete_becomes_pending_return() {
         primary_hash: Some("hash1".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -295,6 +337,7 @@ fn test_planner_unchanged_file_noop() {
         primary_hash: Some("same_hash".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("same_hash".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -326,6 +369,7 @@ fn test_planner_secondary_compares_secondary_baseline() {
         primary_hash: Some("secondary_new".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 2000,
         secondary_hash: Some("secondary_old".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -415,6 +459,7 @@ fn test_conflict_primary_changed() {
         primary_hash: Some("hash_original".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -456,6 +501,7 @@ fn test_conflict_mtime_changed_but_hash_same() {
         primary_hash: Some("same_hash".to_string()),
         primary_hash_status: HashStatus::Verified,
         primary_size: 100,
+        secondary_size: 100,
         primary_modified_unix_ms: 1000,
         secondary_hash: Some("hash1".to_string()),
         secondary_hash_status: HashStatus::Verified,
@@ -485,6 +531,29 @@ fn test_history_move_to_trash() {
     assert_eq!(entry.reason, HistoryReason::Trash);
     assert!(entry.stored_path.contains("trash") || entry.stored_path.contains("trash\\"));
     assert!(std::path::Path::new(&entry.stored_path).exists());
+}
+
+#[test]
+fn test_history_move_to_trash_batch_avoids_parent_child_collision() {
+    let dir = TempDir::new().unwrap();
+    let folder = dir.path().join("folder");
+    let child = folder.join("child.txt");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(&child, "payload").unwrap();
+
+    let store = HistoryStore::new(dir.path());
+    let now = now_ms();
+    let child_entry = store
+        .move_to_trash_in_batch(&child, "folder/child.txt", now, "same-batch")
+        .unwrap();
+    let folder_entry = store
+        .move_to_trash_in_batch(&folder, "folder", now, "same-batch")
+        .unwrap();
+
+    assert_ne!(child_entry.stored_path, folder_entry.stored_path);
+    assert!(!folder.exists());
+    assert!(std::path::Path::new(&child_entry.stored_path).exists());
+    assert!(std::path::Path::new(&folder_entry.stored_path).exists());
 }
 
 #[test]
@@ -530,6 +599,73 @@ fn test_history_discovers_directories_without_database_rows() {
 }
 
 #[test]
+fn test_history_discovers_timestamp_uuid_batch_without_exposing_batch_name() {
+    let dir = TempDir::new().unwrap();
+    let batch = "1779381711093-495e1214-905d-41fc-83e2-d5b4b14ce52c";
+    let stored = dir
+        .path()
+        .join(".lanbridge-history")
+        .join("trash")
+        .join(batch)
+        .join("old.txt");
+    std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+    std::fs::write(&stored, "old data").unwrap();
+
+    let store = HistoryStore::new(dir.path());
+    let entries = store.discover_entries(Uuid::nil()).unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].created_unix_ms, 1779381711093);
+    assert_eq!(entries[0].original_relative_path, "old.txt");
+    assert!(!entries[0]
+        .original_relative_path
+        .contains("495e1214-905d-41fc-83e2-d5b4b14ce52c"));
+}
+
+#[test]
+fn test_history_discovers_directory_batch_as_single_parent_entry() {
+    let dir = TempDir::new().unwrap();
+    let batch = "1779381711093-495e1214-905d-41fc-83e2-d5b4b14ce52c";
+    let stored_file = dir
+        .path()
+        .join(".lanbridge-history")
+        .join("trash")
+        .join(batch)
+        .join("folder")
+        .join("sub")
+        .join("a.txt");
+    std::fs::create_dir_all(stored_file.parent().unwrap()).unwrap();
+    std::fs::write(&stored_file, "payload").unwrap();
+
+    let store = HistoryStore::new(dir.path());
+    let entries = store.discover_entries(Uuid::nil()).unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].original_relative_path, "folder");
+    assert_eq!(entries[0].reason, HistoryReason::Trash);
+    assert_eq!(entries[0].size, 0);
+    assert!(std::path::Path::new(&entries[0].stored_path).is_dir());
+}
+
+#[test]
+fn test_history_cleanup_to_size_limit_removes_oldest_first() {
+    let dir = TempDir::new().unwrap();
+    let store = HistoryStore::new(dir.path());
+    let old_file = store.trash_dir().join("1000").join("old.txt");
+    let new_file = store.trash_dir().join("2000").join("new.txt");
+    std::fs::create_dir_all(old_file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(new_file.parent().unwrap()).unwrap();
+    std::fs::write(&old_file, "old-old-old").unwrap();
+    std::fs::write(&new_file, "new-new-new").unwrap();
+
+    let deleted = store.cleanup_to_size_limit(12).unwrap();
+
+    assert_eq!(deleted, 1);
+    assert!(!old_file.exists());
+    assert!(new_file.exists());
+}
+
+#[test]
 fn test_history_move_to_overwritten() {
     let dir = TempDir::new().unwrap();
     let source = dir.path().join("old_version.txt");
@@ -545,6 +681,51 @@ fn test_history_move_to_overwritten() {
     assert!(
         entry.stored_path.contains("overwritten") || entry.stored_path.contains("overwritten\\")
     );
+}
+
+#[test]
+fn test_overwritten_backups_are_unique_for_same_timestamp_and_path() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("document.txt");
+    let store = HistoryStore::new(dir.path());
+    let timestamp = now_ms();
+    std::fs::write(&source, "version one").unwrap();
+    let first = store
+        .backup_to_overwritten(&source, "document.txt", timestamp)
+        .unwrap();
+    std::fs::write(&source, "version two").unwrap();
+    let second = store
+        .backup_to_overwritten(&source, "document.txt", timestamp)
+        .unwrap();
+
+    assert_ne!(first.stored_path, second.stored_path);
+    assert_eq!(
+        std::fs::read_to_string(first.stored_path).unwrap(),
+        "version one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.stored_path).unwrap(),
+        "version two"
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "version two");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_history_write_rejects_symlinked_internal_directory() {
+    let dir = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let source = dir.path().join("document.txt");
+    std::fs::write(&source, "protected").unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join(".lanbridge-history")).unwrap();
+
+    let error = HistoryStore::new(dir.path())
+        .backup_to_overwritten(&source, "document.txt", now_ms())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("SymlinkNotAllowed"));
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "protected");
 }
 
 #[test]

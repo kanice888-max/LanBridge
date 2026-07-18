@@ -111,13 +111,13 @@ pub async fn connect_peer(
 ) -> Result<String, String> {
     connection::ping_peer_address(&address, port)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(connection::friendly_peer_connection_error)?;
 
-    let peer = Some(
-        connection::request_peer_identity(&address, port)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
+    let peer_identity = connection::request_peer_identity(&address, port)
+        .await
+        .map_err(connection::friendly_peer_connection_error)?;
+    ensure_not_local_device(&state.identity.public().device_id, &peer_identity.device_id)?;
+    let peer = Some(peer_identity);
     crate::transport::connection::pin_connected_peer(&state.connections, &address, port, peer)
         .map_err(|e| e.to_string())
 }
@@ -130,15 +130,35 @@ pub async fn connect_discovered_peer(
     peer_device_id: String,
     peer_public_key: Vec<u8>,
 ) -> Result<String, String> {
-    let (reachable_address, reachable_port) =
-        connect_first_reachable_address(&state, &peer_device_id, &address, port).await?;
+    ensure_not_local_device(&state.identity.public().device_id, &peer_device_id)?;
+    if let Some(device) = state
+        .discovery
+        .list_devices()
+        .into_iter()
+        .find(|device| device.device_id == peer_device_id)
+    {
+        if !device.compatible {
+            return Err(device
+                .compatibility_reason
+                .unwrap_or_else(|| "对端版本不兼容，请升级两端应用".to_string()));
+        }
+    }
 
-    let peer = peer_identity_from_args(Some(peer_device_id), Some(peer_public_key));
+    let (reachable_address, reachable_port, peer_identity) =
+        connect_first_reachable_address(&state, &peer_device_id, &address, port).await?;
+    ensure_not_local_device(&state.identity.public().device_id, &peer_identity.device_id)?;
+    if peer_identity.device_id != peer_device_id {
+        return Err("对端身份已变化，请重新发现设备。".to_string());
+    }
+    if !peer_public_key.is_empty() && peer_identity.public_key != peer_public_key {
+        return Err("对端身份已变化，请重新发现设备。".to_string());
+    }
+
     crate::transport::connection::pin_connected_peer(
         &state.connections,
         &reachable_address,
         reachable_port,
-        peer,
+        Some(peer_identity),
     )
     .map_err(|e| e.to_string())
 }
@@ -148,7 +168,7 @@ async fn connect_first_reachable_address(
     peer_device_id: &str,
     requested_address: &str,
     requested_port: u16,
-) -> Result<(String, u16), String> {
+) -> Result<(String, u16, pairing::PublicIdentity), String> {
     let mut candidates = vec![(requested_address.to_string(), requested_port)];
     if let Some(device) = state
         .discovery
@@ -167,27 +187,30 @@ async fn connect_first_reachable_address(
     let mut last_error = None;
     for (address, port) in candidates {
         match connection::ping_peer_address(&address, port).await {
-            Ok(()) => return Ok((address, port)),
+            Ok(()) => match connection::request_peer_identity(&address, port).await {
+                Ok(identity) => return Ok((address, port, identity)),
+                Err(e) => {
+                    let message = e.to_string();
+                    if message.contains("对端版本不兼容") {
+                        return Err(connection::friendly_peer_connection_error(message));
+                    }
+                    last_error = Some(message);
+                }
+            },
             Err(e) => last_error = Some(e.to_string()),
         }
     }
 
-    Err(last_error.unwrap_or_else(|| "peer is unreachable".to_string()))
+    Err(connection::friendly_peer_connection_error(
+        last_error.unwrap_or_else(|| "peer is unreachable".to_string()),
+    ))
 }
 
-fn peer_identity_from_args(
-    device_id: Option<String>,
-    public_key: Option<Vec<u8>>,
-) -> Option<pairing::PublicIdentity> {
-    match (device_id, public_key) {
-        (Some(device_id), Some(public_key)) if !device_id.is_empty() && !public_key.is_empty() => {
-            Some(pairing::PublicIdentity {
-                device_id,
-                public_key,
-            })
-        }
-        _ => None,
+fn ensure_not_local_device(local_device_id: &str, peer_device_id: &str) -> Result<(), String> {
+    if !peer_device_id.is_empty() && peer_device_id == local_device_id {
+        return Err("不能连接本机".to_string());
     }
+    Ok(())
 }
 
 // ─── Online Devices ───
@@ -231,7 +254,7 @@ pub fn check_network_environment(
             status: "error".to_string(),
             detail: "同步服务未监听端口，其他设备无法连接到本机。".to_string(),
         });
-        suggestions.push("重启应用；如果仍失败，请检查 9527 端口是否被其他程序占用。".to_string());
+        suggestions.push("重启应用；如果仍失败，请检查本机端口占用或安全软件拦截。".to_string());
     } else {
         let localhost = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port));
         match TcpStream::connect_timeout(&localhost, Duration::from_millis(500)) {
@@ -252,15 +275,43 @@ pub fn check_network_environment(
     }
 
     let discovery = state.discovery.status();
-    if discovery.running && discovery.error.is_none() {
+    if !discovery.enabled {
+        checks.push(NetworkCheckItem {
+            label: "自动发现".to_string(),
+            status: "warn".to_string(),
+            detail: "自动发现已关闭，仍可使用手动 IP 连接。".to_string(),
+        });
+    } else if discovery.running && discovery.error.is_none() {
+        let announce_detail = if discovery.announce_interfaces.is_empty() {
+            "暂未识别到广播网卡".to_string()
+        } else {
+            format!("正在通过 {} 广播", discovery.announce_interfaces.join("；"))
+        };
         checks.push(NetworkCheckItem {
             label: "自动发现".to_string(),
             status: "ok".to_string(),
             detail: format!(
-                "发现服务运行中，监听 {}:{}。",
-                discovery.multicast_addr, discovery.multicast_port
+                "发现服务运行中，监听 {}:{}，{}。",
+                discovery.multicast_addr, discovery.multicast_port, announce_detail
             ),
         });
+        if !discovery.skipped_interfaces.is_empty() {
+            checks.push(NetworkCheckItem {
+                label: "自动发现网卡".to_string(),
+                status: "warn".to_string(),
+                detail: format!(
+                    "检测到低优先级 VPN/虚拟网卡：{}",
+                    discovery.skipped_interfaces.join("；")
+                ),
+            });
+        }
+        if !discovery.socket_errors.is_empty() {
+            checks.push(NetworkCheckItem {
+                label: "自动发现诊断".to_string(),
+                status: "warn".to_string(),
+                detail: discovery.socket_errors.join("；"),
+            });
+        }
     } else {
         checks.push(NetworkCheckItem {
             label: "自动发现".to_string(),
@@ -328,15 +379,24 @@ pub fn check_network_environment(
         suggestions.push(platform_network_permission_suggestion());
     } else {
         let address_count: usize = devices.iter().map(|device| device.addresses.len()).sum();
+        let incompatible_count = devices.iter().filter(|device| !device.compatible).count();
         checks.push(NetworkCheckItem {
             label: "已发现设备".to_string(),
-            status: "ok".to_string(),
+            status: if incompatible_count > 0 { "warn" } else { "ok" }.to_string(),
             detail: format!(
-                "发现 {} 台设备，合计 {} 个可尝试地址。",
+                "发现 {} 台设备，合计 {} 个可尝试地址{}。",
                 devices.len(),
-                address_count
+                address_count,
+                if incompatible_count > 0 {
+                    "，其中有旧版设备"
+                } else {
+                    ""
+                }
             ),
         });
+        if incompatible_count > 0 {
+            suggestions.push("发现到旧版设备时，请升级两端 LanBridge。".to_string());
+        }
     }
 
     let ok = !checks.iter().any(|check| check.status == "error");
@@ -349,7 +409,7 @@ pub fn check_network_environment(
 }
 
 fn local_ipv4_interfaces() -> Vec<(String, Ipv4Addr)> {
-    local_ip_address::list_afinet_netifas()
+    let mut interfaces = local_ip_address::list_afinet_netifas()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(name, ip)| match ip {
@@ -358,7 +418,24 @@ fn local_ipv4_interfaces() -> Vec<(String, Ipv4Addr)> {
             }
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    interfaces.sort_by(|left, right| {
+        local_interface_score(right)
+            .cmp(&local_interface_score(left))
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    interfaces
+}
+
+fn local_interface_score((name, ip): &(String, Ipv4Addr)) -> i32 {
+    let ip_score = if ip.is_private() { 100 } else { 10 };
+    let virtual_penalty = if looks_like_virtual_or_vpn(name) {
+        -40
+    } else {
+        0
+    };
+    ip_score + virtual_penalty
 }
 
 fn looks_like_virtual_or_vpn(name: &str) -> bool {
@@ -369,8 +446,13 @@ fn looks_like_virtual_or_vpn(name: &str) -> bool {
         || lower.contains("utun")
         || lower.contains("virtual")
         || lower.contains("hyper-v")
+        || lower.contains("vethernet")
         || lower.contains("vmware")
+        || lower.contains("virtualbox")
         || lower.contains("wsl")
+        || lower.contains("radmin")
+        || lower.contains("zerotier")
+        || lower.contains("tailscale")
 }
 
 #[cfg(target_os = "macos")]
@@ -380,7 +462,7 @@ fn platform_network_permission_suggestion() -> String {
 
 #[cfg(target_os = "windows")]
 fn platform_network_permission_suggestion() -> String {
-    "确认两端应用都已启动；Windows 防火墙需要允许 LanBridge.exe 入站 TCP 9527 和 UDP 53530。"
+    "确认两端应用都已启动；Windows 防火墙需要允许 LanBridge.exe 入站 TCP 当前监听端口和 UDP 53530。"
         .to_string()
 }
 
@@ -402,5 +484,34 @@ mod hex {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_not_local_device, local_interface_score};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn reject_local_device_connection() {
+        assert!(ensure_not_local_device("local", "local").is_err());
+    }
+
+    #[test]
+    fn allow_remote_device_connection() {
+        assert!(ensure_not_local_device("local", "remote").is_ok());
+    }
+
+    #[test]
+    fn local_interface_score_prefers_physical_lan() {
+        let wifi = ("Wi-Fi".to_string(), Ipv4Addr::new(192, 168, 1, 5));
+        let radmin = ("Radmin VPN".to_string(), Ipv4Addr::new(26, 229, 189, 141));
+        let hyperv = (
+            "vEthernet (Default Switch)".to_string(),
+            Ipv4Addr::new(172, 20, 1, 1),
+        );
+
+        assert!(local_interface_score(&wifi) > local_interface_score(&radmin));
+        assert!(local_interface_score(&wifi) > local_interface_score(&hyperv));
     }
 }

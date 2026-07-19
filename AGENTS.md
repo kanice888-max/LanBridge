@@ -6,7 +6,7 @@ Main is the coordination branch for product docs, architecture, active plans, an
 
 ## What This Repo Contains
 
-- Product requirements: `docs/superpowers/specs/2026-05-11-lanbridge-prd.md`
+- Product requirements: `docs/product/PRD.md`
 - Architecture map: `docs/architecture/index.md`
 - Worktree and package map: `docs/architecture/monorepo-map.md`
 - Sync/data-safety invariants: `docs/rules/invariants.md`

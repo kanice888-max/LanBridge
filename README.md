@@ -56,6 +56,20 @@ LanBridge 是一款面向 macOS 和 Windows 的开源桌面应用，用于在同
 
 LanBridge 当前为 pre-1.0 项目。使用前请确保两台设备处于同一受信任局域网，并分别在 macOS 与 Windows 上运行应用。
 
+## 下载与安装
+
+从 [GitHub Releases](https://github.com/kanice888-max/LanBridge/releases/latest) 下载与自己设备匹配的安装包和 `SHA256SUMS.txt`：
+
+| 系统 | 下载内容 | 说明 |
+| --- | --- | --- |
+| macOS Intel | `LanBridge_0.1.4_x64.dmg` | 适用于 Intel Mac。 |
+| macOS Apple Silicon | `LanBridge_0.1.4_aarch64.dmg` | 适用于 M 系列芯片 Mac。 |
+| Windows x64 | `.exe` 或 `.msi` | `.exe` 适合个人安装，`.msi` 适合受管理部署。 |
+
+请在下载后核对 SHA-256。macOS 安装包使用 ad-hoc 签名，尚未经过 Apple 公证：首次启动可能需要
+右键点按 **打开**，或在“系统设置 → 隐私与安全性”中选择“仍要打开”；请不要关闭 Gatekeeper。详细步骤见
+[macOS 安装说明](docs/release/macos-installation.md)与[Windows 安装说明](docs/release/windows-installation.md)。
+
 1. 在两台设备上打开 LanBridge。
 2. 通过局域网发现或手动输入 IP 发起配对，并在两端核对验证码。
 3. 创建任务，选择主端文件夹；接收端接受邀请并选择自己的目标文件夹。
@@ -109,6 +123,8 @@ scripts/          项目工具脚本
 ```
 
 提交涉及同步、传输、配对、删除、冲突或历史记录的变更前，请先阅读[架构概览](docs/architecture/index.md)、[数据安全不变量](docs/rules/invariants.md)和[任务工作流](docs/workflows/task-flow.md)，并在对应 worktree 中完成验证。
+
+欢迎阅读[贡献指南](CONTRIBUTING.md)、[更新日志](CHANGELOG.md)和[行为准则](CODE_OF_CONDUCT.md)，再提交 issue 或 PR。
 
 ## 开源协议
 

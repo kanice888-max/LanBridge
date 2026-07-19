@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a reproducible LanBridge problem.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include private files, device keys, passwords, or unredacted diagnostics.
+  - type: input
+    id: version
+    attributes:
+      label: LanBridge version and platform
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true

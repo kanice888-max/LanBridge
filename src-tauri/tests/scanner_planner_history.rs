@@ -4,7 +4,10 @@ use lanbridge::core::planner::plan_sync;
 use lanbridge::core::scanner::{scan_root, scan_root_with_cache};
 use lanbridge::core::transient::cleanup_lanbridge_transient_files;
 use lanbridge::history::store::HistoryStore;
-use lanbridge::platform::macos::MacPlatform;
+#[cfg(target_os = "macos")]
+use lanbridge::platform::macos::MacPlatform as TestPlatform;
+#[cfg(target_os = "windows")]
+use lanbridge::platform::windows::WinPlatform as TestPlatform;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -36,7 +39,7 @@ fn setup_test_dir() -> TempDir {
 #[test]
 fn test_scanner_finds_files() {
     let dir = setup_test_dir();
-    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = TestPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
 
     let paths: Vec<String> = results
@@ -53,7 +56,7 @@ fn test_scanner_finds_files() {
 fn test_scanner_fails_closed_when_root_cannot_be_read() {
     let dir = TempDir::new().unwrap();
     let missing_root = dir.path().join("missing");
-    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = TestPlatform::with_data_dir(PathBuf::from("/tmp/test"));
 
     let error = scan_root(&missing_root, &platform).unwrap_err();
 
@@ -63,7 +66,7 @@ fn test_scanner_fails_closed_when_root_cannot_be_read() {
 #[test]
 fn test_scanner_skips_ignored() {
     let dir = setup_test_dir();
-    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = TestPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
 
     let paths: Vec<String> = results
@@ -94,7 +97,7 @@ fn test_scanner_skips_lanbridge_transient_files() {
     )
     .unwrap();
 
-    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = TestPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
     let paths: Vec<String> = results
         .iter()
@@ -137,7 +140,7 @@ fn test_cleanup_removes_only_lanbridge_transient_files() {
 #[test]
 fn test_scanner_hashes_small_files() {
     let dir = setup_test_dir();
-    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = TestPlatform::with_data_dir(PathBuf::from("/tmp/test"));
     let results = scan_root(dir.path(), &platform).unwrap();
 
     let readme = results
@@ -154,7 +157,7 @@ fn test_scanner_hashes_small_files() {
 fn test_scanner_reuses_cached_verified_hash() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("cached.txt"), "stable").unwrap();
-    let platform = MacPlatform::with_data_dir(PathBuf::from("/tmp/test"));
+    let platform = TestPlatform::with_data_dir(PathBuf::from("/tmp/test"));
 
     let first = scan_root(dir.path(), &platform).unwrap();
     let mut cached = first

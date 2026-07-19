@@ -12,10 +12,12 @@ if (process.platform !== expectedPlatform) {
   throw new Error(`${target} packages must be built on ${expectedPlatform}; current=${process.platform}`);
 }
 if (target === "win") {
-  execFileSync(process.execPath, [path.join(root, "scripts", "preflight-package.mjs"), "win"], {
-    cwd: root,
-    stdio: "inherit",
-  });
+  if (process.env.LANBRIDGE_SKIP_WINDOWS_RUNTIME_PREFLIGHT !== "1") {
+    execFileSync(process.execPath, [path.join(root, "scripts", "preflight-package.mjs"), "win"], {
+      cwd: root,
+      stdio: "inherit",
+    });
+  }
 }
 if (target === "mac") {
   const mountedImages = execFileSync("hdiutil", ["info"], { encoding: "utf8" });
@@ -24,53 +26,22 @@ if (target === "mac") {
   }
 }
 
-const versionFiles = [
-  "package.json",
-  "package-lock.json",
-  "src-tauri/tauri.conf.json",
-  "src-tauri/Cargo.toml",
-  "src-tauri/Cargo.lock",
-];
-const originals = new Map();
-for (const relative of versionFiles) originals.set(relative, await readFile(path.join(root, relative), "utf8"));
-
-let packageValidated = false;
-async function restoreVersionFiles() {
-  await Promise.all([...originals].map(([relative, content]) => writeFile(path.join(root, relative), content)));
-}
-process.on("uncaughtException", async (error) => {
-  if (!packageValidated) await restoreVersionFiles();
-  console.error(error);
-  process.exit(1);
-});
-process.on("unhandledRejection", async (error) => {
-  if (!packageValidated) await restoreVersionFiles();
-  console.error(error);
-  process.exit(1);
+execFileSync(process.execPath, [path.join(root, "scripts", "verify-version.mjs")], {
+  cwd: root,
+  stdio: "inherit",
 });
 
-let buildSucceeded = false;
-try {
-  execFileSync(process.execPath, [path.join(root, "scripts", "bump-patch-version.mjs")], {
-    cwd: root,
-    stdio: "inherit",
-  });
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-  const args = ["run", "tauri", "--", "build"];
-  if (target === "mac") args.push("--config", "src-tauri/tauri.macos.conf.json", "--bundles", "app");
-  const result = spawnSync(npm, args, { cwd: root, stdio: "inherit", env: process.env });
-  if (result.status !== 0) throw new Error(`Tauri build failed with exit code ${result.status}`);
-  buildSucceeded = true;
-} finally {
-  if (!buildSucceeded) {
-    await restoreVersionFiles();
-    console.error("Build failed; version files were restored.");
-  }
-}
+const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+const args = ["run", "tauri", "--", "build"];
+if (target === "mac") args.push("--config", "src-tauri/tauri.macos.conf.json", "--bundles", "app");
+const result = spawnSync(npm, args, { cwd: root, stdio: "inherit", env: process.env });
+if (result.status !== 0) throw new Error(`Tauri build failed with exit code ${result.status}`);
 
 const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
 const bundleRoot = path.join(root, "src-tauri", "target", "release", "bundle");
 if (target === "mac") {
+  const architecture = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x64" : null;
+  if (!architecture) throw new Error(`Unsupported macOS architecture: ${process.arch}`);
   const appPath = path.join(bundleRoot, "macos", "LanBridge.app");
   execFileSync("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath], { stdio: "inherit" });
   const signatureResult = spawnSync("codesign", ["-dvv", appPath], { encoding: "utf8" });
@@ -80,7 +51,7 @@ if (target === "mac") {
   }
   const dmgDirectory = path.join(bundleRoot, "dmg");
   const staging = path.join(dmgDirectory, `.LanBridge-${packageJson.version}-staging`);
-  const dmgPath = path.join(dmgDirectory, `LanBridge_${packageJson.version}_x64.dmg`);
+  const dmgPath = path.join(dmgDirectory, `LanBridge_${packageJson.version}_${architecture}.dmg`);
   await rm(staging, { recursive: true, force: true });
   await mkdir(staging, { recursive: true });
   await cp(appPath, path.join(staging, "LanBridge.app"), { recursive: true });
@@ -115,4 +86,3 @@ for (const installer of installers) {
   await writeFile(`${installer}.sha256`, `${digest}  ${path.basename(installer)}\n`);
   console.log(`Verified ${installer}\nSHA-256 ${digest}`);
 }
-packageValidated = true;

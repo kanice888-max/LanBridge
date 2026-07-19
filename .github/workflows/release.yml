@@ -28,12 +28,7 @@ jobs:
       - name: Require the release tag to match the application version
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          expected="v$(node -p 'require(\"./package.json\").version')"
-          test "$RELEASE_TAG" = "$expected" || {
-            echo "Release tag $RELEASE_TAG does not match application version $expected" >&2
-            exit 1
-          }
+        run: npm run version:verify-release-tag
 
   draft-release:
     name: Create draft release

@@ -11,6 +11,7 @@
     "version:patch": "node scripts/bump-patch-version.mjs",
     "version:set": "node scripts/bump-patch-version.mjs --set",
     "version:verify": "node scripts/verify-version.mjs",
+    "version:verify-release-tag": "node scripts/verify-release-tag.mjs",
     "package:mac": "node scripts/package-platform.mjs mac",
     "package:win": "node scripts/package-platform.mjs win",
     "preflight:win": "node scripts/preflight-package.mjs win",

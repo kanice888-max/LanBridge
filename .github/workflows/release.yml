@@ -82,4 +82,5 @@ jobs:
           EOF
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
             gh release create "$RELEASE_TAG" --draft --title "LanBridge $RELEASE_TAG" --notes-file release-notes.md
-          gh release upload "$RELEASE_TAG" release-assets/SHA256SUMS.txt release-assets/**/* --clobber
+          mapfile -d '' assets < <(find release-assets -type f ! -name SHA256SUMS.txt -print0)
+          gh release upload "$RELEASE_TAG" release-assets/SHA256SUMS.txt "${assets[@]}" --clobber

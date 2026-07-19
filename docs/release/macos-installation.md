@@ -1,4 +1,4 @@
-# macOS Ad-hoc Signed GitHub Distribution
+# macOS Installation And Distribution
 
 LanBridge currently publishes its macOS DMG through GitHub with a free ad-hoc code signature,
 without a paid Developer ID certificate or Apple notarization. Ad-hoc signing gives each bundle a
@@ -22,9 +22,9 @@ responses must not recommend `spctl --master-disable`.
 
 ## Release Checklist
 
-- Run `npm run package:mac` for every new macOS release. It validates that all project version
-  sources match, increments the patch version (`0.1.0` → `0.1.1`), and then creates the app and
-  DMG. Use `npm run tauri build` only when intentionally rebuilding the same version.
+- Set and commit the release version before packaging. `npm run package:mac` validates that all
+  version sources already match and then creates the architecture-specific DMG without changing
+  tracked version files.
 - Keep the bundle identifier stable as `com.lanbridge.app`.
 - Package the app at the stable `/Applications/LanBridge.app` path.
 - Publish SHA-256 checksums next to every DMG.

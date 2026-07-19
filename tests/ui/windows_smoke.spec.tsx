@@ -121,7 +121,6 @@ describe("Windows app smoke tests", () => {
   it("lets the receiver choose a folder for an incoming invite", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: /照片同步/ }));
     fireEvent.click(await screen.findByRole("button", { name: "选择" }));
 
     await waitFor(() => {

@@ -28,6 +28,7 @@ LanBridge is not general bidirectional sync. It uses a fixed primary-secondary m
 
 ## Key Boundaries
 
+- Product requirements: `docs/product/PRD.md`
 - UI lives in `src/`.
 - Tauri commands live in `src-tauri/src/commands.rs`.
 - Sync model and planning live in `src-tauri/src/core/`.

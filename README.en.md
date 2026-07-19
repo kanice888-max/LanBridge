@@ -56,6 +56,21 @@ Primary folder ── automatic sync ──▶ Secondary folder
 
 LanBridge is currently pre-1.0. Before you begin, make sure both devices are on the same trusted local network and that the app is running on macOS and Windows.
 
+## Download and install
+
+Download the installer for your device and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/kanice888-max/LanBridge/releases/latest):
+
+| Platform | Download | Notes |
+| --- | --- | --- |
+| macOS Intel | `LanBridge_0.1.4_x64.dmg` | For Intel-based Macs. |
+| macOS Apple Silicon | `LanBridge_0.1.4_aarch64.dmg` | For Apple M-series Macs. |
+| Windows x64 | `.exe` or `.msi` | Use `.exe` for a personal install or `.msi` for managed deployment. |
+
+Verify the SHA-256 checksum after downloading. The macOS app is ad-hoc signed and not notarized:
+the first launch may require Control-click **Open** or **Open Anyway** in System Settings → Privacy &
+Security. Never disable Gatekeeper globally. See the [macOS installation guide](docs/release/macos-installation.md)
+and [Windows installation guide](docs/release/windows-installation.md) for complete steps.
+
 1. Open LanBridge on both devices.
 2. Start pairing through LAN discovery or a manual IP address, then verify the code displayed on both devices.
 3. Create a task and select the Primary folder. Accept the invitation on the receiving device and choose its target folder.
@@ -109,6 +124,9 @@ scripts/          Project utility scripts
 ```
 
 Before contributing changes to synchronization, transfer, pairing, deletion, conflicts, or history, read the [architecture overview](docs/architecture/index.md), [data-safety invariants](docs/rules/invariants.md), and [task workflow](docs/workflows/task-flow.md). Validate the change in the worktree that owns it.
+
+Read the [contribution guide](CONTRIBUTING.md), [changelog](CHANGELOG.md), and [code of conduct](CODE_OF_CONDUCT.md)
+before opening an issue or pull request.
 
 ## License
 

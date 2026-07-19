@@ -17,11 +17,11 @@ npm run tauri build -- --debug
 ```
 
 当前 GitHub macOS 发布渠道使用免费 ad-hoc 签名、但不使用 Developer ID 且不公证；付费签名和公证不作为发布门槛。
-发布时仍必须执行 `docs/macos-unsigned-distribution.md` 中的 Gatekeeper 手动放行、受保护
+发布时仍必须执行 `docs/release/macos-installation.md` 中的 Gatekeeper 手动放行、受保护
 目录授权、重启验证，并为 DMG 生成和发布 `shasum -a 256` 校验值。不得引导用户全局关闭
 Gatekeeper。
 
-CI 必须在 Ubuntu、Windows、macOS 各自执行 `npm ci --include=optional`、前端检查、Rust 测试和原生 debug build。以下专项失败时不得发布：existing-target replacement、symlink/Junction 越界、未授权 TaskRegister、Secondary delete return、Keep Both baseline、partial/lease cleanup、commit journal recovery、V1 safe fallback、peer disconnect state persistence/revision ordering。
+CI 在 Ubuntu 执行前端、命名、差异与依赖安全检查；在 Windows 与 macOS 执行 Rust 测试和原生 debug build。以下专项失败时不得发布：existing-target replacement、symlink/Junction 越界、未授权 TaskRegister、Secondary delete return、Keep Both baseline、partial/lease cleanup、commit journal recovery、V1 safe fallback、peer disconnect state persistence/revision ordering。
 
 ## Windows Worktree
 
@@ -59,6 +59,9 @@ On a real Mac, also run:
 npm ci --include=optional
 npm run package:mac
 ```
+
+发布前还要在 Intel 与 Apple Silicon 各验证一次 DMG；具体安装与 Gatekeeper 说明见
+[`docs/release/macos-installation.md`](../release/macos-installation.md)。
 
 ## Real-Device Smoke Flow
 

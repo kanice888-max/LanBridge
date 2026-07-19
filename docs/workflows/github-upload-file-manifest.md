@@ -23,7 +23,7 @@
 - 项目脚本：`scripts/`
 - 应用实际引用的静态资源：`src/assets/`、`public/`，如果存在且被源码引用。
 - 公开基础文档：`README.md` 及其语言版本、`LICENSE`、`SECURITY.md`、`AGENTS.md`
-- 必要 docs：`docs/architecture/`、`docs/rules/`、`docs/security/`、`docs/validation/`、`docs/workflows/`、`docs/testing/`
+- 必要 docs：`docs/architecture/`、`docs/product/`、`docs/release/`、`docs/rules/`、`docs/security/`、`docs/validation/`、`docs/workflows/`、`docs/testing/`
 - 公开质量记录：`docs/quality/debt-log.md`
 - 设计规范：`redesign/design.md`
 

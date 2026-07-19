@@ -8,7 +8,8 @@ LanBridge is currently pre-1.0. Security fixes are applied to the latest `main` 
 
 Please do not disclose security vulnerabilities publicly before a fix is available.
 
-Report security issues to the maintainer directly. If you are unsure whether a behavior is a security issue, report it privately first.
+Use GitHub's [private vulnerability reporting](https://github.com/kanice888-max/LanBridge/security/advisories/new)
+form. If you are unsure whether a behavior is a security issue, report it privately first.
 
 When reporting a vulnerability, include:
 

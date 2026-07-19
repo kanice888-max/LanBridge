@@ -60,6 +60,11 @@ The packaged app CSP is tightened so `connect-src` is limited to `'self'`. Devel
 
 ## Near-Term Plan
 
+### Rust Dependency Audit Exceptions
+
+The CI audit blocks known vulnerabilities. Any narrowly scoped exception must be documented in
+`docs/security/cargo-audit-exceptions.md` with dependency path, safety boundary, and expiry.
+
 ### SyncServer Port Fallback
 
 Implemented plan: bind `9527` when available and fall back to a system-assigned port when needed. Discovery advertises the real listening port, and network diagnostics show the real port.

@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "version:patch": "node scripts/bump-patch-version.mjs",
+    "version:verify": "node scripts/verify-version.mjs",
     "package:mac": "node scripts/package-platform.mjs mac",
     "package:win": "node scripts/package-platform.mjs win",
     "preflight:win": "node scripts/preflight-package.mjs win",

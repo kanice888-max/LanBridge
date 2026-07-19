@@ -317,7 +317,7 @@ fn build_system_tray() -> SystemTray {
 }
 
 fn tray_icon_bytes() -> &'static [u8] {
-    include_bytes!("../icons/32x32.png")
+    include_bytes!("../icons/tray-template.png")
 }
 
 #[cfg(test)]

@@ -484,81 +484,7 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
           </div>
         </div>
 
-        {!isConnectionStep && (
-          <div className="discover-below-stage">
-          <AnimatePresence mode="wait" initial={false}>
-            {step === "discover" && (
-              <motion.div
-                key="discover-copy"
-                className="discover-copy"
-                initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
-                transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
-              >
-                <strong>
-                  {discoveryDisabled ? t.pairing.discoveryDisabled : <>{t.pairing.discovering}<LoadingDots /></>}
-                </strong>
-                <span>
-                  {discoveryDisabled
-                    ? t.pairing.manualStillAvailable
-                    : t.pairing.discoverySummary
-                        .replace("{addr}", discoveryStatus?.multicast_addr || "239.10.10.10")
-                        .replace("{port}", String(discoveryStatus?.multicast_port || 53530))}
-                </span>
-              </motion.div>
-            )}
-
-            {step === "manual" && (
-              <motion.div
-                key="manual-flow"
-                className="manual-flow"
-                initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
-                transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
-              >
-                  <button
-                    className="manual-flow-title"
-                    type="button"
-                    onClick={() => setStep("discover")}
-                  >
-                  <ChevronLeftIcon size={18} />
-                  {t.pairing.manualInput}
-                </button>
-
-                <div className="manual-flow-form">
-                  <label className="manual-field manual-ip-field">
-                    <span>{t.pairing.peerIpShort}</span>
-                    <input
-                      value={address}
-                      onChange={(e) => setAddress(e.target.value)}
-                      placeholder={t.pairing.peerIpPlaceholder}
-                    />
-                  </label>
-                  <label className="manual-field manual-port-field">
-                    <span>{t.pairing.port}</span>
-                    <input
-                      value={port}
-                      onChange={(e) => setPort(e.target.value)}
-                      placeholder="9527"
-                    />
-                  </label>
-                  <button
-                    className="manual-connect-btn"
-                    onClick={handleManualConnect}
-                    disabled={connecting || !address.trim()}
-                  >
-                    {connecting ? t.pairing.connecting : t.pairing.connect}
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-          </div>
-        )}
-
-        {isConnectionStep && (
+        {isConnectionStep ? (
           <div className="pairing-workflow-slot">
             <div className={`connection-flow ${step === "invite" ? "invite-flow" : ""}`}>
             {step === "invite" && (
@@ -651,6 +577,78 @@ export function PairingScreen({ onComplete, refreshToken = 0 }: PairingScreenPro
               </div>
             )}
             </div>
+          </div>
+        ) : (
+          <div className="discover-below-stage">
+            <AnimatePresence mode="wait" initial={false}>
+              {step === "discover" && (
+                <motion.div
+                  key="discover-copy"
+                  className="discover-copy"
+                  initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
+                  transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
+                >
+                  <strong>
+                    {discoveryDisabled ? t.pairing.discoveryDisabled : <>{t.pairing.discovering}<LoadingDots /></>}
+                  </strong>
+                  <span>
+                    {discoveryDisabled
+                      ? t.pairing.manualStillAvailable
+                      : t.pairing.discoverySummary
+                          .replace("{addr}", discoveryStatus?.multicast_addr || "239.10.10.10")
+                          .replace("{port}", String(discoveryStatus?.multicast_port || 53530))}
+                  </span>
+                </motion.div>
+              )}
+
+              {step === "manual" && (
+                <motion.div
+                  key="manual-flow"
+                  className="manual-flow"
+                  initial={reduceMotion ? { opacity: 1 } : { opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduceMotion ? { opacity: 1 } : { opacity: 0, y: -8 }}
+                  transition={reduceMotion ? { duration: 0 } : { duration: 0.18 }}
+                >
+                  <button
+                    className="manual-flow-title"
+                    type="button"
+                    onClick={() => setStep("discover")}
+                  >
+                    <ChevronLeftIcon size={18} />
+                    {t.pairing.manualInput}
+                  </button>
+
+                  <div className="manual-flow-form">
+                    <label className="manual-field manual-ip-field">
+                      <span>{t.pairing.peerIpShort}</span>
+                      <input
+                        value={address}
+                        onChange={(e) => setAddress(e.target.value)}
+                        placeholder={t.pairing.peerIpPlaceholder}
+                      />
+                    </label>
+                    <label className="manual-field manual-port-field">
+                      <span>{t.pairing.port}</span>
+                      <input
+                        value={port}
+                        onChange={(e) => setPort(e.target.value)}
+                        placeholder="9527"
+                      />
+                    </label>
+                    <button
+                      className="manual-connect-btn"
+                      onClick={handleManualConnect}
+                      disabled={connecting || !address.trim()}
+                    >
+                      {connecting ? t.pairing.connecting : t.pairing.connect}
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         )}
       </div>

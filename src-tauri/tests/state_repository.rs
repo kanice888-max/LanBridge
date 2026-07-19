@@ -104,6 +104,37 @@ fn test_sync_task_crud() {
     repo.update_enabled(&task.id, false, now_ms()).unwrap();
     let updated = repo.get(&task.id).unwrap().unwrap();
     assert!(!updated.enabled);
+    assert_eq!(updated.last_transfer_activity_unix_ms, 0);
+
+    repo.mark_transfer_activity(&task.id, 123).unwrap();
+    repo.mark_transfer_activity(&task.id, 100).unwrap();
+    let active = repo.get(&task.id).unwrap().unwrap();
+    assert_eq!(active.last_transfer_activity_unix_ms, 123);
+}
+
+#[test]
+fn test_sync_task_bad_uuid_returns_error_without_panic() {
+    let conn = setup_db();
+    conn.execute(
+        "INSERT INTO sync_tasks (id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            "not-a-uuid",
+            "Bad UUID",
+            "a",
+            "b",
+            "/tmp/a",
+            "/tmp/b",
+            "Primary",
+            1,
+            now_ms(),
+            now_ms(),
+        ],
+    )
+    .unwrap();
+
+    let result = SyncTaskRepository::new(&conn).list_all();
+    assert!(result.is_err());
 }
 
 #[test]

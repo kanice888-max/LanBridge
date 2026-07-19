@@ -272,6 +272,25 @@ describe("App smoke tests", () => {
     fireEvent.click(settingsBtn);
     const heading = await screen.findByText("保留周期");
     expect(heading).toBeTruthy();
+    expect(screen.getByText("通用")).toBeTruthy();
+
+    fireEvent.click(document.querySelector(".settings-language-trigger") as HTMLButtonElement);
+    await screen.findByRole("button", { name: "English" });
+    const languageMenu = document.querySelector(".settings-language-popover");
+    expect(languageMenu?.closest(".settings-language-control")).toBeTruthy();
+  });
+
+  it("returns to device discovery from the manual connection title", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByText("发现"));
+    fireEvent.click((await screen.findAllByRole("button", { name: "手动输入" }))[0]);
+
+    await screen.findByPlaceholderText("请输入对端IP");
+    expect(document.querySelector(".discover-stage.step-manual")).toBeTruthy();
+    expect(document.querySelector(".discover-stage.step-manual .discover-folder-host")).toBeTruthy();
+    fireEvent.click(document.querySelector(".manual-flow-title") as HTMLButtonElement);
+
+    expect(await screen.findByText("自动发现中")).toBeTruthy();
   });
 
   it("shows device name in sidebar", async () => {
@@ -709,6 +728,23 @@ describe("App smoke tests", () => {
     );
   });
 
+  it("refreshes task ordering when a transfer activity event arrives", async () => {
+    mockConnectionStatus("connection refused");
+    render(<App />);
+
+    await waitFor(() => {
+      expect(eventListeners.get("lanbridge://task-transfer-activity")?.size).toBeGreaterThan(0);
+    });
+    const initialTaskListCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_sync_tasks").length;
+
+    emitTauriEvent("lanbridge://task-transfer-activity", { task_id: connectionTask.id });
+
+    await waitFor(() => {
+      const taskListCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_sync_tasks").length;
+      expect(taskListCalls).toBeGreaterThan(initialTaskListCalls);
+    });
+  });
+
   it("opens overflow tasks from the folder menu and switches to the selected task", async () => {
     const tasks = Array.from({ length: 7 }, (_, index) => ({
       id: `overflow-${index + 1}`,
@@ -721,7 +757,8 @@ describe("App smoke tests", () => {
       enabled: true,
       created_unix_ms: index + 1,
       updated_unix_ms: index + 1,
-    last_transfer_activity_unix_ms: 0,
+      // Deliberately reverse creation order: bubbles must follow activity, not creation.
+      last_transfer_activity_unix_ms: 700 - index * 100,
     }));
     invokeMock.mockImplementation((cmd: string, args?: { taskId?: string }) => {
       switch (cmd) {
@@ -760,6 +797,12 @@ describe("App smoke tests", () => {
     render(<App />);
     await screen.findByText("任务 7");
     fireEvent.mouseEnter(document.querySelector(".sync-folder-hitbox") as HTMLDivElement);
+
+    await waitFor(() => {
+      const bubbleNames = Array.from(document.querySelectorAll(".task-bubble-name"))
+        .map((element) => element.textContent);
+      expect(bubbleNames).toEqual(["任务 1", "任务 2", "任务 3", "任务 4", "任务 5"]);
+    });
 
     const moreTasks = await screen.findByRole("button", { name: /更多任务/ });
     expect(moreTasks.textContent).toContain("+2");

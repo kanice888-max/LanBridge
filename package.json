@@ -40,6 +40,6 @@
     "vitest": "^4.1.10"
   },
   "optionalDependencies": {
-    "@tauri-apps/cli-win32-x64-msvc": "1.6.3"
+    "@tauri-apps/cli-win32-x64-msvc": "2.11.4"
   }
 }

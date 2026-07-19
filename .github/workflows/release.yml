@@ -28,7 +28,21 @@ jobs:
       - name: Require the release tag to match the application version
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-        run: npm run version:verify-release-tag
+        run: |
+          if [[ -f scripts/verify-release-tag.mjs ]]; then
+            npm run version:verify-release-tag
+            exit 0
+          fi
+
+          node <<'NODE'
+          const fs = require("fs");
+          const { version } = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const expectedTag = `v${version}`;
+          if (process.env.RELEASE_TAG !== expectedTag) {
+            throw new Error(`Release tag ${process.env.RELEASE_TAG ?? "missing"} does not match application version ${expectedTag}`);
+          }
+          console.log(`Release tag ${process.env.RELEASE_TAG} matches LanBridge ${version}.`);
+          NODE
 
   draft-release:
     name: Create draft release

@@ -665,4 +665,3 @@ export function AnimatedFolder({
     </button>
   );
 }
-

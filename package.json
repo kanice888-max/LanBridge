@@ -1,7 +1,7 @@
 {
   "name": "lanbridge",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "version:patch": "node scripts/bump-patch-version.mjs",
+    "version:set": "node scripts/bump-patch-version.mjs --set",
     "version:verify": "node scripts/verify-version.mjs",
     "package:mac": "node scripts/package-platform.mjs mac",
     "package:win": "node scripts/package-platform.mjs win",

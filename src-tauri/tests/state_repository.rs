@@ -138,56 +138,6 @@ fn test_sync_task_bad_uuid_returns_error_without_panic() {
 }
 
 #[test]
-fn test_sync_task_bad_uuid_returns_error_without_panic() {
-    let conn = setup_db();
-    conn.execute(
-        "INSERT INTO sync_tasks (id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            "not-a-uuid",
-            "Bad UUID",
-            "a",
-            "b",
-            "/tmp/a",
-            "/tmp/b",
-            "Primary",
-            1,
-            now_ms(),
-            now_ms(),
-        ],
-    )
-    .unwrap();
-
-    let result = SyncTaskRepository::new(&conn).list_all();
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_sync_task_bad_uuid_returns_error_without_panic() {
-    let conn = setup_db();
-    conn.execute(
-        "INSERT INTO sync_tasks (id, name, primary_device_id, secondary_device_id, local_path, remote_path, local_role, enabled, created_unix_ms, updated_unix_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            "not-a-uuid",
-            "Bad UUID",
-            "a",
-            "b",
-            "/tmp/a",
-            "/tmp/b",
-            "Primary",
-            1,
-            now_ms(),
-            now_ms(),
-        ],
-    )
-    .unwrap();
-
-    let result = SyncTaskRepository::new(&conn).list_all();
-    assert!(result.is_err());
-}
-
-#[test]
 fn test_file_snapshot_upsert() {
     let conn = setup_db();
     let task_repo = SyncTaskRepository::new(&conn);

@@ -25,6 +25,9 @@ responses must not recommend `spctl --master-disable`.
 - Set and commit the release version before packaging. `npm run package:mac` validates that all
   version sources already match and then creates the architecture-specific DMG without changing
   tracked version files.
+- Build the Intel and Apple Silicon DMGs manually from the matching Git tag. Upload the DMGs and
+  their checksum files to the draft GitHub Release manually; the release workflow does not build
+  or upload installer files.
 - Keep the bundle identifier stable as `com.lanbridge.app`.
 - Package the app at the stable `/Applications/LanBridge.app` path.
 - Publish SHA-256 checksums next to every DMG.

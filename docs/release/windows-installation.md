@@ -25,6 +25,8 @@ discard pairings, tasks, history metadata, and the device identity.
 ## Release Checklist
 
 - Build x64 installers on a clean Windows environment with `npm run package:win`.
+- Build from the matching Git tag, then manually upload the `.exe`, `.msi`, and checksum files to
+  the draft GitHub Release. The release workflow does not build or upload installer files.
 - Verify the installer and matching SHA-256 checksum before upload.
 - Smoke-test installation, first launch, pairing, a Primary-to-Secondary transfer, explicit
   return-sync, and uninstall behavior.

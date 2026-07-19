@@ -104,6 +104,12 @@ fn test_sync_task_crud() {
     repo.update_enabled(&task.id, false, now_ms()).unwrap();
     let updated = repo.get(&task.id).unwrap().unwrap();
     assert!(!updated.enabled);
+    assert_eq!(updated.last_transfer_activity_unix_ms, 0);
+
+    repo.mark_transfer_activity(&task.id, 123).unwrap();
+    repo.mark_transfer_activity(&task.id, 100).unwrap();
+    let active = repo.get(&task.id).unwrap().unwrap();
+    assert_eq!(active.last_transfer_activity_unix_ms, 123);
 }
 
 #[test]

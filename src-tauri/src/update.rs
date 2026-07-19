@@ -234,8 +234,8 @@ mod tests {
     fn compares_latest_release_to_current_version() {
         let result = result_from_release(
             Some(UpdateRelease {
-                version: "0.2.0-beta.1".to_string(),
-                tag_name: "v0.2.0-beta.1".to_string(),
+                version: "0.2.1".to_string(),
+                tag_name: "v0.2.1".to_string(),
                 name: None,
                 published_at: None,
             }),

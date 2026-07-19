@@ -317,6 +317,12 @@ fn build_system_tray() -> SystemTray {
 }
 
 fn tray_icon_bytes() -> &'static [u8] {
+    #[cfg(target_os = "macos")]
+    {
+        return include_bytes!("../icons/tray-template.png");
+    }
+
+    #[cfg(not(target_os = "macos"))]
     include_bytes!("../icons/32x32.png")
 }
 

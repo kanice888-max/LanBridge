@@ -1,4 +1,4 @@
-name: Draft release
+name: Prepare draft release
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing or new release tag, for example v0.1.4
+        description: Existing or new release tag, for example v0.2.0
         required: true
         type: string
 
@@ -14,73 +14,54 @@ permissions:
   contents: write
 
 jobs:
-  package:
-    name: Package (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS Intel
-            os: macos-15-intel
-            command: npm run package:mac
-            artifact: macos-x64
-            files: src-tauri/target/release/bundle/**/*.dmg*
-          - name: macOS Apple Silicon
-            os: macos-latest
-            command: npm run package:mac
-            artifact: macos-aarch64
-            files: src-tauri/target/release/bundle/**/*.dmg*
-          # Windows x64 packages are added manually for the initial release after
-          # a physical Windows-device build and checksum verification.
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - run: npm ci --include=optional
-      - run: npm run version:verify
-      - name: Build release package
-        env:
-          LANBRIDGE_SKIP_WINDOWS_RUNTIME_PREFLIGHT: "1"
-        run: ${{ matrix.command }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.files }}
-          if-no-files-found: error
-
-  draft-release:
-    name: Create draft release
-    needs: package
+  verify-release:
+    name: Verify release version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
         with:
-          path: release-assets
-      - name: Build checksum manifest
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm run version:verify
+      - name: Require the release tag to match the application version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          find release-assets -type f -name '*.sha256' -print0 | sort -z | xargs -0 cat > release-assets/SHA256SUMS.txt
+          expected="v$(node -p \"require('./package.json').version\")"
+          test "$RELEASE_TAG" = "$expected" || {
+            echo "Release tag $RELEASE_TAG does not match application version $expected" >&2
+            exit 1
+          }
+
+  draft-release:
+    name: Create draft release
+    needs: verify-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Create or update GitHub draft release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          cat > release-notes.md <<'EOF'
-          ## LanBridge 0.1.4
+          RELEASE_VERSION="${RELEASE_TAG#v}"
+          cat > release-notes.md <<EOF
+          ## LanBridge $RELEASE_VERSION
 
           LanBridge is a Primary/Secondary local-network sync tool with explicit return-sync,
           conflict choices, and recoverable history. It is not fully automatic bidirectional sync.
 
-          - Download the package that matches your architecture.
+          Installation packages and SHA-256 checksum files are built and uploaded manually
+          from the tagged source commit.
+
+          - Download the package that matches your architecture after the assets are attached.
           - Verify the SHA-256 checksum before installing.
           - macOS packages are ad-hoc signed and not notarized; follow the installation guide
             rather than disabling Gatekeeper.
           EOF
           gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
             gh release create "$RELEASE_TAG" --draft --title "LanBridge $RELEASE_TAG" --notes-file release-notes.md
-          mapfile -d '' assets < <(find release-assets -type f ! -name SHA256SUMS.txt -print0)
-          gh release upload "$RELEASE_TAG" release-assets/SHA256SUMS.txt "${assets[@]}" --clobber

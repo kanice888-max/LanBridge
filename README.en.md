@@ -62,8 +62,8 @@ Download the installer for your device and `SHA256SUMS.txt` from [GitHub Release
 
 | Platform | Download | Notes |
 | --- | --- | --- |
-| macOS Intel | `LanBridge_0.1.4_x64.dmg` | For Intel-based Macs. |
-| macOS Apple Silicon | `LanBridge_0.1.4_aarch64.dmg` | For Apple M-series Macs. |
+| macOS Intel | `LanBridge_0.2.0_x64.dmg` | For Intel-based Macs. |
+| macOS Apple Silicon | `LanBridge_0.2.0_aarch64.dmg` | For Apple M-series Macs. |
 | Windows x64 | `.exe` or `.msi` | Use `.exe` for a personal install or `.msi` for managed deployment. |
 
 Verify the SHA-256 checksum after downloading. The macOS app is ad-hoc signed and not notarized:

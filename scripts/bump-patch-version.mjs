@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dryRun = process.argv.includes("--dry-run");
+const setVersionIndex = process.argv.indexOf("--set");
+const requestedVersion = setVersionIndex >= 0 ? process.argv[setVersionIndex + 1] : null;
 
 const paths = {
   packageJson: path.join(root, "package.json"),
@@ -70,8 +72,13 @@ if (!match) {
   throw new Error(`package.json: ${currentVersion} is not a stable semantic version`);
 }
 
-const nextVersion = `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
-console.log(`LanBridge patch version: ${currentVersion} -> ${nextVersion}${dryRun ? " (dry run)" : ""}`);
+if (setVersionIndex >= 0 && (!requestedVersion || !semver.test(requestedVersion))) {
+  throw new Error("--set requires a stable semantic version in the form X.Y.Z");
+}
+
+const nextVersion = requestedVersion ?? `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
+const operation = requestedVersion ? "set version" : "patch version";
+console.log(`LanBridge ${operation}: ${currentVersion} -> ${nextVersion}${dryRun ? " (dry run)" : ""}`);
 
 if (dryRun) {
   process.exit(0);

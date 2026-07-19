@@ -31,11 +31,8 @@ jobs:
             command: npm run package:mac
             artifact: macos-aarch64
             files: src-tauri/target/release/bundle/**/*.dmg*
-          - name: Windows x64
-            os: windows-latest
-            command: npm run package:win
-            artifact: windows-x64
-            files: src-tauri/target/release/bundle/**/*.{exe,msi,sha256}
+          # Windows x64 packages are added manually for the initial release after
+          # a physical Windows-device build and checksum verification.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

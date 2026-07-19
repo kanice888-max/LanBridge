@@ -32,8 +32,9 @@ jobs:
         include:
           - name: macOS arm64
             os: macos-latest
-          - name: Windows x64
-            os: windows-latest
+          # Windows native checks are run manually on a physical Windows device
+          # during the initial release. Keep the Windows build out of GitHub-hosted
+          # runners until that packaging path is validated there.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
